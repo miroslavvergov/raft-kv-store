@@ -3,18 +3,11 @@
 the six log-divergence scenarios from Figure 7 of the Raft paper.
 """
 
-from raftkv.consensus import (
-    LogEntry,
-    last_log_index,
-    last_log_term,
-    log_after_append_entries,
-    log_matches,
-    next_index_after_rejection,
-)
+from raftkv.consensus import FollowerProgress, Log, LogEntry
 
 
 def make_log(terms):
-    return [LogEntry(term=t, command=f"cmd{i + 1}") for i, t in enumerate(terms)]
+    return Log([LogEntry(term=t, command=f"cmd{i + 1}") for i, t in enumerate(terms)])
 
 
 # Figure 7 of the Raft paper: a leader for term 8, and six possible follower
@@ -38,74 +31,78 @@ def reconcile(leader_log, follower_log):
     until REPL-5's check passes, then apply REPL-8's overwrite. Returns the
     reconciled follower log and the prevLogIndex the retry loop settled on.
     """
-    next_index = last_log_index(leader_log) + 1
+    progress = FollowerProgress(next_index=leader_log.last_index + 1)
     while True:
-        prev_log_index = next_index - 1
+        prev_log_index = progress.next_index - 1
         prev_log_term = leader_log[prev_log_index - 1].term if prev_log_index > 0 else 0
-        if log_matches(follower_log, prev_log_index, prev_log_term):
+        if follower_log.matches(prev_log_index, prev_log_term):
             entries = leader_log[prev_log_index:]
             return (
-                log_after_append_entries(follower_log, prev_log_index, entries),
+                follower_log.after_append_entries(prev_log_index, entries),
                 prev_log_index,
             )
-        next_index = next_index_after_rejection(next_index)
+        progress.record_rejection()
 
 
 # --- REPL-5: the consistency check itself -----------------------------------
 
 
 def test_log_matches_when_prev_log_index_is_zero():
-    assert log_matches([], prev_log_index=0, prev_log_term=0) is True
-    assert log_matches(make_log([1, 1]), prev_log_index=0, prev_log_term=0) is True
+    assert Log().matches(prev_log_index=0, prev_log_term=0) is True
+    assert make_log([1, 1]).matches(prev_log_index=0, prev_log_term=0) is True
 
 
 def test_log_matches_rejects_when_index_beyond_log():
     log = make_log([1, 1, 1])
-    assert log_matches(log, prev_log_index=4, prev_log_term=1) is False
+    assert log.matches(prev_log_index=4, prev_log_term=1) is False
 
 
 def test_log_matches_rejects_when_term_differs_at_that_index():
     log = make_log([1, 1, 4])
-    assert log_matches(log, prev_log_index=3, prev_log_term=1) is False
+    assert log.matches(prev_log_index=3, prev_log_term=1) is False
 
 
 def test_log_matches_accepts_when_index_and_term_agree():
     log = make_log([1, 1, 4])
-    assert log_matches(log, prev_log_index=3, prev_log_term=4) is True
+    assert log.matches(prev_log_index=3, prev_log_term=4) is True
 
 
 # --- REPL-6: nextIndex decrement on rejection --------------------------------
 
 
-def test_next_index_after_rejection_decrements():
-    assert next_index_after_rejection(5) == 4
+def test_follower_progress_record_rejection_decrements_next_index():
+    progress = FollowerProgress(next_index=5)
+    progress.record_rejection()
+    assert progress.next_index == 4
 
 
-def test_next_index_after_rejection_floors_at_one():
-    assert next_index_after_rejection(1) == 1
+def test_follower_progress_record_rejection_floors_at_one():
+    progress = FollowerProgress(next_index=1)
+    progress.record_rejection()
+    assert progress.next_index == 1
 
 
 # --- REPL-8: overwrite conflicting entries, leave matching ones alone -------
 
 
-def test_log_after_append_entries_appends_past_end_of_log():
+def test_after_append_entries_appends_past_end_of_log():
     log = make_log([1, 1])
     new_entries = [LogEntry(term=2, command="x")]
-    result = log_after_append_entries(log, prev_log_index=2, entries=new_entries)
+    result = log.after_append_entries(prev_log_index=2, entries=new_entries)
     assert [e.term for e in result] == [1, 1, 2]
 
 
-def test_log_after_append_entries_overwrites_conflicting_tail():
+def test_after_append_entries_overwrites_conflicting_tail():
     log = make_log([1, 1, 2, 2])  # follower has extra term-2 entries at 3, 4
     new_entries = [LogEntry(term=3, command="y")]  # leader's real entry 3 is term 3
-    result = log_after_append_entries(log, prev_log_index=2, entries=new_entries)
+    result = log.after_append_entries(prev_log_index=2, entries=new_entries)
     assert [e.term for e in result] == [1, 1, 3]
 
 
-def test_log_after_append_entries_leaves_matching_entries_untouched():
+def test_after_append_entries_leaves_matching_entries_untouched():
     log = make_log([1, 1, 3])
     same_entry = log[2]  # identical object: term 3, "cmd3"
-    result = log_after_append_entries(log, prev_log_index=2, entries=[same_entry])
+    result = log.after_append_entries(prev_log_index=2, entries=[same_entry])
     assert result == log
     assert result[2] is same_entry  # not replaced, since it already matched
 
@@ -159,14 +156,14 @@ def test_figure_7_scenario_c_extra_entry_survives_a_plain_heartbeat():
     leader_log = make_log(LEADER_TERMS)
     follower_log = make_log(FOLLOWER_TERMS["c"])
 
-    assert log_matches(follower_log, prev_log_index=10, prev_log_term=6)
-    heartbeat_result = log_after_append_entries(follower_log, prev_log_index=10, entries=[])
+    assert follower_log.matches(prev_log_index=10, prev_log_term=6)
+    heartbeat_result = follower_log.after_append_entries(prev_log_index=10, entries=[])
     assert [e.term for e in heartbeat_result] == FOLLOWER_TERMS["c"]
 
     # Now the leader (still term 8) accepts a new client command as entry 11.
     new_entry = LogEntry(term=8, command="new-write")
-    written_result = log_after_append_entries(
-        heartbeat_result, prev_log_index=10, entries=[new_entry]
+    written_result = heartbeat_result.after_append_entries(
+        prev_log_index=10, entries=[new_entry]
     )
     assert [e.term for e in written_result] == LEADER_TERMS + [8]
 
@@ -179,21 +176,21 @@ def test_figure_7_scenario_d_extra_entries_survive_a_plain_heartbeat():
     leader_log = make_log(LEADER_TERMS)
     follower_log = make_log(FOLLOWER_TERMS["d"])
 
-    assert log_matches(follower_log, prev_log_index=10, prev_log_term=6)
-    heartbeat_result = log_after_append_entries(follower_log, prev_log_index=10, entries=[])
+    assert follower_log.matches(prev_log_index=10, prev_log_term=6)
+    heartbeat_result = follower_log.after_append_entries(prev_log_index=10, entries=[])
     assert [e.term for e in heartbeat_result] == FOLLOWER_TERMS["d"]
 
     new_entry = LogEntry(term=8, command="new-write")
-    written_result = log_after_append_entries(
-        heartbeat_result, prev_log_index=10, entries=[new_entry]
+    written_result = heartbeat_result.after_append_entries(
+        prev_log_index=10, entries=[new_entry]
     )
     # Both stale entries (11, 12) are gone, not just the conflicting one.
     assert [e.term for e in written_result] == LEADER_TERMS + [8]
 
 
-def test_last_log_index_and_term_on_empty_and_nonempty_logs():
-    assert last_log_index([]) == 0
-    assert last_log_term([]) == 0
+def test_last_index_and_term_on_empty_and_nonempty_logs():
+    assert Log().last_index == 0
+    assert Log().last_term == 0
     log = make_log(LEADER_TERMS)
-    assert last_log_index(log) == 10
-    assert last_log_term(log) == 6
+    assert log.last_index == 10
+    assert log.last_term == 6

@@ -98,7 +98,7 @@ class NodeState:
             )
         self.role = Role.LEADER
 
-    def try_catch_up_to_term(self, term: int) -> bool:
+    def handle_observed_term(self, term: int) -> bool:
         """Catch up current_term, voted_for, and role if `term` is higher.
 
         The one trigger STATE-4, STATE-5, and STATE-6 all fire from:
@@ -127,15 +127,6 @@ class NodeState:
         to Follower (STATE-4 — the role consequence, scoped to those
         two roles specifically, because a plain Follower has no role
         left to give up).
-
-        Named `try_catch_up_to_term` rather than something like
-        `observe_term` deliberately: this is not a read of the observed
-        term, it mutates `current_term`, `voted_for`, and possibly
-        `role`, and reports back whether it actually did anything — a
-        caller that only needs that fact ("did this RPC turn out to
-        carry a newer term than I had?") gets it from the return
-        value, but the name itself should read as the mutating,
-        conditional action it is, not as a getter.
 
         Args:
             term: The term observed in an incoming RPC or RPC response.

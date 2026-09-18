@@ -1,24 +1,27 @@
-"""Pure functions for Raft's log-matching and log-repair mechanics.
+"""The Log class: Raft's replicated log and its matching/repair mechanics.
 
-The Raft log itself, and the mechanics that keep a Follower's copy of it
-consistent with the Leader's (REPL-5 through REPL-8). Everything here is a
-plain function over an ordinary Python list of LogEntry — no I/O, no
-asyncio, no persistence — because these are pure decisions ("does this log
-already agree with the Leader at this position?", "what should the log
-look like after this AppendEntries RPC?") that need to be correct on their
-own before any networking or disk-access code can be trusted to call them
-correctly.
+The log itself, and the mechanics that keep a Follower's copy of it
+consistent with the Leader's (REPL-5 through REPL-8), modeled as a class
+that owns its entries rather than free functions that take a log as an
+argument — a `Log` answers its own consistency and repair questions about
+itself. No I/O, no asyncio, no persistence — these are pure decisions
+("does this log already agree with the Leader at this position?", "what
+should the log look like after this AppendEntries RPC?") that need to be
+correct on their own before any networking or disk-access code can be
+trusted to call them correctly.
 
 Raft's own 1-based indexing is used throughout (the first entry in the log
 is index 1, and index 0 conventionally means "before the first entry, no
 entry required") rather than Python's native 0-based list indexing, so
-these functions read the same way the requirements below and the paper
-itself describe them. The conversion to a 0-based Python list position
-happens once, at the point of use, inside each function.
+this class reads the same way the requirements below and the paper itself
+describe it. The conversion to a 0-based Python list position happens
+once, at the point of use, inside each method.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator, Optional
+
+from raftkv.consensus.log_position import LogPosition
 
 
 @dataclass(frozen=True)
@@ -35,9 +38,8 @@ class LogEntry:
 
     Frozen because a log entry, once created, must never be mutated in
     place — the only way an entry ever goes away is by being replaced
-    wholesale, as part of computing a new log in
-    `log_after_append_entries` when a genuine conflict forces an
-    overwrite.
+    wholesale, as part of computing a new log in `Log.after_append_entries`
+    when a genuine conflict forces an overwrite.
 
     Attributes:
         term: The term the leader was in when this entry was appended.
@@ -48,161 +50,171 @@ class LogEntry:
     command: Any
 
 
-def last_log_index(log: list[LogEntry]) -> int:
-    """Return the 1-based index of the last entry in the log.
+class Log:
+    """A node's replicated log, exposing REPL-5/REPL-8's own mechanics.
 
-    0 doubles as "no entries yet" throughout this module, matching how
-    `log_matches` treats a `prev_log_index` of 0 as automatically
-    satisfied. This is the fact ELECT-7 requires a RequestVote RPC to
-    carry about the candidate's own log, and one half of what ELECT-10's
-    up-to-date comparison is defined over.
-
-    Args:
-        log: The log to measure.
-
-    Returns:
-        The 1-based index of the last entry, or 0 if `log` is empty.
+    Wraps an ordered sequence of LogEntry and answers exactly the two
+    questions a Follower needs answered about its own log when handling
+    AppendEntries: "do I already agree with the Leader here?"
+    (`matches`) and "what should my log become after this RPC?"
+    (`after_append_entries`). Immutable by construction — `matches` and
+    the read-only properties never change anything, and
+    `after_append_entries` returns a new `Log` rather than mutating this
+    one, consistent with `LogEntry` itself being frozen.
     """
-    return len(log)
 
+    def __init__(self, entries: Optional[list[LogEntry]] = None) -> None:
+        """Wrap a sequence of log entries.
 
-def last_log_term(log: list[LogEntry]) -> int:
-    """Return the term of the last entry in the log.
+        Args:
+            entries: The entries this log starts with, in order (index 1
+                first). Copied on construction, so later mutating the
+                list passed in has no effect on this `Log`. Defaults to
+                an empty log.
+        """
+        self._entries: list[LogEntry] = list(entries) if entries else []
 
-    Paired with `last_log_index`, this is exactly the (term, index) fact
-    ELECT-7 requires a RequestVote RPC to carry and ELECT-10's up-to-date
-    comparison is defined over.
+    def __len__(self) -> int:
+        return len(self._entries)
 
-    Args:
-        log: The log to inspect.
+    def __iter__(self) -> Iterator[LogEntry]:
+        return iter(self._entries)
 
-    Returns:
-        The term of the last entry, or 0 if `log` is empty.
-    """
-    return log[-1].term if log else 0
+    def __getitem__(self, key):
+        return self._entries[key]
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Log):
+            return NotImplemented
+        return self._entries == other._entries
 
-def log_matches(log: list[LogEntry], prev_log_index: int, prev_log_term: int) -> bool:
-    """Check whether the log already agrees with the leader at a position.
+    @property
+    def last_index(self) -> int:
+        """The 1-based index of this log's last entry, or 0 if empty.
 
-    Implements REPL-5's consistency check: "a Follower shall reject an
-    AppendEntries RPC whenever its own log does not contain an entry at
-    the RPC's previous-entry index whose term matches the RPC's
-    previous-entry term." This function IS that check, phrased as the
-    acceptance condition rather than the rejection one — a caller rejects
-    the RPC precisely when this returns False.
+        0 doubles as "no entries yet" throughout this class, matching how
+        `matches` treats a `prev_log_index` of 0 as automatically
+        satisfied. This is the fact ELECT-7 requires a RequestVote RPC to
+        carry about the candidate's own log, and one half of
+        `last_position`.
+        """
+        return len(self._entries)
 
-    `prev_log_index == 0` always returns True, because index 0 means "the
-    Leader is proposing to replace everything from the very start of the
-    log" — there is no preceding entry for the two logs to agree on, so
-    nothing can disagree either. This is what lets a brand-new,
-    empty-log Follower accept its very first AppendEntries.
+    @property
+    def last_term(self) -> int:
+        """The term of this log's last entry, or 0 if empty.
 
-    For any other `prev_log_index`, the check is exactly the single-point
-    comparison the Log Matching Property (§5.3) says is sufficient: if
-    `log` doesn't even have an entry that far in, or the entry it has
-    there was written in a different term, the two logs cannot be assumed
-    to agree before that point either, so the RPC is rejected outright
-    rather than trusting a shorter or differently-originated prefix.
+        Paired with `last_index`, this is exactly the (term, index) fact
+        ELECT-7 requires a RequestVote RPC to carry, and the other half
+        of `last_position`.
+        """
+        return self._entries[-1].term if self._entries else 0
 
-    Args:
-        log: The log being checked (typically the follower's own log).
-        prev_log_index: The 1-based index of the entry immediately
-            preceding the entries under consideration, as carried by an
-            AppendEntries RPC. 0 means there is no preceding entry.
-        prev_log_term: The term the entry at `prev_log_index` is expected
-            to have.
+    @property
+    def last_position(self) -> LogPosition:
+        """This log's last entry, as the LogPosition ELECT-10 compares.
 
-    Returns:
-        True if `log` already agrees with the leader at `prev_log_index`
-        (or `prev_log_index` is 0), False otherwise.
-    """
-    if prev_log_index == 0:
-        return True
-    if prev_log_index > len(log):
-        return False
-    return log[prev_log_index - 1].term == prev_log_term
+        A convenience combining `last_term` and `last_index` into the
+        single value `LogPosition.is_at_least_as_up_to_date_as` actually
+        takes, so a caller doing an ELECT-10 comparison doesn't have to
+        assemble the pair by hand.
+        """
+        return LogPosition(term=self.last_term, index=self.last_index)
 
+    def matches(self, prev_log_index: int, prev_log_term: int) -> bool:
+        """Check whether this log already agrees with the leader at a position.
 
-def log_after_append_entries(
-    log: list[LogEntry], prev_log_index: int, entries: list[LogEntry]
-) -> list[LogEntry]:
-    """Compute the log that results from applying an AppendEntries RPC.
+        Implements REPL-5's consistency check: "a Follower shall reject
+        an AppendEntries RPC whenever its own log does not contain an
+        entry at the RPC's previous-entry index whose term matches the
+        RPC's previous-entry term." This method IS that check, phrased
+        as the acceptance condition rather than the rejection one — a
+        caller rejects the RPC precisely when this returns False.
 
-    Implements REPL-8 — "once an AppendEntries RPC is accepted, the
-    Leader's replication logic shall overwrite any conflicting entries
-    already present in that Follower's log with the Leader's own
-    entries" — by applying the two receiver rules Figure 2 of the paper
-    actually specifies this as: the moment an existing entry conflicts
-    with an incoming one (same position, different term), delete that
-    entry and everything after it; then append whatever of the incoming
-    entries didn't already fit.
+        `prev_log_index == 0` always returns True, because index 0 means
+        "the Leader is proposing to replace everything from the very
+        start of the log" — there is no preceding entry for the two logs
+        to agree on, so nothing can disagree either. This is what lets a
+        brand-new, empty log accept its very first AppendEntries.
 
-    Deliberately does NOT delete anything outside that rule: an entry
-    beyond the range `entries` covers, or one that already matches its
-    incoming counterpart term-for-term, is left exactly as it was. This is
-    why a stale, uncommitted tail entry from an old, abandoned Leader
-    (Figure 7, scenarios (c) and (d) of the paper) survives an ordinary
-    heartbeat untouched — a heartbeat carries no new entries to conflict
-    with it — and is only ever overwritten once the current Leader
-    actually produces a genuinely conflicting entry at that same position.
+        For any other `prev_log_index`, the check is exactly the
+        single-point comparison the Log Matching Property (§5.3) says is
+        sufficient: if this log doesn't even have an entry that far in,
+        or the entry it has there was written in a different term, the
+        two logs cannot be assumed to agree before that point either, so
+        the RPC is rejected outright rather than trusting a shorter or
+        differently-originated prefix.
 
-    Callers must have already confirmed
-    `log_matches(log, prev_log_index, prev_log_term)` — REPL-5 — before
-    calling this; it does not repeat that check itself, and calling it
-    against a `prev_log_index` the two logs don't actually agree on yet
-    would silently corrupt the result rather than raise.
+        Args:
+            prev_log_index: The 1-based index of the entry immediately
+                preceding the entries under consideration, as carried by
+                an AppendEntries RPC. 0 means there is no preceding
+                entry.
+            prev_log_term: The term the entry at `prev_log_index` is
+                expected to have.
 
-    Does not mutate `log` — consistent with `LogEntry` being frozen,
-    nothing in this module ever mutates a log, it only ever computes what
-    the log should become next.
+        Returns:
+            True if this log already agrees with the leader at
+            `prev_log_index` (or `prev_log_index` is 0), False
+            otherwise.
+        """
+        if prev_log_index == 0:
+            return True
+        if prev_log_index > len(self._entries):
+            return False
+        return self._entries[prev_log_index - 1].term == prev_log_term
 
-    Args:
-        log: The log to start from (typically the follower's own log).
-            Not mutated.
-        prev_log_index: The 1-based index of the entry immediately
-            preceding `entries`, as already confirmed by a prior
-            `log_matches` call.
-        entries: The leader's entries to reconcile into `log`, in order,
-            starting immediately after `prev_log_index`.
+    def after_append_entries(
+        self, prev_log_index: int, entries: list[LogEntry]
+    ) -> "Log":
+        """Compute the log that results from applying an AppendEntries RPC.
 
-    Returns:
-        A new list of LogEntry representing the log after applying the
-        AppendEntries RPC.
-    """
-    new_log = list(log)
-    for offset, entry in enumerate(entries):
-        position = prev_log_index + offset
-        if position < len(new_log):
-            if new_log[position].term != entry.term:
-                new_log = new_log[:position] + [entry]
-        else:
-            new_log.append(entry)
-    return new_log
+        Implements REPL-8 — "once an AppendEntries RPC is accepted, the
+        Leader's replication logic shall overwrite any conflicting
+        entries already present in that Follower's log with the
+        Leader's own entries" — by applying the two receiver rules
+        Figure 2 of the paper actually specifies this as: the moment an
+        existing entry conflicts with an incoming one (same position,
+        different term), delete that entry and everything after it;
+        then append whatever of the incoming entries didn't already fit.
 
+        Deliberately does NOT delete anything outside that rule: an
+        entry beyond the range `entries` covers, or one that already
+        matches its incoming counterpart term-for-term, is left exactly
+        as it was. This is why a stale, uncommitted tail entry from an
+        old, abandoned Leader (Figure 7, scenarios (c) and (d) of the
+        paper) survives an ordinary heartbeat untouched — a heartbeat
+        carries no new entries to conflict with it — and is only ever
+        overwritten once the current Leader actually produces a
+        genuinely conflicting entry at that same position.
 
-def next_index_after_rejection(next_index: int) -> int:
-    """Compute the nextIndex to retry with after an AppendEntries rejection.
+        Callers must have already confirmed
+        `self.matches(prev_log_index, prev_log_term)` — REPL-5 — before
+        calling this; it does not repeat that check itself, and calling
+        it against a `prev_log_index` the two logs don't actually agree
+        on yet would silently corrupt the result rather than raise.
 
-    Implements REPL-6: "whenever a Leader's AppendEntries RPC is
-    rejected under REPL-5, the Leader shall decrement its stored
-    nextIndex for that Follower." The floor at 1 exists because
-    `log_matches` already treats `prev_log_index == 0` as automatically
-    satisfied — nextIndex can never usefully fall below 1, since index 0
-    needs no agreement check at all, and decrementing past it would just
-    repeat an already-guaranteed-to-succeed probe forever.
+        Returns a new `Log` rather than mutating this one — consistent
+        with `LogEntry` being frozen, nothing in this class ever mutates
+        a log, it only ever computes what the log should become next.
 
-    This is only half of the repair loop REPL-6 and REPL-7 describe
-    together: the retrying itself — calling this, then `log_matches`
-    again with the new, lower index, and repeating until it succeeds — is
-    REPL-7's job, and is therefore the caller's responsibility, not this
-    function's.
+        Args:
+            prev_log_index: The 1-based index of the entry immediately
+                preceding `entries`, as already confirmed by a prior
+                `matches` call.
+            entries: The leader's entries to reconcile into this log, in
+                order, starting immediately after `prev_log_index`.
 
-    Args:
-        next_index: The Leader's current nextIndex for the follower
-            whose AppendEntries RPC was just rejected.
-
-    Returns:
-        The decremented nextIndex, floored at 1.
-    """
-    return max(1, next_index - 1)
+        Returns:
+            A new `Log` representing this log after applying the
+            AppendEntries RPC.
+        """
+        new_entries = list(self._entries)
+        for offset, entry in enumerate(entries):
+            position = prev_log_index + offset
+            if position < len(new_entries):
+                if new_entries[position].term != entry.term:
+                    new_entries = new_entries[:position] + [entry]
+            else:
+                new_entries.append(entry)
+        return Log(new_entries)

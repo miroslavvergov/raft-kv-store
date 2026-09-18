@@ -68,44 +68,44 @@ def test_leader_to_leader_is_illegal():
     assert node.role is Role.LEADER
 
 
-def test_try_catch_up_to_term_does_nothing_for_a_lower_or_equal_term():
+def test_handle_observed_term_does_nothing_for_a_lower_or_equal_term():
     node = NodeState(node_id="n1")
     node.become_candidate()  # term becomes 1
-    fired = node.try_catch_up_to_term(1)
+    fired = node.handle_observed_term(1)
     assert fired is False
     assert node.role is Role.CANDIDATE
     assert node.current_term == 1
     assert node.voted_for == "n1"
 
 
-def test_candidate_catches_up_to_higher_term_and_reverts_to_follower():
+def test_candidate_handles_higher_observed_term_and_reverts_to_follower():
     # STATE-4 (role), STATE-5 (currentTerm), STATE-6 (votedFor) all firing
     # together off the same trigger, as one forced RPC.
     node = NodeState(node_id="n1")
     node.become_candidate()  # role=CANDIDATE, term=1, votedFor="n1"
-    fired = node.try_catch_up_to_term(5)
+    fired = node.handle_observed_term(5)
     assert fired is True
     assert node.role is Role.FOLLOWER  # STATE-4
     assert node.current_term == 5  # STATE-5
     assert node.voted_for is None  # STATE-6
 
 
-def test_leader_catches_up_to_higher_term_and_reverts_to_follower():
+def test_leader_handles_higher_observed_term_and_reverts_to_follower():
     node = NodeState(node_id="n1")
     node.become_candidate()
     node.become_leader()
-    fired = node.try_catch_up_to_term(9)
+    fired = node.handle_observed_term(9)
     assert fired is True
     assert node.role is Role.FOLLOWER  # STATE-4
     assert node.current_term == 9  # STATE-5
     assert node.voted_for is None  # STATE-6
 
 
-def test_follower_catches_up_to_higher_term_with_no_role_to_give_up():
+def test_follower_handles_higher_observed_term_with_no_role_to_give_up():
     # STATE-4 is scoped to Candidate/Leader only — a plain Follower has no
     # role to give up, but STATE-5/STATE-6 still apply unconditionally.
     node = NodeState(node_id="n1")
-    fired = node.try_catch_up_to_term(3)
+    fired = node.handle_observed_term(3)
     assert fired is True
     assert node.role is Role.FOLLOWER
     assert node.current_term == 3
