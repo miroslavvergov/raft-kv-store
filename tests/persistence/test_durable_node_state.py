@@ -56,7 +56,7 @@ class FailingStore(SqliteStore):
 
 
 class GatedStore(SqliteStore):
-    """A store that holds each term/vote write in flight until `release` is set.
+    """A store that holds each write in flight until `release` is set.
 
     `entered` is set as soon as a write arrives, so a test knows exactly
     when one is pending instead of guessing with sleeps.
@@ -73,6 +73,12 @@ class GatedStore(SqliteStore):
         self.entered.set()
         await self.release.wait()
         await super().save_term_and_vote(current_term, voted_for)
+
+    async def save_log_from(self, index, entries):
+        self.writes.append(("log_from", index))
+        self.entered.set()
+        await self.release.wait()
+        await super().save_log_from(index, entries)
 
 
 async def seed_log(path, terms):
@@ -187,6 +193,49 @@ async def test_failed_write_leaves_term_vote_and_role_unchanged(db_path):
         with pytest.raises(OSError):
             await durable.handle_observed_term(4)
         assert durable.current_term == 0
+
+
+async def test_cancelled_caller_still_installs_what_it_persisted(db_path):
+    # A write can complete on the store's background thread after the task
+    # that issued it is cancelled. The change must still be installed, or
+    # disk would hold a vote the node does not know it cast.
+    async with GatedStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store)
+        caller = asyncio.create_task(durable.become_candidate())
+        await store.entered.wait()
+
+        caller.cancel()
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not caller.done()  # still waiting for its write, lock still held
+
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert (durable.current_term, durable.voted_for) == (1, NODE_ID)
+        assert durable.role is Role.CANDIDATE
+
+    persisted = await reload(db_path)
+    assert (persisted.current_term, persisted.voted_for) == (1, NODE_ID)
+
+
+async def test_cancelled_log_write_still_installs_the_new_log(db_path):
+    await seed_log(db_path, [1, 1])
+    async with GatedStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store)
+        caller = asyncio.create_task(
+            durable.receive_entries(2, 1, [LogEntry(term=2, command="x")])
+        )
+        await store.entered.wait()
+
+        caller.cancel()
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        in_memory = durable.log
+
+    assert [e.term for e in in_memory] == [1, 1, 2]
+    assert (await reload(db_path)).log == in_memory
 
 
 async def test_failed_write_leaves_the_log_unchanged(db_path):

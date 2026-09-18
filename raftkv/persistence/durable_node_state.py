@@ -2,7 +2,7 @@
 
 import asyncio
 import copy
-from typing import Optional
+from typing import Any, Coroutine, Optional
 
 from raftkv.consensus import Log, LogEntry, NodeState, Role
 from raftkv.persistence.sqlite_store import SqliteStore
@@ -22,13 +22,20 @@ class DurableNodeState:
        write to commit.
     3. Only then install it as the node's current in-memory state.
 
-    Two properties follow. First, a caller that awaits one of these
+    Three properties follow. First, a caller that awaits one of these
     methods and only then responds to an RPC has persisted before
     responding (PERSIST-1 through PERSIST-3), and a Candidate that awaits
     `become_candidate` before sending RequestVote has persisted before
     sending (ELECT-5). Second, the in-memory state is never ahead of what
     is on disk: if a write fails, the method raises and the node's state
-    is exactly what it was before the call.
+    is exactly what it was before the call. Third, what is on disk is
+    never ahead of the in-memory state either: once a write has been
+    handed to the store it runs to completion even if the calling task is
+    cancelled meanwhile, the change is installed, and only then does the
+    cancellation propagate. A write can finish on the store's background
+    thread after the task that issued it has been cancelled, so a
+    cancelled caller that simply stopped before step 3 would leave a
+    change on disk that the node does not know it made.
 
     The lock is held across the `await` on the write, which is where
     `aiosqlite` suspends the calling coroutine while its background
@@ -119,14 +126,19 @@ class DurableNodeState:
                 changed or written.
             sqlite3.Error: If the write fails. The node's in-memory
                 state is left as it was before the call.
+            asyncio.CancelledError: If the calling task was cancelled
+                while the write was in flight — raised only after the
+                write has committed and the new state is installed.
         """
         async with self._lock:
             next_state = copy.copy(self._state)
             next_state.become_candidate()
-            await self._store.save_term_and_vote(
-                next_state.current_term, next_state.voted_for
+            await self._persist_then_install(
+                self._store.save_term_and_vote(
+                    next_state.current_term, next_state.voted_for
+                ),
+                next_state=next_state,
             )
-            self._state = next_state
 
     async def become_leader(self) -> None:
         """Become Leader.
@@ -165,15 +177,20 @@ class DurableNodeState:
         Raises:
             sqlite3.Error: If the write fails. The node's in-memory
                 state is left as it was before the call.
+            asyncio.CancelledError: If the calling task was cancelled
+                while the write was in flight — raised only after the
+                write has committed and the new state is installed.
         """
         async with self._lock:
             next_state = copy.copy(self._state)
             if not next_state.handle_observed_term(term):
                 return False
-            await self._store.save_term_and_vote(
-                next_state.current_term, next_state.voted_for
+            await self._persist_then_install(
+                self._store.save_term_and_vote(
+                    next_state.current_term, next_state.voted_for
+                ),
+                next_state=next_state,
             )
-            self._state = next_state
             return True
 
     async def receive_entries(
@@ -213,15 +230,65 @@ class DurableNodeState:
         Raises:
             sqlite3.Error: If the write fails. The node's in-memory log
                 is left as it was before the call.
+            asyncio.CancelledError: If the calling task was cancelled
+                while the write was in flight — raised only after the
+                write has committed and the new log is installed.
         """
         async with self._lock:
             if not self._log.matches(prev_log_index, prev_log_term):
                 return False
             next_log = self._log.after_append_entries(prev_log_index, entries)
             changed_from = self._log.first_differing_index(next_log)
-            if changed_from is not None:
-                await self._store.save_log_from(
-                    changed_from, next_log[changed_from - 1 :]
-                )
-            self._log = next_log
+            if changed_from is None:
+                self._log = next_log
+                return True
+            await self._persist_then_install(
+                self._store.save_log_from(changed_from, next_log[changed_from - 1 :]),
+                next_log=next_log,
+            )
             return True
+
+    async def _persist_then_install(
+        self,
+        write: Coroutine[Any, Any, None],
+        next_state: Optional[NodeState] = None,
+        next_log: Optional[Log] = None,
+    ) -> None:
+        """Run `write` to completion, then install what it persisted.
+
+        The write runs as its own task, which cancelling the caller does
+        not cancel: `asyncio.wait` stops waiting when the caller is
+        cancelled but leaves the awaited task running. The caller keeps
+        waiting until the write has finished either way. If the write
+        committed, `next_state` and/or `next_log` are installed; if it
+        failed, nothing is installed. A cancellation received meanwhile
+        is raised only after that.
+
+        Args:
+            write: The store write that makes the change durable.
+            next_state: The NodeState to install once `write` commits.
+            next_log: The Log to install once `write` commits.
+
+        Raises:
+            asyncio.CancelledError: If the caller was cancelled while the
+                write was in flight.
+            Exception: Whatever `write` raised, if it failed and the
+                caller was not cancelled.
+        """
+        pending = asyncio.ensure_future(write)
+        cancelled = False
+        while not pending.done():
+            try:
+                await asyncio.wait({pending})
+            except asyncio.CancelledError:
+                cancelled = True
+        failure = pending.exception()
+        if failure is None:
+            if next_state is not None:
+                self._state = next_state
+            if next_log is not None:
+                self._log = next_log
+        if cancelled:
+            raise asyncio.CancelledError() from failure
+        if failure is not None:
+            raise failure

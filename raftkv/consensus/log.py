@@ -1,9 +1,8 @@
 """The Log class: Raft's replicated log and its matching/repair mechanics.
 
 The log itself, and the mechanics that keep a Follower's copy of it
-consistent with the Leader's (REPL-5 through REPL-8), modeled as a class
-that owns its entries rather than free functions that take a log as an
-argument — a `Log` answers its own consistency and repair questions about
+consistent with the Leader's (REPL-5 through REPL-8). A `Log` owns its
+entries and answers its own consistency and repair questions about
 itself. No I/O, no asyncio, no persistence — these are pure decisions
 ("does this log already agree with the Leader at this position?", "what
 should the log look like after this AppendEntries RPC?") that need to be
@@ -259,7 +258,7 @@ class Log:
         with a newly computed one by rewriting only what changed: every
         entry before the returned index is identical in both logs, and
         everything from it onward must be replaced. In particular, when
-        `after_append_entries` deliberately leaves a stale, unconflicted
+        `after_append_entries` leaves a stale, unconflicted
         tail in place (Figure 7, scenarios (c) and (d)), the logs don't
         differ there, so that tail is never touched on disk either.
 

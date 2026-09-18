@@ -6,10 +6,8 @@ class FollowerProgress:
 
     REPL-6 speaks of the Leader's "stored nextIndex for that Follower" —
     a value that persists and evolves across an entire term as
-    AppendEntries RPCs to this one follower succeed or get rejected. That
-    is genuinely mutable, evolving state belonging to one follower, which
-    is why it is modeled as an object here rather than a bare int passed
-    around a retry loop.
+    AppendEntries RPCs to this one follower succeed or get rejected. One
+    FollowerProgress holds that value for one follower.
 
     Attributes:
         next_index: The index of the next log entry the Leader will send

@@ -9,8 +9,8 @@ class LogPosition:
 
     ELECT-9/ELECT-10 never need to inspect more than a log's last entry
     to decide whether one log is at least as up to date as another, so
-    this is deliberately not a full log — just the two facts the
-    comparison actually operates on. `Log.last_position` produces one of
+    this holds only the two facts that comparison operates on, not a full
+    log. `Log.last_position` produces one of
     these for a real log, and both sides of a RequestVote RPC's own
     last-log-index/term fields (ELECT-7) reduce to exactly this pair too.
 
