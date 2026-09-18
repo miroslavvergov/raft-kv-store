@@ -19,7 +19,7 @@ once, at the point of use, inside each method.
 """
 
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Iterator, Optional
 
 from raftkv.consensus.log_position import LogPosition
 
@@ -36,6 +36,17 @@ class LogEntry:
     entry per (index, term) pair and never rewrites its own log
     afterward.
 
+    `command` is an opaque string (DD-21): the KV Store layer serializes
+    a client command exactly once, when the Leader first proposes it, and
+    from then on every node — the Leader included — stores, replicates,
+    persists, and applies that exact string. Nothing in the Raft layer
+    ever decodes or re-encodes it, which is what makes APPLY-7 hold: a
+    value that went through a decode/re-encode round trip (a tuple coming
+    back as a list, an integer dict key coming back as a string) would no
+    longer be the command the Leader appended, and replicas applying
+    different values would break the premise APPLY-6's determinism
+    depends on.
+
     Frozen because a log entry, once created, must never be mutated in
     place — the only way an entry ever goes away is by being replaced
     wholesale, as part of computing a new log in `Log.after_append_entries`
@@ -43,11 +54,12 @@ class LogEntry:
 
     Attributes:
         term: The term the leader was in when this entry was appended.
-        command: The client command this entry carries.
+        command: The client command, already serialized by the KV Store
+            layer, carried verbatim.
     """
 
     term: int
-    command: Any
+    command: str
 
 
 class Log:
@@ -218,3 +230,34 @@ class Log:
             else:
                 new_entries.append(entry)
         return Log(new_entries)
+
+    def first_differing_index(self, other: "Log") -> Optional[int]:
+        """Find the first index at which this log and another log differ.
+
+        Compares entries position by position and reports the 1-based
+        index of the first position where they are not equal. If one log
+        is a strict prefix of the other, the first differing index is the
+        one just past the end of the shorter log — the first position
+        that exists in only one of them.
+
+        This is what lets a durable copy of the log be brought in line
+        with a newly computed one by rewriting only what changed: every
+        entry before the returned index is identical in both logs, and
+        everything from it onward must be replaced. In particular, when
+        `after_append_entries` deliberately leaves a stale, unconflicted
+        tail in place (Figure 7, scenarios (c) and (d)), the logs don't
+        differ there, so that tail is never touched on disk either.
+
+        Args:
+            other: The log to compare against.
+
+        Returns:
+            The 1-based index of the first differing position, or None if
+            the two logs are identical.
+        """
+        for position, (mine, theirs) in enumerate(zip(self._entries, other._entries)):
+            if mine != theirs:
+                return position + 1
+        if len(self._entries) != len(other._entries):
+            return min(len(self._entries), len(other._entries)) + 1
+        return None

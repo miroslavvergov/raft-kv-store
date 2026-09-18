@@ -194,3 +194,42 @@ def test_last_index_and_term_on_empty_and_nonempty_logs():
     log = make_log(LEADER_TERMS)
     assert log.last_index == 10
     assert log.last_term == 6
+
+
+# --- first_differing_index: the part of a log that actually changed ---------
+
+
+def test_first_differing_index_is_none_for_identical_logs():
+    assert make_log([1, 1, 2]).first_differing_index(make_log([1, 1, 2])) is None
+    assert Log().first_differing_index(Log()) is None
+
+
+def test_first_differing_index_finds_first_conflicting_position():
+    assert make_log([1, 1, 2, 2]).first_differing_index(make_log([1, 1, 3])) == 3
+
+
+def test_first_differing_index_when_one_log_is_a_prefix_of_the_other():
+    assert make_log([1, 1]).first_differing_index(make_log([1, 1, 2])) == 3
+    assert make_log([1, 1, 2]).first_differing_index(make_log([1, 1])) == 3
+    assert Log().first_differing_index(make_log([1])) == 1
+
+
+def test_first_differing_index_compares_commands_not_just_terms():
+    ours = Log([LogEntry(term=1, command="a")])
+    theirs = Log([LogEntry(term=1, command="b")])
+    assert ours.first_differing_index(theirs) == 1
+
+
+def test_first_differing_index_after_a_heartbeat_on_figure_7_c_is_none():
+    # The stale tail follower (c) keeps through a heartbeat is not a change,
+    # so nothing needs rewriting.
+    follower_log = make_log(FOLLOWER_TERMS["c"])
+    after_heartbeat = follower_log.after_append_entries(prev_log_index=10, entries=[])
+    assert follower_log.first_differing_index(after_heartbeat) is None
+
+
+def test_first_differing_index_after_repairing_figure_7_f_is_index_four():
+    leader_log = make_log(LEADER_TERMS)
+    follower_log = make_log(FOLLOWER_TERMS["f"])
+    reconciled, _ = reconcile(leader_log, follower_log)
+    assert follower_log.first_differing_index(reconciled) == 4

@@ -21,30 +21,69 @@ class NodeState:
     """One node's Raft role, current term, and vote.
 
     Attributes:
-        node_id: This node's own identifier, recorded as `voted_for`
-            when the node votes for itself on becoming a Candidate.
+        node_id: This node's permanent identity (NODE-8, DD-20): a
+            positive integer, distinct from its network address, that
+            never changes across restarts. Recorded as `voted_for` when
+            the node votes for itself on becoming a Candidate.
         role: The node's current Role (STATE-1).
         current_term: The node's current term.
-        voted_for: The identifier this node voted for in `current_term`,
-            or None if it hasn't voted yet this term.
+        voted_for: The node ID this node voted for in `current_term`, or
+            None if it hasn't voted yet this term.
     """
 
-    def __init__(self, node_id):
-        """Initialize a node in the Follower role with no term history.
+    def __init__(self, node_id: int) -> None:
+        """Initialize a brand-new node in the Follower role with no term history.
 
-        STATE-2: a node starts in the Follower role, and starts with no
-        opinion about any term yet. (PERSIST-4 and PERSIST-5 are what
-        make this the state a *restarted* node begins evaluating RPCs
-        from, in the real system; here it is simply the state a new
-        `NodeState` object begins in.)
+        STATE-2: a node starts in the Follower role. A node that has
+        never run before has no opinion about any term yet, so it starts
+        at `current_term = 0` with no vote. A node restarting from
+        persisted state is built with `reloaded` instead.
 
         Args:
-            node_id: This node's own identifier.
+            node_id: This node's permanent positive-integer identity.
         """
         self.node_id = node_id
         self.role = Role.FOLLOWER
         self.current_term = 0
-        self.voted_for: Optional[object] = None
+        self.voted_for: Optional[int] = None
+
+    @classmethod
+    def reloaded(
+        cls, node_id: int, current_term: int, voted_for: Optional[int]
+    ) -> "NodeState":
+        """Build a node from the term and vote it had persisted before restarting.
+
+        STATE-2: a node starts in the Follower role immediately after
+        reloading its persisted state (PERSIST-4, PERSIST-5) — and that
+        holds regardless of the role it had before it stopped. A node
+        that crashed while a Candidate, or even while Leader, comes back
+        as a Follower; leadership is never persisted and is only ever
+        regained by winning a new election.
+
+        The reloaded `current_term` and `voted_for` are restored exactly
+        as they were. This is what prevents the double vote illustrated
+        under PERSIST-1/PERSIST-2: a node that already voted in some term
+        before crashing still remembers that vote afterwards, and so
+        refuses a second, different vote in that same term.
+
+        For a node that has never run before, the store reports
+        `current_term = 0` and no vote, which makes the result identical
+        to constructing a new `NodeState` directly.
+
+        Args:
+            node_id: This node's permanent positive-integer identity.
+            current_term: The term reloaded from stable storage.
+            voted_for: The vote reloaded from stable storage, or None if
+                the node had not voted in `current_term`.
+
+        Returns:
+            A NodeState in the Follower role carrying the reloaded term
+            and vote.
+        """
+        state = cls(node_id)
+        state.current_term = current_term
+        state.voted_for = voted_for
+        return state
 
     def become_candidate(self) -> None:
         """Transition to Candidate, incrementing the term and voting for self.
@@ -53,12 +92,6 @@ class NodeState:
         edges of STATE-3, together with ELECT-3 and ELECT-4 — the two
         things the requirements say must happen "upon becoming
         Candidate": incrementing `current_term` and voting for self.
-        These three are one method, not three, because they are
-        triggered by exactly the same event and the requirements
-        themselves describe them that way; splitting them apart would
-        only move the risk of calling them out of order, or forgetting
-        one, onto whichever caller has to remember to invoke all three
-        together.
 
         Raises:
             IllegalTransition: If the node's current role is not
@@ -103,12 +136,8 @@ class NodeState:
 
         The one trigger STATE-4, STATE-5, and STATE-6 all fire from:
         observing, in any RPC or RPC response, a term higher than this
-        node's own `current_term`. All three are implemented together
-        here because they are three obligations of a single event, not
-        three separate decisions a caller could choose to invoke
-        independently — see DD-8's own reasoning for why they're guarded
-        by one lock rather than three, once this state is driven by real
-        concurrent RPC handlers instead of direct calls.
+        node's own `current_term`. All three consequences of that
+        trigger take effect in this single call.
 
         Does nothing if `term` is not strictly greater than
         `current_term` — STATE-4, STATE-5, and STATE-6 all say "higher
