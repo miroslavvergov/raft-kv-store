@@ -7,6 +7,7 @@ still pending.
 """
 
 import asyncio
+from dataclasses import dataclass
 
 import pytest
 
@@ -258,62 +259,94 @@ async def test_figure_7_stale_tail_survives_a_heartbeat_on_disk_too(db_path, lab
 # --- DD-19: no second decision while a first write is in flight -------------
 
 
-async def test_second_decision_waits_while_first_write_is_in_flight(db_path):
-    async with GatedStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store)
+@dataclass
+class RaceOutcome:
+    """What a race between become_candidate and handle_observed_term produced."""
 
-        first = asyncio.create_task(durable.become_candidate())
-        await store.entered.wait()  # the first write is now held in flight
-
-        second = asyncio.create_task(durable.handle_observed_term(99))
-        for _ in range(10):
-            await asyncio.sleep(0)  # give the second task every chance to run
-
-        try:
-            # The second decision has not reached the store, and the first
-            # one has not been installed before its own write completes.
-            assert store.writes == [(1, NODE_ID)]
-            assert durable.current_term == 0
-        finally:
-            store.release.set()
-            await asyncio.gather(first, second)
-
-        # Once released, the second decision runs against the first one's
-        # result: Candidate in term 1 observes term 99 and steps down.
-        assert store.writes == [(1, NODE_ID), (99, None)]
-        assert (durable.current_term, durable.voted_for) == (99, None)
-        assert durable.role is Role.FOLLOWER
-
-    persisted = await reload(db_path)
-    assert (persisted.current_term, persisted.voted_for) == (99, None)
+    writes_while_held: list
+    term_while_held: int
+    results: list
+    final: tuple
+    persisted: tuple
 
 
-async def test_vote_cast_in_flight_is_not_forgotten_by_a_concurrent_observation(db_path):
-    # The second task observes term 1 — the very term the first task is
-    # becoming Candidate in. Evaluated against the state before the first
-    # write, term 1 would look new and clear the vote; the node would
-    # forget it already voted for itself in term 1 and could vote again
-    # in that term.
+class NoLock:
+    """Stands in for DD-8's lock in the negative control: never blocks anyone."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+async def race_candidacy_against_observed_term(db_path, observed_term):
+    """Hold become_candidate's write in flight, then start handle_observed_term.
+
+    The first write is held by GatedStore until released, and the second
+    task is given ten event-loop turns to run before the release — no real
+    time passes, so the outcome does not depend on timing.
+    """
     async with GatedStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store)
 
         first = asyncio.create_task(durable.become_candidate())
         await store.entered.wait()
-
-        second = asyncio.create_task(durable.handle_observed_term(1))
+        second = asyncio.create_task(durable.handle_observed_term(observed_term))
         for _ in range(10):
             await asyncio.sleep(0)
 
-        try:
-            assert store.writes == [(1, NODE_ID)]
-        finally:
-            store.release.set()
-            results = await asyncio.gather(first, second)
-
-        assert results == [None, False]  # term 1 was not higher than term 1
-        assert store.writes == [(1, NODE_ID)]
-        assert (durable.current_term, durable.voted_for) == (1, NODE_ID)
-        assert durable.role is Role.CANDIDATE
+        writes_while_held = list(store.writes)
+        term_while_held = durable.current_term
+        store.release.set()
+        results = await asyncio.gather(first, second)
+        final = (durable.current_term, durable.voted_for, durable.role)
 
     persisted = await reload(db_path)
-    assert (persisted.current_term, persisted.voted_for) == (1, NODE_ID)
+    return RaceOutcome(
+        writes_while_held,
+        term_while_held,
+        results,
+        final,
+        (persisted.current_term, persisted.voted_for),
+    )
+
+
+async def test_second_decision_waits_while_first_write_is_in_flight(db_path):
+    outcome = await race_candidacy_against_observed_term(db_path, observed_term=99)
+    # While the first write was held, the second decision never reached the
+    # store, and the first was not installed before its own write finished.
+    assert outcome.writes_while_held == [(1, NODE_ID)]
+    assert outcome.term_while_held == 0
+    # Once released, the second ran against the first one's result: a
+    # Candidate in term 1 observing term 99 steps down.
+    assert outcome.final == (99, None, Role.FOLLOWER)
+    assert outcome.persisted == (99, None)
+
+
+async def test_vote_cast_in_flight_is_not_forgotten_by_a_concurrent_observation(db_path):
+    # The second task observes term 1 — the very term the first is becoming
+    # Candidate in. Against the state before the first write, term 1 would
+    # look new and clear the vote, and the node could vote again in term 1.
+    outcome = await race_candidacy_against_observed_term(db_path, observed_term=1)
+    assert outcome.writes_while_held == [(1, NODE_ID)]
+    assert outcome.results == [None, False]  # term 1 is not higher than term 1
+    assert outcome.final == (1, NODE_ID, Role.CANDIDATE)
+    assert outcome.persisted == (1, NODE_ID)
+
+
+async def test_negative_control_without_the_lock_the_vote_is_lost(db_path, monkeypatch):
+    # Confirms the race tests above can fail: with DD-8's lock replaced by a
+    # no-op, the same scenario lets the second decision reach the store while
+    # the first is held, and the node's persisted term-1 self-vote is erased.
+    original_init = DurableNodeState.__init__
+
+    def init_without_lock(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._lock = NoLock()
+
+    monkeypatch.setattr(DurableNodeState, "__init__", init_without_lock)
+
+    outcome = await race_candidacy_against_observed_term(db_path, observed_term=1)
+    assert outcome.writes_while_held == [(1, NODE_ID), (1, None)]
+    assert outcome.persisted == (1, None)

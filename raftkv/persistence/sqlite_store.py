@@ -53,8 +53,8 @@ class SqliteStore:
 
     Every write happens inside one transaction that is either committed
     whole or rolled back whole (DD-7), and the connection runs with
-    `PRAGMA synchronous = FULL`, so a committed transaction has been
-    flushed to the disk rather than left in the operating system's
+    `PRAGMA synchronous = FULL` (DD-24), so a committed transaction has
+    been flushed to the disk rather than left in the operating system's
     cache — which is what "persist to stable storage" (PERSIST-1 through
     PERSIST-3) requires.
 
