@@ -3,26 +3,10 @@
 the six log-divergence scenarios from Figure 7 of the Raft paper.
 """
 
+import pytest
+
 from raftkv.consensus import FollowerProgress, Log, LogEntry
-
-
-def make_log(terms):
-    return Log([LogEntry(term=t, command=f"cmd{i + 1}") for i, t in enumerate(terms)])
-
-
-# Figure 7 of the Raft paper: a leader for term 8, and six possible follower
-# logs (a)-(f) it might find on coming to power. Indices below are 1-based,
-# matching the paper's own labeling.
-LEADER_TERMS = [1, 1, 1, 4, 4, 5, 5, 6, 6, 6]
-
-FOLLOWER_TERMS = {
-    "a": [1, 1, 1, 4, 4, 5, 5, 6, 6],  # missing entry 10
-    "b": [1, 1, 1, 4],  # missing entries 5-10
-    "c": [1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 6],  # extra uncommitted entry 11 (term 6)
-    "d": [1, 1, 1, 4, 4, 5, 5, 6, 6, 6, 7, 7],  # extra entries 11-12 (term 7, 7)
-    "e": [1, 1, 1, 4, 4, 4, 4],  # diverges at index 6 (term 4 vs leader's term 5)
-    "f": [1, 1, 1, 2, 2, 2, 3, 3, 3, 3],  # diverges at index 4 (term 2 vs leader's term 4)
-}
+from tests.figure_7 import FOLLOWER_TERMS, LEADER_TERMS, make_log
 
 
 def reconcile(leader_log, follower_log):
@@ -194,6 +178,16 @@ def test_last_index_and_term_on_empty_and_nonempty_logs():
     log = make_log(LEADER_TERMS)
     assert log.last_index == 10
     assert log.last_term == 6
+
+
+# --- DD-21: a command is an opaque string ------------------------------------
+
+
+def test_log_entry_rejects_a_non_string_command():
+    with pytest.raises(TypeError):
+        LogEntry(term=1, command=5)
+    with pytest.raises(TypeError):
+        LogEntry(term=1, command=("put", "x", 1))
 
 
 # --- first_differing_index: the part of a log that actually changed ---------

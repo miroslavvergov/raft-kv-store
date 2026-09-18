@@ -52,14 +52,29 @@ class LogEntry:
     wholesale, as part of computing a new log in `Log.after_append_entries`
     when a genuine conflict forces an overwrite.
 
+    A non-string command is rejected at construction. Anything else would
+    be silently converted somewhere downstream — SQLite, for instance,
+    stores the integer 5 in a TEXT column as the string '5' — and the
+    entry read back after a restart would no longer equal the one that
+    was appended.
+
     Attributes:
         term: The term the leader was in when this entry was appended.
         command: The client command, already serialized by the KV Store
             layer, carried verbatim.
+
+    Raises:
+        TypeError: If `command` is not a str.
     """
 
     term: int
     command: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.command, str):
+            raise TypeError(
+                f"LogEntry.command must be a str, got {type(self.command).__name__}"
+            )
 
 
 class Log:
