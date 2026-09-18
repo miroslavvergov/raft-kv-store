@@ -11,7 +11,7 @@ import pytest
 
 from raftkv.consensus import Log, LogEntry
 from raftkv.persistence import SqliteStore
-from tests.figure_7 import make_log
+from tests.divergent_logs import make_log
 
 
 @pytest.fixture

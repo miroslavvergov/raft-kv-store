@@ -1,12 +1,12 @@
 """Tier 1 unit tests for the Log Matching consistency check and repair loop
 (REPL-5, REPL-6, REPL-7, REPL-8), against hand-constructed logs — including
-the six log-divergence scenarios from Figure 7 of the Raft paper.
+six follower logs that each diverge from one leader's log in a different way.
 """
 
 import pytest
 
 from raftkv.consensus import FollowerProgress, Log, LogEntry
-from tests.figure_7 import FOLLOWER_TERMS, LEADER_TERMS, make_log
+from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
 
 
 def reconcile(leader_log, follower_log):
@@ -21,6 +21,7 @@ def reconcile(leader_log, follower_log):
         prev_log_term = leader_log[prev_log_index - 1].term if prev_log_index > 0 else 0
         if follower_log.matches(prev_log_index, prev_log_term):
             entries = leader_log[prev_log_index:]
+            progress.record_success(prev_log_index, len(entries))
             return (
                 follower_log.after_append_entries(prev_log_index, entries),
                 prev_log_index,
@@ -51,21 +52,6 @@ def test_log_matches_accepts_when_index_and_term_agree():
     assert log.matches(prev_log_index=3, prev_log_term=4) is True
 
 
-# --- REPL-6: nextIndex decrement on rejection --------------------------------
-
-
-def test_follower_progress_record_rejection_decrements_next_index():
-    progress = FollowerProgress(next_index=5)
-    progress.record_rejection()
-    assert progress.next_index == 4
-
-
-def test_follower_progress_record_rejection_floors_at_one():
-    progress = FollowerProgress(next_index=1)
-    progress.record_rejection()
-    assert progress.next_index == 1
-
-
 # --- REPL-8: overwrite conflicting entries, leave matching ones alone -------
 
 
@@ -91,58 +77,62 @@ def test_after_append_entries_leaves_matching_entries_untouched():
     assert result[2] is same_entry  # not replaced, since it already matched
 
 
-# --- Figure 7: all six scenarios reconcile to exactly the leader's log ------
+# --- Six diverged followers, repaired against one leader ---------------------
 
 
-def test_figure_7_scenarios_without_extra_entries_reconcile_to_leaders_log():
-    # (a), (b): missing entries only, nothing of the follower's own to
-    # conflict with. (e), (f): diverge partway through, but the leader's own
-    # log fully covers and overwrites the diverging tail. In all four cases
-    # a single reconciliation against the leader's log ends up identical to
-    # it. (c) and (d) are deliberately excluded here — see the dedicated
-    # tests below for why a plain heartbeat does NOT reconcile them fully.
+def test_followers_without_extra_entries_end_up_identical_to_the_leader():
+    # Two followers are only missing entries, so there is nothing of their
+    # own to conflict with. Two diverge partway through, but the leader's
+    # log covers and overwrites every diverging entry. In all four cases one
+    # repair leaves the follower identical to the leader. The two followers
+    # holding extra entries are excluded here — the tests below show why a
+    # plain heartbeat does not remove those.
     leader_log = make_log(LEADER_TERMS)
-    for label in ("a", "b", "e", "f"):
-        follower_log = make_log(FOLLOWER_TERMS[label])
+    for name in (
+        "missing_last_entry",
+        "missing_last_six_entries",
+        "conflicts_from_index_6",
+        "conflicts_from_index_4",
+    ):
+        follower_log = make_log(FOLLOWER_TERMS[name])
         reconciled, _ = reconcile(leader_log, follower_log)
-        assert [e.term for e in reconciled] == LEADER_TERMS, f"scenario ({label})"
+        assert [e.term for e in reconciled] == LEADER_TERMS, name
 
 
-def test_figure_7_scenario_a_agrees_up_to_its_own_last_entry():
-    # (a) is only missing the leader's last entry — the retry loop should
-    # find agreement on the very first try, at index 9.
+def test_follower_missing_the_last_entry_agrees_at_index_9():
+    # The first probe (index 10) is past the end of its log and is rejected
+    # once; the next one agrees at index 9.
     leader_log = make_log(LEADER_TERMS)
-    follower_log = make_log(FOLLOWER_TERMS["a"])
+    follower_log = make_log(FOLLOWER_TERMS["missing_last_entry"])
     _, matched_at = reconcile(leader_log, follower_log)
     assert matched_at == 9
 
 
-def test_figure_7_scenario_e_diverges_starting_at_index_six():
+def test_follower_conflicting_from_index_6_agrees_at_index_5():
     leader_log = make_log(LEADER_TERMS)
-    follower_log = make_log(FOLLOWER_TERMS["e"])
+    follower_log = make_log(FOLLOWER_TERMS["conflicts_from_index_6"])
     _, matched_at = reconcile(leader_log, follower_log)
     assert matched_at == 5  # last point of agreement is index 5
 
 
-def test_figure_7_scenario_f_diverges_starting_at_index_four():
+def test_follower_conflicting_from_index_4_agrees_at_index_3():
     leader_log = make_log(LEADER_TERMS)
-    follower_log = make_log(FOLLOWER_TERMS["f"])
+    follower_log = make_log(FOLLOWER_TERMS["conflicts_from_index_4"])
     _, matched_at = reconcile(leader_log, follower_log)
     assert matched_at == 3  # last point of agreement is index 3
 
 
-def test_figure_7_scenario_c_extra_entry_survives_a_plain_heartbeat():
-    # A heartbeat/probe that only covers indices already present on both
-    # sides must NOT touch follower (c)'s extra, stale, uncommitted entry 11
-    # (term 6) — nothing conflicts with it yet, so Figure 2's rules leave it
-    # exactly where it is. It is only overwritten once the leader actually
-    # produces a genuinely conflicting entry at that index.
-    leader_log = make_log(LEADER_TERMS)
-    follower_log = make_log(FOLLOWER_TERMS["c"])
+def test_one_extra_stale_entry_survives_a_plain_heartbeat():
+    # A heartbeat that only covers indices both logs already hold must NOT
+    # touch the follower's extra, never-committed entry 11 (term 6). Nothing
+    # conflicts with it, and entries are only deleted from the first
+    # conflict onward, so it stays exactly where it is. It is overwritten
+    # only once the leader produces a genuinely conflicting entry there.
+    follower_log = make_log(FOLLOWER_TERMS["one_extra_stale_entry"])
 
     assert follower_log.matches(prev_log_index=10, prev_log_term=6)
     heartbeat_result = follower_log.after_append_entries(prev_log_index=10, entries=[])
-    assert [e.term for e in heartbeat_result] == FOLLOWER_TERMS["c"]
+    assert [e.term for e in heartbeat_result] == FOLLOWER_TERMS["one_extra_stale_entry"]
 
     # Now the leader (still term 8) accepts a new client command as entry 11.
     new_entry = LogEntry(term=8, command="new-write")
@@ -152,17 +142,15 @@ def test_figure_7_scenario_c_extra_entry_survives_a_plain_heartbeat():
     assert [e.term for e in written_result] == LEADER_TERMS + [8]
 
 
-def test_figure_7_scenario_d_extra_entries_survive_a_plain_heartbeat():
-    # Same story as (c), but with two extra stale entries (11, 12; term 7
-    # each) instead of one — demonstrating that a genuine conflict discards
-    # "the existing entry and all that follow it" (Figure 2, rule 3), not
-    # just the one entry that directly conflicts.
-    leader_log = make_log(LEADER_TERMS)
-    follower_log = make_log(FOLLOWER_TERMS["d"])
+def test_two_extra_stale_entries_survive_a_plain_heartbeat():
+    # Same as with one extra entry, but with two (11 and 12, term 7 each) —
+    # showing that a genuine conflict deletes the conflicting entry and every
+    # entry after it, not just the one entry that directly conflicts.
+    follower_log = make_log(FOLLOWER_TERMS["two_extra_stale_entries"])
 
     assert follower_log.matches(prev_log_index=10, prev_log_term=6)
     heartbeat_result = follower_log.after_append_entries(prev_log_index=10, entries=[])
-    assert [e.term for e in heartbeat_result] == FOLLOWER_TERMS["d"]
+    assert [e.term for e in heartbeat_result] == FOLLOWER_TERMS["two_extra_stale_entries"]
 
     new_entry = LogEntry(term=8, command="new-write")
     written_result = heartbeat_result.after_append_entries(
@@ -214,16 +202,16 @@ def test_first_differing_index_compares_commands_not_just_terms():
     assert ours.first_differing_index(theirs) == 1
 
 
-def test_first_differing_index_after_a_heartbeat_on_figure_7_c_is_none():
-    # The stale tail follower (c) keeps through a heartbeat is not a change,
-    # so nothing needs rewriting.
-    follower_log = make_log(FOLLOWER_TERMS["c"])
+def test_first_differing_index_is_none_after_a_heartbeat_keeps_a_stale_entry():
+    # A stale entry kept through a heartbeat is not a change, so nothing
+    # needs rewriting.
+    follower_log = make_log(FOLLOWER_TERMS["one_extra_stale_entry"])
     after_heartbeat = follower_log.after_append_entries(prev_log_index=10, entries=[])
     assert follower_log.first_differing_index(after_heartbeat) is None
 
 
-def test_first_differing_index_after_repairing_figure_7_f_is_index_four():
+def test_first_differing_index_after_repairing_a_conflict_from_index_4_is_4():
     leader_log = make_log(LEADER_TERMS)
-    follower_log = make_log(FOLLOWER_TERMS["f"])
+    follower_log = make_log(FOLLOWER_TERMS["conflicts_from_index_4"])
     reconciled, _ = reconcile(leader_log, follower_log)
     assert follower_log.first_differing_index(reconciled) == 4

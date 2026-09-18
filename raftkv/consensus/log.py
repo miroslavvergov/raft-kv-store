@@ -9,12 +9,11 @@ should the log look like after this AppendEntries RPC?") that need to be
 correct on their own before any networking or disk-access code can be
 trusted to call them correctly.
 
-Raft's own 1-based indexing is used throughout (the first entry in the log
-is index 1, and index 0 conventionally means "before the first entry, no
-entry required") rather than Python's native 0-based list indexing, so
-this class reads the same way the requirements below and the paper itself
-describe it. The conversion to a 0-based Python list position happens
-once, at the point of use, inside each method.
+Indexes are 1-based, the way Raft numbers log entries: the first entry is
+index 1, and index 0 means "before the first entry — no entry required".
+Every index a caller passes in or gets back uses that numbering; the
+conversion to a 0-based Python list position happens once, at the point
+of use, inside each method.
 """
 
 from dataclasses import dataclass
@@ -28,12 +27,11 @@ class LogEntry:
     """A single entry in a node's replicated log.
 
     Tagged with the term the Leader was in when it first appended the
-    command to its own log (§5.3). `term` is what the Log Matching
-    Property, and the whole consistency check below, is built on — two
-    entries at the same index are guaranteed identical (and everything
-    before them too) precisely because a Leader only ever writes one
-    entry per (index, term) pair and never rewrites its own log
-    afterward.
+    command to its own log. `term` is what the whole consistency check
+    below is built on: two entries at the same index and with the same
+    term are guaranteed identical, and so is everything before them,
+    because a Leader only ever writes one entry per (index, term) pair
+    and never rewrites its own log afterward.
 
     `command` is an opaque string (DD-21): the KV Store layer serializes
     a client command exactly once, when the Leader first proposes it, and
@@ -163,13 +161,14 @@ class Log:
         to agree on, so nothing can disagree either. This is what lets a
         brand-new, empty log accept its very first AppendEntries.
 
-        For any other `prev_log_index`, the check is exactly the
-        single-point comparison the Log Matching Property (§5.3) says is
-        sufficient: if this log doesn't even have an entry that far in,
-        or the entry it has there was written in a different term, the
-        two logs cannot be assumed to agree before that point either, so
-        the RPC is rejected outright rather than trusting a shorter or
-        differently-originated prefix.
+        For any other `prev_log_index`, checking that one entry is
+        enough. Two logs holding an entry with the same index and term
+        are identical in every entry up to and including it, so a match
+        here means the whole prefix matches. If this log doesn't even
+        have an entry that far in, or the entry it has there was written
+        in a different term, the two logs cannot be assumed to agree
+        before that point either, so the RPC is rejected outright rather
+        than trusting a shorter or differently-originated prefix.
 
         Args:
             prev_log_index: The 1-based index of the entry immediately
@@ -198,21 +197,22 @@ class Log:
         Implements REPL-8 — "once an AppendEntries RPC is accepted, the
         Leader's replication logic shall overwrite any conflicting
         entries already present in that Follower's log with the
-        Leader's own entries" — by applying the two receiver rules
-        Figure 2 of the paper actually specifies this as: the moment an
-        existing entry conflicts with an incoming one (same position,
-        different term), delete that entry and everything after it;
-        then append whatever of the incoming entries didn't already fit.
+        Leader's own entries" — by applying two rules in order: the
+        moment an existing entry conflicts with an incoming one (same
+        position, different term), delete that entry and everything
+        after it; then append whatever of the incoming entries didn't
+        already fit.
 
-        Deliberately does NOT delete anything outside that rule: an
-        entry beyond the range `entries` covers, or one that already
-        matches its incoming counterpart term-for-term, is left exactly
-        as it was. This is why a stale, uncommitted tail entry from an
-        old, abandoned Leader (Figure 7, scenarios (c) and (d) of the
-        paper) survives an ordinary heartbeat untouched — a heartbeat
-        carries no new entries to conflict with it — and is only ever
-        overwritten once the current Leader actually produces a
-        genuinely conflicting entry at that same position.
+        Nothing outside those two rules is deleted: an entry beyond the
+        range `entries` covers, or one that already matches its incoming
+        counterpart term-for-term, is left exactly as it was. So when a
+        Follower holds extra, never-committed entries at the end of its
+        log — left there by an old Leader that crashed before
+        replicating them anywhere else — an ordinary heartbeat leaves
+        them untouched, because a heartbeat carries no entries to
+        conflict with them. They are overwritten only once the current
+        Leader produces a genuinely conflicting entry at the same
+        position.
 
         Callers must have already confirmed
         `self.matches(prev_log_index, prev_log_term)` — REPL-5 — before
@@ -258,9 +258,9 @@ class Log:
         with a newly computed one by rewriting only what changed: every
         entry before the returned index is identical in both logs, and
         everything from it onward must be replaced. In particular, when
-        `after_append_entries` leaves a stale, unconflicted
-        tail in place (Figure 7, scenarios (c) and (d)), the logs don't
-        differ there, so that tail is never touched on disk either.
+        `after_append_entries` leaves a stale, unconflicted tail of
+        extra entries in place, the logs don't differ there, so that
+        tail is never touched on disk either.
 
         Args:
             other: The log to compare against.

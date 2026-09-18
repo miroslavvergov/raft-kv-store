@@ -209,8 +209,8 @@ class DurableNodeState:
 
         The persisted log therefore always equals the in-memory one. A
         heartbeat that changes nothing writes nothing, and a stale,
-        unconflicted tail that REPL-8 leaves in place (Figure 7,
-        scenarios (c) and (d)) is left in place on disk as well.
+        unconflicted tail of extra entries that REPL-8 leaves in place
+        is left in place on disk as well.
 
         Only the log is checked here. The RPC's term is not compared
         against `current_term`.

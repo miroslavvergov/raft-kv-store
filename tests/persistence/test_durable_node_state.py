@@ -1,9 +1,9 @@
 """Tier 2 component tests for DurableNodeState (DD-8, DD-19, DD-22): every
 state change persisted before its method returns, memory never ahead of
-disk, the persisted log always equal to the in-memory one across all six
-Figure 7 scenarios, and — using a store that holds a write in flight until
-the test releases it — no second decision taken while a first write is
-still pending.
+disk, the persisted log always equal to the in-memory one while six
+diverged followers are repaired, and — using a store that holds a write in
+flight until the test releases it — no second decision taken while a first
+write is still pending.
 """
 
 import asyncio
@@ -13,7 +13,7 @@ import pytest
 
 from raftkv.consensus import FollowerProgress, IllegalTransition, LogEntry, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
-from tests.figure_7 import FOLLOWER_TERMS, LEADER_TERMS, make_log
+from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
 
 NODE_ID = 7
 
@@ -274,9 +274,17 @@ async def test_heartbeat_that_changes_nothing_writes_nothing(db_path):
         assert store.writes == []
 
 
-@pytest.mark.parametrize("label", ["a", "b", "e", "f"])
-async def test_figure_7_repair_is_persisted_exactly(db_path, label):
-    await seed_log(db_path, FOLLOWER_TERMS[label])
+@pytest.mark.parametrize(
+    "follower",
+    [
+        "missing_last_entry",
+        "missing_last_six_entries",
+        "conflicts_from_index_6",
+        "conflicts_from_index_4",
+    ],
+)
+async def test_repaired_log_is_persisted_exactly(db_path, follower):
+    await seed_log(db_path, FOLLOWER_TERMS[follower])
     leader_log = make_log(LEADER_TERMS)
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store)
@@ -285,13 +293,13 @@ async def test_figure_7_repair_is_persisted_exactly(db_path, label):
     assert (await reload(db_path)).log == leader_log
 
 
-@pytest.mark.parametrize("label", ["c", "d"])
-async def test_figure_7_stale_tail_survives_a_heartbeat_on_disk_too(db_path, label):
-    await seed_log(db_path, FOLLOWER_TERMS[label])
+@pytest.mark.parametrize("follower", ["one_extra_stale_entry", "two_extra_stale_entries"])
+async def test_stale_extra_entries_survive_a_heartbeat_on_disk_too(db_path, follower):
+    await seed_log(db_path, FOLLOWER_TERMS[follower])
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store)
         assert await durable.receive_entries(10, 6, []) is True
-    assert (await reload(db_path)).log == make_log(FOLLOWER_TERMS[label])
+    assert (await reload(db_path)).log == make_log(FOLLOWER_TERMS[follower])
 
     # Once the leader writes a genuinely conflicting entry 11, the whole
     # stale tail goes — in memory and on disk alike.

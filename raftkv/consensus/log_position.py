@@ -33,19 +33,29 @@ class LogPosition:
         the two terms differ — index is only ever consulted as a
         tiebreaker once the terms already match.
 
-        This ordering is what actually makes the safety argument work
-        (§5.4.1): combined with quorum overlap (ELECT-12), it guarantees
-        a winning candidate's log already contains every entry any
-        earlier Leader could have committed, because a committed entry
-        can only exist in a term already reflected by every
-        sufficiently-up-to-date voter's own last term. A simpler
-        "whichever log is longer wins" rule breaks this outright: a
-        candidate can be safely electable with a log that is both
-        shorter and, by a pure length comparison, "behind" a voter's,
-        provided its last entry's term is later — see the note "Why
-        Longest Log Wins Is the Wrong Rule for Raft Elections" in the
-        accompanying notes for the worked counterexample this module's
-        own test suite reproduces directly.
+        This ordering is what keeps committed entries safe across
+        elections. A committed entry is stored on a majority of nodes,
+        and a candidate needs votes from a majority, so at least one of
+        its voters always holds every committed entry (ELECT-12).
+        Comparing last terms first makes that voter refuse any candidate
+        whose log could be missing it.
+
+        A simpler "whichever log is longer wins" rule breaks this. Take
+        five nodes, A to E, all holding one entry from term 1:
+
+        - A becomes Leader for term 2, appends three entries to its own
+          log only, and crashes. A's log is now [1, 2, 2, 2] (each
+          entry's term, by index).
+        - B becomes Leader for term 3 and commits one new entry on B, C,
+          and D, whose logs are now [1, 3]. E still has [1].
+        - B crashes, A comes back, and A runs for Leader in term 4.
+
+        By length, A's log beats everyone's, so C, D, and E would all
+        vote for it, and as Leader it would overwrite the committed
+        term-3 entry at index 2 with its own term-2 entry. Comparing
+        last terms first, C and D see A's term 2 against their own term
+        3 and refuse; A gets only its own vote and E's, which is short
+        of a majority, and the committed entry survives.
 
         Args:
             other: The position being compared against — typically the
