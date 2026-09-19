@@ -2,19 +2,49 @@
 
 import asyncio
 import copy
+import functools
 from typing import Any, Coroutine, Optional
 
-from raftkv.consensus import Log, LogEntry, NodeState, Role
+from raftkv.consensus import (
+    Candidacy,
+    Cluster,
+    Leadership,
+    Log,
+    LogEntry,
+    NodeState,
+    RequestVoteRequest,
+    RequestVoteResponse,
+    Role,
+)
 from raftkv.persistence.sqlite_store import SqliteStore
+from raftkv.tracing import NodeTracer, traced
+
+
+def _holding_the_lock(method):
+    """Run `method` entirely inside one hold of the node's lock (DD-8, DD-19).
+
+    The lock is taken before the method reads any state and released only
+    after it returns or raises — so it is held across every `await` inside
+    the method, including the wait for a write to commit. A second call on
+    the same node waits until the first has decided, persisted, and
+    installed, and then decides against the state the first one left.
+    """
+
+    @functools.wraps(method)
+    async def locked(self, *args: Any) -> Any:
+        async with self._lock:
+            return await method(self, *args)
+
+    return locked
 
 
 class DurableNodeState:
     """The single place a node's role, term, vote, and log are changed.
 
-    Owns a pure `NodeState`, the node's `Log`, its `SqliteStore`, and the
-    one per-node `asyncio.Lock` DD-8 requires. Every method that changes
-    any of that state does all of the following while holding the lock,
-    in this order (DD-19, DD-22):
+    Owns a pure `NodeState`, the node's `Log`, its `SqliteStore`, the
+    `Cluster` it belongs to, and the one per-node `asyncio.Lock` DD-8
+    requires. Every method that changes any of that state does all of the
+    following while holding the lock, in this order (DD-19, DD-22):
 
     1. Compute the next state on a copy, using the pure consensus
        classes.
@@ -24,24 +54,47 @@ class DurableNodeState:
 
     Three properties follow. First, a caller that awaits one of these
     methods and only then responds to an RPC has persisted before
-    responding (PERSIST-1 through PERSIST-3), and a Candidate that awaits
-    `become_candidate` before sending RequestVote has persisted before
-    sending (ELECT-5). Second, the in-memory state is never ahead of what
-    is on disk: if a write fails, the method raises and the node's state
-    is exactly what it was before the call. Third, what is on disk is
-    never ahead of the in-memory state either: once a write has been
-    handed to the store it runs to completion even if the calling task is
-    cancelled meanwhile, the change is installed, and only then does the
-    cancellation propagate. A write can finish on the store's background
-    thread after the task that issued it has been cancelled, so a
-    cancelled caller that simply stopped before step 3 would leave a
-    change on disk that the node does not know it made.
+    responding (PERSIST-1 through PERSIST-3), and a Candidate gets the
+    RequestVote to send only from `start_election`, after its new term
+    and self-vote are on disk (ELECT-5). Second, the in-memory state is
+    never ahead of what is on disk: if a write fails, the method raises
+    and the node's state is exactly what it was before the call. Third,
+    what is on disk is never ahead of the in-memory state either: once a
+    write has been handed to the store it runs to completion even if the
+    calling task is cancelled meanwhile, the change is installed, and
+    only then does the cancellation propagate. A write can finish on the
+    store's background thread after the task that issued it has been
+    cancelled, so a cancelled caller that simply stopped before step 3
+    would leave a change on disk that the node does not know it made.
 
-    The lock is held across the `await` on the write, which is where
+    Each such method is marked `_holding_the_lock`: the lock is held for
+    the whole call, across the `await` on the write, which is where
     `aiosqlite` suspends the calling coroutine while its background
     thread does the disk I/O. Any other coroutine calling one of these
     methods in the meantime waits for the lock rather than computing its
     own next state from the one about to be replaced.
+
+    Alongside the role, the node keeps the in-memory records that only
+    one role needs: a `Candidacy` counting votes while it is a
+    Candidate, and a `Leadership` tracking every Follower while it is
+    Leader. Every change of role or term brings them in line in the same
+    step: a Candidate always has a Candidacy for its current term, a
+    Leader always has a Leadership for its current term, and a Follower
+    has neither. Entering a role, or entering a new term in the same
+    role, always starts a fresh record, so nothing counted in an earlier
+    term — votes or Follower progress — can carry over into a later
+    one. Neither record is persisted; after a restart the node is a
+    Follower (STATE-2) and has neither.
+
+    The only way to become Leader is to reach a majority of granted
+    votes (ELECT-11): in `handle_vote_response`, or in `start_election`
+    when the node's own vote is already a majority.
+
+    Methods marked `traced` are reported, from outside, to the node's
+    `NodeTracer`: the decorator records the node's state just before and
+    just after the call — inside the lock, so no other call can change it
+    in between — and the tracer reports what changed, in etcd's format
+    (see `raftkv.tracing`).
 
     Attributes:
         node_id: This node's permanent positive-integer identity.
@@ -51,9 +104,17 @@ class DurableNodeState:
         voted_for: The node ID voted for in `current_term`, as last
             persisted, or None.
         log: The node's log, as last persisted.
+        peers: The IDs of every other member of the cluster.
+        candidacy: The votes collected in the current term while
+            Candidate; None in any other role.
+        leadership: The progress of every Follower in the current term
+            while Leader; None in any other role.
     """
 
-    def __init__(self, state: NodeState, log: Log, store: SqliteStore) -> None:
+    @traced(NodeTracer.report_started)
+    def __init__(
+        self, state: NodeState, log: Log, store: SqliteStore, cluster: Cluster
+    ) -> None:
         """Wrap state and a log that already match what `store` holds.
 
         `load` is the way to build one from a store; this constructor
@@ -64,14 +125,25 @@ class DurableNodeState:
             state: The node's current role, term, and vote.
             log: The node's current log.
             store: The open store holding the persisted copy of both.
+            cluster: The cluster this node is a member of.
+
+        Raises:
+            ValueError: If this node is not a member of `cluster`.
         """
         self._state = state
         self._log = log
         self._store = store
+        self._cluster = cluster
+        self._peers = cluster.peers_of(state.node_id)
+        self._candidacy: Optional[Candidacy] = None
+        self._leadership: Optional[Leadership] = None
         self._lock = asyncio.Lock()
+        self._align_role_records()
 
     @classmethod
-    async def load(cls, node_id: int, store: SqliteStore) -> "DurableNodeState":
+    async def load(
+        cls, node_id: int, store: SqliteStore, cluster: Cluster
+    ) -> "DurableNodeState":
         """Rebuild a node from its persisted state, in the Follower role.
 
         Implements start-up for PERSIST-4, PERSIST-5, PERSIST-6, and
@@ -83,13 +155,17 @@ class DurableNodeState:
         Args:
             node_id: This node's permanent positive-integer identity.
             store: The node's open store.
+            cluster: The cluster this node is a member of.
 
         Returns:
             The node's durable state, ready to accept or issue RPCs.
+
+        Raises:
+            ValueError: If `node_id` is not a member of `cluster`.
         """
         persisted = await store.load()
         state = NodeState.reloaded(node_id, persisted.current_term, persisted.voted_for)
-        return cls(state, persisted.log, store)
+        return cls(state, persisted.log, store, cluster)
 
     @property
     def node_id(self) -> int:
@@ -111,15 +187,45 @@ class DurableNodeState:
     def log(self) -> Log:
         return self._log
 
-    async def become_candidate(self) -> None:
-        """Become Candidate, and persist the new term and self-vote before returning.
+    @property
+    def peers(self) -> frozenset[int]:
+        return self._peers
+
+    @property
+    def candidacy(self) -> Optional[Candidacy]:
+        return self._candidacy
+
+    @property
+    def leadership(self) -> Optional[Leadership]:
+        return self._leadership
+
+    @_holding_the_lock
+    @traced(NodeTracer.report_election)
+    async def start_election(self) -> RequestVoteRequest:
+        """Become Candidate in a new term, persist it, and return the RequestVote to send.
 
         Applies `NodeState.become_candidate` — STATE-3's Follower-to-
         Candidate or Candidate-to-Candidate edge, with ELECT-3's term
-        increment and ELECT-4's vote for self — then persists the new
-        term and vote. Returns only once that write has committed, so a
-        caller that sends RequestVote after awaiting this satisfies
-        ELECT-5.
+        increment and ELECT-4's vote for self — persists the new term and
+        vote, and starts a fresh `Candidacy` for the new term holding
+        that one vote. Any Candidacy from an earlier term is discarded
+        with it, so no vote granted in an earlier election counts in
+        this one.
+
+        Returns the RequestVote to send to every peer (ELECT-6), built
+        only after the write has committed: there is no way to obtain the
+        request before the term and vote it announces are on disk
+        (ELECT-5). It carries the new term, this node's ID, and the index
+        and term of the node's last log entry (ELECT-7), all read under
+        the same lock hold as the write, so they describe exactly the
+        state that was persisted.
+
+        In a single-node cluster the node's own vote is already a
+        majority (ELECT-11), so it becomes Leader before returning, and
+        there is no peer to send the request to.
+
+        Returns:
+            The RequestVote for this election.
 
         Raises:
             IllegalTransition: If the node is a Leader. Nothing is
@@ -128,34 +234,28 @@ class DurableNodeState:
                 state is left as it was before the call.
             asyncio.CancelledError: If the calling task was cancelled
                 while the write was in flight — raised only after the
-                write has committed and the new state is installed.
+                write has committed and the new state is installed. No
+                request is returned, so none is sent; the node is a
+                Candidate in the new term until its next election
+                timeout starts another election.
         """
-        async with self._lock:
-            next_state = copy.copy(self._state)
-            next_state.become_candidate()
-            await self._persist_then_install(
-                self._store.save_term_and_vote(
-                    next_state.current_term, next_state.voted_for
-                ),
-                next_state=next_state,
-            )
+        next_state = copy.copy(self._state)
+        next_state.become_candidate()
+        await self._persist_then_install(
+            self._store.save_term_and_vote(next_state.current_term, next_state.voted_for),
+            next_state=next_state,
+        )
+        if self._candidacy.has_majority:
+            self._become_leader()
+        return RequestVoteRequest(
+            term=self._state.current_term,
+            candidate_id=self._state.node_id,
+            last_log_index=self._log.last_index,
+            last_log_term=self._log.last_term,
+        )
 
-    async def become_leader(self) -> None:
-        """Become Leader.
-
-        Applies `NodeState.become_leader` — STATE-3's Candidate-to-Leader
-        edge, taken once ELECT-11's majority has been reached. Nothing is
-        written: this transition changes only the role, and role is not
-        persisted. The lock is still taken, because role is part of the
-        state DD-8 guards.
-
-        Raises:
-            IllegalTransition: If the node is not a Candidate. Nothing is
-                changed.
-        """
-        async with self._lock:
-            self._state.become_leader()
-
+    @_holding_the_lock
+    @traced(NodeTracer.report_observed_term)
     async def handle_observed_term(self, term: int) -> bool:
         """Catch up to a higher term seen in an RPC, persisting it before returning.
 
@@ -164,7 +264,9 @@ class DurableNodeState:
         Leader — and, only when that actually changed something, persists
         the new term and cleared vote. Returns only once that write has
         committed, so a caller that responds to the RPC after awaiting
-        this has persisted before responding (PERSIST-1, PERSIST-2).
+        this has persisted before responding (PERSIST-1, PERSIST-2). A
+        node that steps down discards its Candidacy or Leadership with
+        its old role.
 
         Args:
             term: The term observed in an incoming RPC or RPC response.
@@ -181,18 +283,131 @@ class DurableNodeState:
                 while the write was in flight — raised only after the
                 write has committed and the new state is installed.
         """
-        async with self._lock:
-            next_state = copy.copy(self._state)
-            if not next_state.handle_observed_term(term):
-                return False
+        next_state = copy.copy(self._state)
+        if not next_state.handle_observed_term(term):
+            return False
+        await self._persist_then_install(
+            self._store.save_term_and_vote(next_state.current_term, next_state.voted_for),
+            next_state=next_state,
+        )
+        return True
+
+    @_holding_the_lock
+    @traced(NodeTracer.report_vote_request)
+    async def handle_vote_request(self, request: RequestVoteRequest) -> RequestVoteResponse:
+        """Answer a Candidate's RequestVote, persisting any change before returning the answer.
+
+        The receiving side of RequestVote (DD-18), in one lock hold
+        (DD-8, DD-19): decide with `NodeState.handle_vote_request` —
+        catch up to a higher term (STATE-4, STATE-5, STATE-6), refuse a
+        request from an earlier term or a second Candidate in the same
+        term (ELECT-8), refuse a Candidate whose log is behind this
+        node's (ELECT-9, ELECT-10), and otherwise record the vote — then
+        persist `current_term` and `voted_for` if they changed, and only
+        then return the answer. The answer cannot be sent before the vote
+        it grants is on disk (PERSIST-1, PERSIST-2), so a node that
+        crashes right after answering still remembers its vote when it
+        restarts and cannot give it to a different Candidate in the same
+        term.
+
+        Holding the lock across the write is what makes ELECT-8 hold
+        when two Candidates' requests arrive at once: the second request
+        is decided only after the first one's vote has been persisted and
+        installed, so it sees that vote and is refused.
+
+        A request that changes nothing writes nothing: a refusal in the
+        current term, or a repeat of a request already granted, which is
+        granted again (FAIL-1).
+
+        A caller that receives a granted answer must reset its election
+        timeout before sending it (ELECT-13).
+
+        Args:
+            request: The Candidate's RequestVote.
+
+        Returns:
+            The answer to send back to the Candidate.
+
+        Raises:
+            sqlite3.Error: If the write fails. The node's in-memory state
+                is left as it was before the call, and no answer is
+                returned, so none is sent.
+            asyncio.CancelledError: If the calling task was cancelled
+                while the write was in flight — raised only after the
+                write has committed and the new state is installed.
+        """
+        next_state = copy.copy(self._state)
+        response = next_state.handle_vote_request(request, self._log.last_position)
+        if (next_state.current_term, next_state.voted_for) != (
+            self._state.current_term,
+            self._state.voted_for,
+        ):
             await self._persist_then_install(
-                self._store.save_term_and_vote(
-                    next_state.current_term, next_state.voted_for
-                ),
+                self._store.save_term_and_vote(next_state.current_term, next_state.voted_for),
                 next_state=next_state,
             )
-            return True
+        return response
 
+    @_holding_the_lock
+    @traced(NodeTracer.report_vote_response)
+    async def handle_vote_response(
+        self, voter: int, sent_in_term: int, response: RequestVoteResponse
+    ) -> bool:
+        """Count a voter's answer toward this node's election, becoming Leader on a majority.
+
+        The Candidate's side of RequestVote (DD-18), in one lock hold:
+
+        1. If the answer carries a term higher than `current_term`, some
+           other election has moved past this one. The node catches up
+           and steps down (STATE-4, STATE-5, STATE-6), persisting the new
+           term and cleared vote, and its Candidacy is discarded.
+        2. Otherwise, if the node is a Candidate, the answer is recorded
+           on its `Candidacy`, which ignores answers to requests sent in
+           any other term and repeated answers from the same voter.
+        3. If the votes granted now make up a strict majority of the
+           cluster, including this node's own (ELECT-11, ELECT-12), the
+           node becomes Leader for this term, with a fresh `Leadership`:
+           every Follower starts at `next_index` one past this node's
+           last log index (REPL-14) and `match_index` 0 (REPL-15).
+
+        A node that is no longer a Candidate — it already won, or has
+        stepped down — ignores the answer, apart from step 1.
+
+        Args:
+            voter: The node ID of the peer that answered.
+            sent_in_term: The term the answered RequestVote was sent in.
+            response: The peer's answer.
+
+        Returns:
+            True if this answer completed a majority and the node became
+            Leader, False otherwise.
+
+        Raises:
+            KeyError: If the request was sent in the current term but
+                `voter` is not a member of the cluster.
+            sqlite3.Error: If catching up to a higher term fails to
+                write. The node's in-memory state is left as it was.
+            asyncio.CancelledError: If the calling task was cancelled
+                while that write was in flight — raised only after the
+                write has committed and the new state is installed.
+        """
+        next_state = copy.copy(self._state)
+        if next_state.handle_observed_term(response.term):
+            await self._persist_then_install(
+                self._store.save_term_and_vote(next_state.current_term, next_state.voted_for),
+                next_state=next_state,
+            )
+            return False
+        if self._candidacy is None:
+            return False
+        if not self._candidacy.record_vote(voter, sent_in_term, response.vote_granted):
+            return False
+        if not self._candidacy.has_majority:
+            return False
+        self._become_leader()
+        return True
+
+    @_holding_the_lock
     async def receive_entries(
         self, prev_log_index: int, prev_log_term: int, entries: list[LogEntry]
     ) -> bool:
@@ -234,19 +449,18 @@ class DurableNodeState:
                 while the write was in flight — raised only after the
                 write has committed and the new log is installed.
         """
-        async with self._lock:
-            if not self._log.matches(prev_log_index, prev_log_term):
-                return False
-            next_log = self._log.after_append_entries(prev_log_index, entries)
-            changed_from = self._log.first_differing_index(next_log)
-            if changed_from is None:
-                self._log = next_log
-                return True
-            await self._persist_then_install(
-                self._store.save_log_from(changed_from, next_log[changed_from - 1 :]),
-                next_log=next_log,
-            )
+        if not self._log.matches(prev_log_index, prev_log_term):
+            return False
+        next_log = self._log.after_append_entries(prev_log_index, entries)
+        changed_from = self._log.first_differing_index(next_log)
+        if changed_from is None:
+            self._log = next_log
             return True
+        await self._persist_then_install(
+            self._store.save_log_from(changed_from, next_log[changed_from - 1 :]),
+            next_log=next_log,
+        )
+        return True
 
     async def _persist_then_install(
         self,
@@ -260,9 +474,10 @@ class DurableNodeState:
         not cancel: `asyncio.wait` stops waiting when the caller is
         cancelled but leaves the awaited task running. The caller keeps
         waiting until the write has finished either way. If the write
-        committed, `next_state` and/or `next_log` are installed; if it
-        failed, nothing is installed. A cancellation received meanwhile
-        is raised only after that.
+        committed, `next_state` and/or `next_log` are installed, and the
+        per-role records are brought in line with the installed state; if
+        it failed, nothing is installed. A cancellation received
+        meanwhile is raised only after that.
 
         Args:
             write: The store write that makes the change durable.
@@ -286,9 +501,42 @@ class DurableNodeState:
         if failure is None:
             if next_state is not None:
                 self._state = next_state
+                self._align_role_records()
             if next_log is not None:
                 self._log = next_log
         if cancelled:
             raise asyncio.CancelledError() from failure
         if failure is not None:
             raise failure
+
+    def _become_leader(self) -> None:
+        """Become Leader of the current term, with a fresh Leadership.
+
+        Applies `NodeState.become_leader` — STATE-3's Candidate-to-Leader
+        edge — and replaces the Candidacy with a new `Leadership`.
+        Called only with the lock held, once a Candidacy has reached a
+        majority (ELECT-11). Nothing is written: role is not persisted.
+        """
+        self._state.become_leader()
+        self._align_role_records()
+
+    def _align_role_records(self) -> None:
+        """Bring the Candidacy and Leadership in line with the current role and term.
+
+        A Candidate gets a Candidacy for its current term, holding its
+        own vote; a Leader gets a Leadership for its current term, with
+        every Follower reset (REPL-14, REPL-15); a Follower gets neither.
+        A record that already belongs to the current role and term is
+        kept. Any other is replaced by a fresh one, which is what
+        discards votes and Follower progress from an earlier term the
+        moment the node moves to a new one.
+        """
+        role, term = self._state.role, self._state.current_term
+        if role is not Role.CANDIDATE:
+            self._candidacy = None
+        elif self._candidacy is None or self._candidacy.term != term:
+            self._candidacy = Candidacy(term, self._state.node_id, self._cluster)
+        if role is not Role.LEADER:
+            self._leadership = None
+        elif self._leadership is None or self._leadership.term != term:
+            self._leadership = Leadership(term, self._peers, self._log.last_index)

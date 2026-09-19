@@ -2,9 +2,9 @@
 
 
 class FollowerProgress:
-    """The Leader's own view of how far one Follower's log matches its own.
+    """How far one Follower's log is known to match the Leader's.
 
-    Holds the two values a Leader tracks, in memory only, for each
+    Holds the two values a Leader tracks, in memory only, for one
     follower:
 
     - `next_index` — the index of the next entry the Leader will send.
@@ -12,20 +12,21 @@ class FollowerProgress:
       Follower's log agrees with the Leader's (REPL-5).
     - `match_index` — the highest index known to be identical on the
       Follower and the Leader. It is never a guess: it moves only when
-      the Follower has actually acknowledged a successful AppendEntries,
-      which is what lets the Leader count the Follower toward the
-      majority APPLY-1 requires before an entry can be committed.
+      the Follower has actually acknowledged a successful AppendEntries
+      (REPL-16), which is what lets the Leader count the Follower toward
+      the majority APPLY-1 requires before an entry can be committed.
 
     Both values change only through `record_success` and
-    `record_rejection`, and together they keep one invariant after every
-    call: `match_index < next_index`. Everything up to `match_index` is
-    already confirmed, so the next entry the Leader sends is always past
-    it.
+    `record_rejection` (DD-25), and together they keep one invariant
+    after every call: `match_index < next_index`. Everything up to
+    `match_index` is already confirmed, so the next entry the Leader
+    sends is always past it.
 
-    A Leader starts a fresh FollowerProgress for every follower each time
-    it wins an election, with `match_index = 0`, and never persists one:
-    after a restart or a lost election, nothing it confirmed as a
-    previous Leader is assumed to still hold.
+    A FollowerProgress knows nothing about terms. In the Leader, every
+    FollowerProgress belongs to a `Leadership`, which creates a fresh one
+    for each follower whenever the node wins an election and passes on
+    only replies to RPCs sent in that election's term — so every reply
+    that reaches this record belongs to the current leadership.
 
     Attributes:
         next_index: The index of the next log entry the Leader will send
@@ -37,16 +38,15 @@ class FollowerProgress:
     def __init__(self, next_index: int) -> None:
         """Start tracking a follower, with nothing confirmed yet.
 
-        A newly elected Leader sets every follower's nextIndex to one past
-        its own last log index — 11, for a Leader holding 10 entries —
-        optimistically assuming the follower already has everything, and
-        lets rejections walk it back. Computing that starting value is
-        the caller's job; matchIndex always starts at 0, because nothing
-        has been confirmed yet.
+        `match_index` always starts at 0 (REPL-15), because nothing has
+        been confirmed yet. A `Leadership` starts `next_index` at one past
+        the Leader's own last log index (REPL-14) — 11, for a Leader
+        holding 10 entries — optimistically assuming the follower already
+        has everything, and letting rejections walk it back.
 
         Args:
-            next_index: The nextIndex to start tracking for this
-                follower. At least 1.
+            next_index: The nextIndex to start tracking this follower
+                from. At least 1.
         """
         self._next_index = next_index
         self._match_index = 0
@@ -65,12 +65,12 @@ class FollowerProgress:
         The accepted RPC proves the follower's log now matches the
         Leader's through the last entry that RPC carried:
         `prev_log_index + entry_count`, both taken from that specific
-        RPC. `match_index` moves up to that index, and `next_index` moves
-        to the index right after it.
+        RPC (REPL-16). `match_index` moves up to that index, and
+        `next_index` moves to the index right after it.
 
-        Neither value ever moves down here. Responses can arrive late or
-        more than once — FAIL-2 retries an RPC that timed out, and the
-        network may deliver replies out of order — so a success for an
+        Neither value ever moves down here (REPL-17). Responses can arrive
+        late or more than once — FAIL-2 retries an RPC that timed out, and
+        the network may deliver replies out of order — so a success for an
         older RPC that carried fewer entries can arrive after a newer
         one. Taking the larger value keeps `match_index` from falling
         back to something already surpassed, so it only ever increases.

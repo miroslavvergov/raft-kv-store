@@ -1,6 +1,7 @@
 """Tier 1 unit tests for the pure Follower/Candidate/Leader state machine
-(STATE-1 through STATE-6) — every valid STATE-3 edge, several invalid ones,
-and a forced higher-term observation confirming STATE-4/5/6 fire together.
+(STATE-1 through STATE-7) — every valid STATE-3 edge, several invalid ones,
+a forced higher-term observation confirming STATE-4/5/6 fire together, and
+a Candidate recognizing the Leader of its own term (STATE-7).
 """
 
 import pytest
@@ -155,3 +156,52 @@ def test_reloaded_node_becomes_candidate_from_its_reloaded_term():
     node.become_candidate()
     assert node.current_term == 6
     assert node.voted_for == 1
+
+
+# --- STATE-7: recognizing the Leader of an AppendEntries' term ---------------
+
+
+def test_candidate_recognizing_a_same_term_leader_reverts_to_follower_keeping_term_and_vote():
+    # Two Candidates ran in term 1 and the other one won. Its AppendEntries
+    # carries term 1 — not higher — so STATE-4 never fires; STATE-7 does. The
+    # self-vote stays: clearing it would free this node to vote again in term 1.
+    node = NodeState(node_id=1)
+    node.become_candidate()
+    assert node.recognize_leader(1) is True
+    assert (node.role, node.current_term, node.voted_for) == (Role.FOLLOWER, 1, 1)
+
+
+def test_follower_recognizes_a_same_term_leader_and_stays_follower():
+    node = NodeState.reloaded(node_id=1, current_term=4, voted_for=2)
+    assert node.recognize_leader(4) is True
+    assert (node.role, node.current_term, node.voted_for) == (Role.FOLLOWER, 4, 2)
+
+
+def test_leader_of_a_higher_term_is_recognized_after_catching_up():
+    node = NodeState(node_id=1)
+    node.become_candidate()
+    assert node.recognize_leader(3) is True
+    assert (node.role, node.current_term, node.voted_for) == (Role.FOLLOWER, 3, None)
+
+
+def test_leader_of_an_earlier_term_is_not_recognized():
+    node = NodeState.reloaded(node_id=1, current_term=5, voted_for=2)
+    node.become_candidate()  # term 6
+    assert node.recognize_leader(5) is False
+    assert (node.role, node.current_term, node.voted_for) == (Role.CANDIDATE, 6, 1)
+
+
+def test_leader_does_not_recognize_another_leader_in_its_own_term():
+    node = NodeState(node_id=1)
+    node.become_candidate()
+    node.become_leader()
+    assert node.recognize_leader(1) is False
+    assert (node.role, node.current_term) == (Role.LEADER, 1)
+
+
+def test_leader_recognizes_the_leader_of_a_higher_term_and_steps_down():
+    node = NodeState(node_id=1)
+    node.become_candidate()
+    node.become_leader()
+    assert node.recognize_leader(2) is True
+    assert (node.role, node.current_term, node.voted_for) == (Role.FOLLOWER, 2, None)

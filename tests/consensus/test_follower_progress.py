@@ -1,8 +1,10 @@
-"""Tier 1 unit tests for FollowerProgress: nextIndex backoff (REPL-6, REPL-7)
-and a matchIndex that only ever reflects acknowledged replication — what the
-Leader will count toward APPLY-1's majority — including replies that arrive
-late, twice, or out of order, and the full repair loop against six follower
-logs that each diverge from the leader's in a different way.
+"""Tier 1 unit tests for FollowerProgress (DD-25): nextIndex backoff (REPL-6,
+REPL-7) and a matchIndex that starts at 0 (REPL-15), moves only on an
+acknowledged success (REPL-16), and never decreases (REPL-17) — including
+replies that arrive late, twice, or out of order, and the full repair loop
+against six follower logs that each diverge from the leader's in a
+different way. Which replies reach a FollowerProgress at all is decided by
+Leadership, tested separately.
 """
 
 import random
@@ -17,7 +19,10 @@ def repair(leader_log, follower_log):
     """Probe, back off, and confirm, as a Leader would.
 
     Returns the follower's progress once an AppendEntries is accepted, and
-    how many rejections it took to get there.
+    how many rejections it took to get there. Each rejection lowers
+    nextIndex by one, and a probe at index 1 always succeeds, so needing
+    more rejections than the leader has entries fails the test instead of
+    looping forever.
     """
     progress = FollowerProgress(next_index=leader_log.last_index + 1)
     rejections = 0
@@ -30,6 +35,7 @@ def repair(leader_log, follower_log):
             return progress, rejections
         progress.record_rejection()
         rejections += 1
+        assert rejections <= leader_log.last_index, "never reached an index where the logs agree"
 
 
 # --- Starting state -----------------------------------------------------------

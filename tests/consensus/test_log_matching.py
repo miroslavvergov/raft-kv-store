@@ -14,8 +14,11 @@ def reconcile(leader_log, follower_log):
     from nextIndex just past the leader's last entry, decrement on rejection
     until REPL-5's check passes, then apply REPL-8's overwrite. Returns the
     reconciled follower log and the prevLogIndex the retry loop settled on.
+    A probe at index 1 always passes, so needing more rejections than the
+    leader has entries fails the test instead of looping forever.
     """
     progress = FollowerProgress(next_index=leader_log.last_index + 1)
+    rejections = 0
     while True:
         prev_log_index = progress.next_index - 1
         prev_log_term = leader_log[prev_log_index - 1].term if prev_log_index > 0 else 0
@@ -27,6 +30,8 @@ def reconcile(leader_log, follower_log):
                 prev_log_index,
             )
         progress.record_rejection()
+        rejections += 1
+        assert rejections <= leader_log.last_index, "never reached an index where the logs agree"
 
 
 # --- REPL-5: the consistency check itself -----------------------------------
