@@ -1,31 +1,20 @@
-"""Collects each test's election trace and writes it out once the test is over.
+"""Record each test's election trace in memory, then write and check it once the test is over.
 
-Used by `pytest --trace-elections` (see tests/conftest.py). While a test
-runs, the recorder only appends log records to a list: nothing is
-formatted or written, so recording adds no disk I/O to the event loop and
-no `await`, and cannot reorder anything the test does. Once the test has
-finished — its fixtures torn down, its nodes stopped — the records are
-written as two files in the traces directory:
-
-- `<test>.log`, for reading: every node's log line in etcd's raft log
-  format, interleaved with what the test harness did (`net`, `clock`,
-  `crash`, `disk`, `state`), numbered in the order it happened.
-- `<test>.jsonl`, for machines: a header line, then every trace event in
-  the same order — the nodes' events in etcd's `TracingEvent` shape and the
-  harness's own — each with the number of the `.log` line it follows.
-
-Each trace is then re-checked by `checker.check_election_trace`, and the
-verdict is written at the top of the `.log` file.
+Recording only appends log records, so it adds no I/O or `await` to the test. Each trace becomes
+`<test>.log`, the numbered node log lines and harness steps headed by the checker's verdict, and
+`<test>.jsonl`, a header and then every trace event with the number of the `.log` line it follows.
 """
 
+import contextlib
 import json
 import logging
 import pathlib
 import re
 import shutil
+from typing import NamedTuple
 
-from raftkv.tracing import LOG_LINES, TRACE_EVENTS
-from tests.election_traces.checker import check_election_trace
+from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER
+from tests.election_traces.checker import TraceVerdict, check_election_trace
 
 HARNESS = "tests.cluster"
 
@@ -37,13 +26,33 @@ _LEGEND = """\
 # node's file · state = every running node after the step (t = term, v = vote)."""
 
 
+class TraceResult(NamedTuple):
+    """One written trace.
+
+    Attributes:
+        test_id: The test's pytest node ID.
+        verdict: The checker's verdict on the trace.
+        negative_control: Whether the test breaks a safety rule on purpose.
+        log_path: The trace's `.log` file.
+    """
+
+    test_id: str
+    verdict: TraceVerdict
+    negative_control: bool
+    log_path: pathlib.Path
+
+    @property
+    def test_name(self):
+        """Return the test's name without its file path."""
+        return self.test_id.split("::")[-1]
+
+
 class ElectionTraceRecorder(logging.Handler):
     """A logging handler that records one test at a time and writes its trace files.
 
     Attributes:
         directory: Where trace files are written.
-        results: For every trace written: the test's ID, its verdict,
-            whether it is a negative control, and the `.log` file's path.
+        results: A TraceResult for every trace written.
     """
 
     def __init__(self, directory):
@@ -51,23 +60,26 @@ class ElectionTraceRecorder(logging.Handler):
         self.directory = pathlib.Path(directory)
         self.results = []
         self._records = None
+        self._names_used = set()
 
     def install(self):
-        """Empty the traces directory and start receiving every node's and the harness's records."""
+        """Empty the traces directory and start receiving the nodes' and the harness's records."""
         shutil.rmtree(self.directory, ignore_errors=True)
         self.directory.mkdir(parents=True)
-        for name in (LOG_LINES, TRACE_EVENTS, HARNESS):
+        for name in (LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, HARNESS):
             logger = logging.getLogger(name)
             logger.setLevel(logging.DEBUG)
             logger.addHandler(self)
 
     def uninstall(self):
-        for name in (LOG_LINES, TRACE_EVENTS, HARNESS):
+        """Stop receiving records and restore the loggers' levels."""
+        for name in (LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, HARNESS):
             logger = logging.getLogger(name)
             logger.removeHandler(self)
             logger.setLevel(logging.NOTSET)
 
     def emit(self, record):
+        """Keep `record` if a test is being recorded."""
         if self._records is not None:
             self._records.append(record)
 
@@ -81,22 +93,22 @@ class ElectionTraceRecorder(logging.Handler):
         Args:
             test_id: The test's pytest node ID.
             outcome: "passed", "failed", or "skipped".
-            negative_control: Whether the test deliberately breaks a
-                safety rule, so problems in its trace are expected.
+            negative_control: Whether the test breaks a safety rule on purpose, so problems
+                in its trace are expected.
 
         Returns:
-            The checker's TraceVerdict, or None if the test recorded
-            nothing (it ran no node).
+            The checker's TraceVerdict, or None if the test ran no node.
         """
         records, self._records = self._records, None
         if not records:
             return None
-        lines, entries = self._render(records)
+        lines, entries = render(records)
         verdict = check_election_trace(entries)
-        base = self.directory / _file_name(test_id)
+        name = self._unused_name(_file_name(test_id))
+        log_path = self.directory / f"{name}.log"
 
         header = {"id": test_id, "result": outcome, "negativeControl": negative_control}
-        with open(base.with_suffix(".jsonl"), "w") as jsonl:
+        with open(self.directory / f"{name}.jsonl", "w") as jsonl:
             jsonl.write(json.dumps({"test": header}, sort_keys=True) + "\n")
             for entry in entries:
                 jsonl.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -109,37 +121,101 @@ class ElectionTraceRecorder(logging.Handler):
             f"# test:     {test_id}",
             f"# result:   {outcome}",
             f"# leaders:  {leaders or 'none'}",
-            "# checker:  "
-            + ("no problems" if not verdict.problems else f"{len(verdict.problems)} problem(s)"
-               + (" — expected: this is a negative control" if negative_control else "")),
+            f"# checker:  {_checker_summary(verdict, negative_control)}",
         ]
         summary += [f"#   - {problem}" for problem in verdict.problems]
-        base.with_suffix(".log").write_text(
+        log_path.write_text(
             "\n".join(summary) + "\n#\n" + _LEGEND + "\n\n" + "\n".join(lines) + "\n"
         )
 
-        self.results.append((test_id, verdict, negative_control, base.with_suffix(".log")))
+        self.results.append(TraceResult(test_id, verdict, negative_control, log_path))
         return verdict
 
-    @staticmethod
-    def _render(records):
-        """Turn records into numbered `.log` lines and `.jsonl` entries, in recorded order."""
-        lines, entries = [], []
-        for record in records:
-            if record.name == TRACE_EVENTS:
-                entries.append({"seq": len(entries) + 1, "logLine": len(lines), "source": "node",
-                                "event": record.trace_event.as_dict()})
-                continue
-            source = "raft" if record.name == LOG_LINES else record.trace_source
-            lines.append(f"{len(lines) + 1:>4}  {source:<5}  {record.getMessage()}")
-            harness_event = getattr(record, "trace_event", None)
-            if harness_event is not None:
-                entries.append({"seq": len(entries) + 1, "logLine": len(lines), "source": source,
-                                "event": harness_event})
-        return lines, entries
+    def _unused_name(self, name):
+        """Return `name`, or `name-2`, `name-3`, ... if an earlier trace of this run has it."""
+        candidate, suffix = name, 1
+        while candidate in self._names_used:
+            suffix += 1
+            candidate = f"{name}-{suffix}"
+        self._names_used.add(candidate)
+        return candidate
+
+
+@contextlib.contextmanager
+def collecting_trace_records():
+    """Collect the nodes' trace events and the harness's steps while the block runs.
+
+    Yields the list the records are appended to, ready for `render`. Both loggers are enabled
+    for the block, then restored to their earlier levels.
+    """
+    handler = _RecordList()
+    loggers = [logging.getLogger(name) for name in (TRACE_EVENTS_LOGGER, HARNESS)]
+    levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        for logger, level in zip(loggers, levels, strict=True):
+            logger.removeHandler(handler)
+            logger.setLevel(level)
+
+
+class _RecordList(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def render(records):
+    """Turn log records into numbered `.log` lines and `.jsonl` entries, in recorded order.
+
+    Returns:
+        The `.log` lines, and the entries the checker reads.
+    """
+    lines, entries = [], []
+    for record in records:
+        if record.name == TRACE_EVENTS_LOGGER:
+            entries.append(
+                {
+                    "seq": len(entries) + 1,
+                    "logLine": len(lines),
+                    "source": "node",
+                    "event": record.trace_event.as_dict(),
+                }
+            )
+            continue
+        source = "raft" if record.name == LOG_LINES_LOGGER else record.trace_source
+        lines.append(f"{len(lines) + 1:>4}  {source:<5}  {record.getMessage()}")
+        harness_event = getattr(record, "trace_event", None)
+        if harness_event is not None:
+            entries.append(
+                {
+                    "seq": len(entries) + 1,
+                    "logLine": len(lines),
+                    "source": source,
+                    "event": harness_event,
+                }
+            )
+    return lines, entries
+
+
+def _checker_summary(verdict, negative_control):
+    """Return the text of the `.log` header's `# checker:` line."""
+    if not verdict.problems:
+        return "no problems"
+    expected = " — expected: this is a negative control" if negative_control else ""
+    return f"{len(verdict.problems)} problem(s){expected}"
 
 
 def _file_name(test_id):
-    """Turn `tests/persistence/test_x.py::test_y[3]` into `test_x__test_y-3`."""
+    """Turn `tests/persistence/test_x.py::test_y[3]` into `persistence.test_x__test_y-3`."""
     path, _, name = test_id.partition("::")
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", f"{pathlib.Path(path).stem}__{name}").strip("-")
+    parts = path.removesuffix(".py").split("/")
+    if parts[0] == "tests":
+        parts = parts[1:]
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", ".".join(parts) + "__" + name).strip("-")

@@ -1,42 +1,37 @@
 """One structured trace event: a node's state at a step, and the message involved."""
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from raftkv.consensus import RequestVoteRequest, RequestVoteResponse
 
 
 @dataclass(frozen=True)
 class TraceMessage:
-    """An RPC as it appears in a trace event: who sent what to whom, in which term.
+    """An RPC as a trace event shows it: who sent what to whom, in which term.
 
-    Keys in `as_dict` follow etcd's trace format (`type`, `term`, `from`,
-    `to`, `logTerm`, `index`, `reject`), so a trace reads the same way as
-    one recorded from etcd.
+    `as_dict` uses etcd's trace-format keys, so a trace reads like etcd's.
 
     Attributes:
         type: "RequestVote" or "RequestVoteResponse".
-        sender: The node ID that sent it.
-        receiver: The node ID it was sent to.
+        sender: The sender's node ID.
+        receiver: The receiver's node ID.
         term: The term the message carries.
-        log_term: For a request, the term of the Candidate's last log
-            entry; None for a response.
-        index: For a request, the index of the Candidate's last log
-            entry; None for a response.
-        reject: For a response, True if the vote was refused; None for a
-            request.
+        log_term: The Candidate's last log term, for a request; else None.
+        index: The Candidate's last log index, for a request; else None.
+        reject: Whether the vote was refused, for a response; else None.
     """
 
     type: str
     sender: int
     receiver: int
     term: int
-    log_term: Optional[int] = None
-    index: Optional[int] = None
-    reject: Optional[bool] = None
+    log_term: int | None = None
+    index: int | None = None
+    reject: bool | None = None
 
     @classmethod
-    def from_request(cls, request: RequestVoteRequest, receiver: int) -> "TraceMessage":
+    def from_vote_request(cls, request: RequestVoteRequest, receiver: int) -> "TraceMessage":
         """Describe a RequestVote from its Candidate to `receiver`."""
         return cls(
             type="RequestVote",
@@ -48,7 +43,7 @@ class TraceMessage:
         )
 
     @classmethod
-    def from_response(
+    def from_vote_response(
         cls, response: RequestVoteResponse, sender: int, receiver: int
     ) -> "TraceMessage":
         """Describe a voter's answer, from `sender` (the voter) to `receiver` (the Candidate)."""
@@ -76,19 +71,15 @@ class TraceMessage:
 
 @dataclass(frozen=True)
 class TraceEvent:
-    """A named step in one node's life, with the node's state right after it.
+    """One step of a node in the shape of etcd's `TracingEvent`, with its state.
 
-    Mirrors etcd's `TracingEvent`: every event carries the node's ID, role,
-    term, and vote, how far its log goes, and — for sending or receiving an
-    RPC — the message. Event names are etcd's: `InitState`,
-    `BecomeCandidate`, `BecomeFollower`, `BecomeLeader`,
-    `SendRequestVoteRequest`, `ReceiveRequestVoteRequest`,
-    `SendRequestVoteResponse`, and `ReceiveRequestVoteResponse`.
-
-    The state is always state the node has actually installed: an event is
-    emitted only after the change it describes has been persisted and made
-    the node's current state, so a trace never shows a term or vote the
-    node did not really hold.
+    Names are etcd's: `InitState`, `BecomeCandidate`, `BecomeFollower`,
+    `BecomeLeader`, `SendRequestVoteRequest`, `ReceiveRequestVoteRequest`,
+    `SendRequestVoteResponse`, `ReceiveRequestVoteResponse`; plus `PersistVote`,
+    for a vote a cancelled call installed without answering. Receive events
+    carry the state the message arrived to; all others, the state after the
+    step. A change appears only once persisted and installed, so a trace never
+    shows a term or vote the node did not hold.
 
     Attributes:
         name: The event name.
@@ -98,19 +89,18 @@ class TraceEvent:
         vote: The node's `voted_for`, or None.
         last_log_index: The index of the node's last log entry.
         last_log_term: The term of the node's last log entry.
-        message: The RPC sent or received, for message events.
-        properties: Extra facts for this event, such as a new Leader's
-            per-Follower progress.
+        message: The RPC sent or received, for message events; else None.
+        properties: Extra facts, such as a new Leader's per-Follower progress.
     """
 
     name: str
     node_id: int
     role: str
     term: int
-    vote: Optional[int]
+    vote: int | None
     last_log_index: int
     last_log_term: int
-    message: Optional[TraceMessage] = None
+    message: TraceMessage | None = None
     properties: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:

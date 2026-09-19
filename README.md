@@ -14,6 +14,7 @@ strategy this project implements against.
     source .venv/bin/activate
     pip install -r requirements.txt
     pytest -q
+    ruff format raftkv tests && ruff check raftkv tests   # settings in ruff.toml
 
 ## Tracing elections
 
@@ -36,19 +37,22 @@ to see *why* a test passed or failed, not just *that* it did.
   term, vote, role, and last log entry.
 
 Every trace is also re-checked by an independent checker that reads only the
-trace (`tests/election_traces/checker.py`, the counterpart of etcd's TLA+
-trace validation): at most one Leader per term, at most one vote per node
-per term, votes only for up-to-date logs, Leaders only with a majority,
-terms and votes that survive restarts, and votes on disk before answering.
-A test whose trace breaks a rule fails; tests marked `negative_control`
-break one on purpose, and the summary at the end shows what the checker
-found in them. To re-check saved traces later:
+trace (`tests/election_traces/checker.py`): at most one Leader per term, at
+most one vote per node per term, votes only for up-to-date logs, Leaders only
+with a majority, terms and votes that survive restarts, and votes on disk
+before answering. A passing test whose trace breaks a rule fails at teardown;
+tests marked `negative_control` break one on purpose, and the summary at the
+end shows what the checker found in them. To re-check saved traces later:
 
     python -m tests.election_traces.checker test-traces/elections
 
-Without the option nothing is recorded, and tracing costs one level check
-per call.
+Without the option nothing is recorded, and tracing costs a logger level
+check per call.
 
 ## Status
 
-Environment and repository scaffold only — implementation has not started yet.
+Built and tested: the replicated log's consistency check and repair, durable
+term, vote, and log in SQLite (persisted before every answer), leader election
+(voting, vote counting, stepping down), and per-follower replication progress.
+Not yet built: the AppendEntries handler, commit and apply, timers, the HTTP
+transport, and the key-value store.

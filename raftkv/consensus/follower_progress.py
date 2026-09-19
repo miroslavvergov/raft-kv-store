@@ -1,52 +1,31 @@
-"""A Leader's per-follower replication progress: nextIndex and matchIndex."""
+"""A Leader's per-Follower replication progress: nextIndex and matchIndex."""
 
 
 class FollowerProgress:
-    """How far one Follower's log is known to match the Leader's.
+    """A Leader's in-memory replication progress for one Follower (DD-25).
 
-    Holds the two values a Leader tracks, in memory only, for one
-    follower:
-
-    - `next_index` — the index of the next entry the Leader will send.
-      It is a guess, lowered on every rejection (REPL-6) until the
-      Follower's log agrees with the Leader's (REPL-5).
-    - `match_index` — the highest index known to be identical on the
-      Follower and the Leader. It is never a guess: it moves only when
-      the Follower has actually acknowledged a successful AppendEntries
-      (REPL-16), which is what lets the Leader count the Follower toward
-      the majority APPLY-1 requires before an entry can be committed.
-
-    Both values change only through `record_success` and
-    `record_rejection` (DD-25), and together they keep one invariant
-    after every call: `match_index < next_index`. Everything up to
-    `match_index` is already confirmed, so the next entry the Leader
-    sends is always past it.
-
-    A FollowerProgress knows nothing about terms. In the Leader, every
-    FollowerProgress belongs to a `Leadership`, which creates a fresh one
-    for each follower whenever the node wins an election and passes on
-    only replies to RPCs sent in that election's term — so every reply
-    that reaches this record belongs to the current leadership.
+    `next_index` is a guess, lowered on each rejection (REPL-6) until the logs
+    agree (REPL-5). `match_index` is never a guess: it rises only on an
+    acknowledged success (REPL-16), which is what counts the Follower toward an
+    entry's commit majority (APPLY-1). Both change only through
+    `record_success` and `record_rejection`, which keep
+    `match_index < next_index`. It holds no term: its `Leadership` passes on
+    only replies to RPCs sent in its own term.
 
     Attributes:
-        next_index: The index of the next log entry the Leader will send
-            to this follower. Always greater than `match_index`.
-        match_index: The highest log index confirmed to match on this
-            follower (0 if none yet). Never decreases.
+        next_index: The index of the next entry to send; always above
+            `match_index`.
+        match_index: The highest index known to match on the Follower; 0 until
+            one is confirmed. Never decreases (REPL-17).
     """
 
     def __init__(self, next_index: int) -> None:
-        """Start tracking a follower, with nothing confirmed yet.
-
-        `match_index` always starts at 0 (REPL-15), because nothing has
-        been confirmed yet. A `Leadership` starts `next_index` at one past
-        the Leader's own last log index (REPL-14) — 11, for a Leader
-        holding 10 entries — optimistically assuming the follower already
-        has everything, and letting rejections walk it back.
+        """Start tracking a Follower, with `match_index` 0 (REPL-15).
 
         Args:
-            next_index: The nextIndex to start tracking this follower
-                from. At least 1.
+            next_index: The first index to send; at least 1. `Leadership` passes
+                one past the Leader's last log index (REPL-14), assuming the
+                Follower has everything until rejections walk it back.
         """
         self._next_index = next_index
         self._match_index = 0
@@ -60,45 +39,28 @@ class FollowerProgress:
         return self._match_index
 
     def record_success(self, prev_log_index: int, entry_count: int) -> None:
-        """Record that this follower accepted an AppendEntries RPC.
+        """Record that the Follower accepted an AppendEntries.
 
-        The accepted RPC proves the follower's log now matches the
-        Leader's through the last entry that RPC carried:
-        `prev_log_index + entry_count`, both taken from that specific
-        RPC (REPL-16). `match_index` moves up to that index, and
-        `next_index` moves to the index right after it.
-
-        Neither value ever moves down here (REPL-17). Responses can arrive
-        late or more than once — FAIL-2 retries an RPC that timed out, and
-        the network may deliver replies out of order — so a success for an
-        older RPC that carried fewer entries can arrive after a newer
-        one. Taking the larger value keeps `match_index` from falling
-        back to something already surpassed, so it only ever increases.
+        The accepted RPC proves the logs match through
+        `prev_log_index + entry_count` (REPL-16): `match_index` rises to that index
+        and `next_index` to at least `match_index + 1`. Neither ever decreases
+        (REPL-17), so a late, duplicated, or reordered reply (FAIL-2) cannot move
+        them back.
 
         Args:
-            prev_log_index: The `prev_log_index` the accepted RPC was
-                sent with.
-            entry_count: How many entries the accepted RPC carried — 0
-                for a heartbeat.
+            prev_log_index: The accepted RPC's `prev_log_index`.
+            entry_count: How many entries it carried; 0 for a heartbeat.
         """
         self._match_index = max(self._match_index, prev_log_index + entry_count)
         self._next_index = max(self._next_index, self._match_index + 1)
 
     def record_rejection(self) -> None:
-        """Lower nextIndex by one after this follower rejects an AppendEntries.
+        """Lower `next_index` by one after the Follower rejects an AppendEntries (REPL-6).
 
-        Implements REPL-6: "whenever a Leader's AppendEntries RPC is
-        rejected under REPL-5, the Leader shall decrement its stored
-        nextIndex for that Follower." It never goes below
-        `match_index + 1`: every index up to `match_index` is already
-        confirmed to match, so a rejection reaching below it can only be
-        a late reply to an older RPC, and probing there again would only
-        resend entries the follower already holds. With nothing confirmed
-        yet, that floor is 1 — the lowest index a probe ever needs,
-        since `Log.matches` accepts a `prev_log_index` of 0
-        unconditionally.
-
-        The retrying itself — sending AppendEntries again from the new,
-        lower `next_index` — is REPL-7's job, and the caller's.
+        Never below `match_index + 1`: indexes up to `match_index` are confirmed, so
+        a rejection reaching below is a late reply to an older RPC. With nothing
+        confirmed the floor is 1, the lowest probe needed, since `Log.matches`
+        accepts `prev_log_index` 0. Resending from the new `next_index` (REPL-7) is
+        the caller's job.
         """
         self._next_index = max(self._match_index + 1, self._next_index - 1)

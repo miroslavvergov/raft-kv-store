@@ -9,24 +9,16 @@ from raftkv.consensus.log_position import LogPosition
 class RequestVoteRequest:
     """A Candidate's request for one node's vote in one term.
 
-    A Candidate sends the same request to every other member (ELECT-6)
-    right after persisting its new term and its vote for itself (ELECT-5).
-
-    It carries the facts about the Candidate's log that the voter needs
-    for ELECT-9: the index and term of the Candidate's last log entry
-    (ELECT-7). Comparing just those two numbers is enough to tell whether
-    the Candidate's log is at least as up to date as the voter's
-    (ELECT-10), so the log itself is never sent.
+    Sent to every other member (ELECT-6) once the Candidate's new term and
+    self-vote are persisted (ELECT-5). It carries only the index and term of the
+    Candidate's last entry (ELECT-7), which is all ELECT-9/ELECT-10 compare.
 
     Attributes:
-        term: The term the Candidate is running in — its own
-            `current_term`, just incremented (ELECT-3).
-        candidate_id: The Candidate's node ID. A voter that grants the
-            vote records this as its `voted_for`.
-        last_log_index: The index of the Candidate's last log entry (0
-            for an empty log).
-        last_log_term: The term of the Candidate's last log entry (0 for
-            an empty log).
+        term: The Candidate's `current_term`, just incremented (ELECT-3).
+        candidate_id: The Candidate's node ID; a voter that grants records it
+            as `voted_for`.
+        last_log_index: The index of the Candidate's last entry; 0 if empty.
+        last_log_term: The term of the Candidate's last entry; 0 if empty.
     """
 
     term: int
@@ -45,13 +37,11 @@ class RequestVoteResponse:
     """A voter's answer to one RequestVoteRequest.
 
     Attributes:
-        term: The voter's `current_term` after handling the request.
-            A Candidate that finds this higher than its own term has
-            fallen behind: it catches up and stops campaigning (STATE-4,
-            STATE-5). When the vote is granted, this equals the request's
-            term.
-        vote_granted: True if the voter gave its vote for the request's
-            term to the Candidate.
+        term: The voter's `current_term` after handling the request; equal to
+            the request's term whenever the vote is granted. A Candidate seeing
+            a higher term catches up and stops campaigning (STATE-4, STATE-5).
+        vote_granted: Whether the voter gave the Candidate its vote for the
+            request's term.
     """
 
     term: int

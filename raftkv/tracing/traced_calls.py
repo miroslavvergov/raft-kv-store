@@ -2,71 +2,103 @@
 
 import functools
 import inspect
-from typing import Any, Callable
+import logging
+from collections.abc import Callable
+from typing import Any
 
 from raftkv.tracing.node_snapshot import NodeSnapshot
 from raftkv.tracing.node_tracer import NodeTracer
 
+_failures = logging.getLogger(__name__)
 
-def traced(report: Callable[..., None]) -> Callable:
-    """Report every call of the decorated `DurableNodeState` method to the node's tracer.
 
-    The method itself contains no tracing: the decorator takes a
-    `NodeSnapshot` of the node just before the call and another just after
-    it, and passes both — with the call's arguments, and its result or the
-    exception it raised — to `report`, one of `NodeTracer`'s `report_*`
-    methods, which works out what happened and reports it in etcd's
-    format.
+def traced(report: Callable[..., None]) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Report each call of the decorated `DurableNodeState` method to the node's tracer.
 
-    Placed inside `_holding_the_lock`, both snapshots are taken with the
-    node's lock held, so no other call can change the state between them
-    and the method. The "after" snapshot is taken even when the method
-    raises: a write that failed left the state as it was, so nothing is
-    reported as changed; a caller cancelled while its write was in flight
-    had the change installed before the cancellation was raised, so it is
-    reported.
-
-    With tracing off, the call goes straight through: no snapshot is
-    taken and `report` is not called.
-
-    A constructor is reported once it has finished, with no "before"
-    snapshot.
+    Takes a `NodeSnapshot` just before and just after the call and passes both,
+    with the call's arguments and its result or exception, to `report`. Apply it
+    beneath the node's lock decorator, so both snapshots are taken under the
+    lock. The "after" snapshot is taken even when the method raises: a failed
+    write shows no change, and a cancelled caller's installed change shows.
+    With tracing off, the call goes straight through and nothing is
+    snapshotted or reported.
 
     Args:
-        report: The `NodeTracer` method that reports this kind of call. It
-            is called as `report(tracer, before, after, *args, result=...,
-            error=...)`.
+        report: The `NodeTracer.report_*` method for this kind of call. For a
+            coroutine method it is called as `report(tracer, before, after,
+            *args, result=..., error=...)`, where `args` are the call's
+            arguments for the method's positional parameters, defaults filled
+            in, passed positionally however the caller passed them. For
+            `__init__` it is called as `report(tracer, after)` once the
+            constructor returns.
 
     Returns:
         The decorator.
+
+    Raises:
+        TypeError: When the decorator is applied to a synchronous method other
+            than `__init__`.
     """
 
-    def decorate(method: Callable) -> Callable:
+    def decorate(method: Callable[..., Any]) -> Callable[..., Any]:
         if not inspect.iscoroutinefunction(method):
+            if method.__name__ != "__init__":
+                raise TypeError(
+                    f"traced supports coroutine methods and __init__, not {method.__qualname__}"
+                )
 
             @functools.wraps(method)
-            def constructed(node: Any, *args: Any) -> None:
-                method(node, *args)
+            def traced_init(node: Any, *args: Any, **kwargs: Any) -> None:
+                method(node, *args, **kwargs)
                 tracer = NodeTracer(node.node_id)
                 if tracer.enabled:
-                    report(tracer, None, NodeSnapshot.of(node), *args, result=None, error=None)
+                    _report_safely(report, tracer, NodeSnapshot.of(node))
 
-            return constructed
+            return traced_init
+
+        signature = inspect.signature(method)
 
         @functools.wraps(method)
-        async def called(node: Any, *args: Any) -> Any:
+        async def traced_method(node: Any, *args: Any, **kwargs: Any) -> Any:
             tracer = NodeTracer(node.node_id)
             if not tracer.enabled:
-                return await method(node, *args)
+                return await method(node, *args, **kwargs)
+            bound = signature.bind(node, *args, **kwargs)
+            bound.apply_defaults()
+            positional = bound.args[1:]
             before = NodeSnapshot.of(node)
             try:
-                result = await method(node, *args)
+                result = await method(node, *positional, **bound.kwargs)
             except BaseException as error:
-                report(tracer, before, NodeSnapshot.of(node), *args, result=None, error=error)
+                _report_safely(
+                    report,
+                    tracer,
+                    before,
+                    NodeSnapshot.of(node),
+                    *positional,
+                    result=None,
+                    error=error,
+                )
                 raise
-            report(tracer, before, NodeSnapshot.of(node), *args, result=result, error=None)
+            _report_safely(
+                report,
+                tracer,
+                before,
+                NodeSnapshot.of(node),
+                *positional,
+                result=result,
+                error=None,
+            )
             return result
 
-        return called
+        return traced_method
 
     return decorate
+
+
+def _report_safely(report: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+    """Call `report`; if it raises, log that and leave the traced call unaffected."""
+    try:
+        report(*args, **kwargs)
+    except Exception:
+        _failures.exception("reporting with %s failed", report.__qualname__)

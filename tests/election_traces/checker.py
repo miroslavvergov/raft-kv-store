@@ -1,28 +1,19 @@
 """Re-check election safety from a recorded trace alone.
 
-The counterpart of etcd's TLA+ trace validation: it reads only what was
-recorded — the nodes' trace events and the harness's disk checks — and
-re-derives from them, independently of the tests' own assertions, whether
-the run broke any of the rules below. It imports nothing from `raftkv`, so
-a bug in the code under test cannot also hide inside the check.
+It reads only the nodes' trace events and the harness's disk checks, and imports nothing from
+`raftkv`, so a bug in the code under test cannot also hide in the check. Rules, per trace:
 
-Rules, per trace:
-
-1. At most one node becomes Leader in any term (Election Safety).
-2. A node votes for at most one Candidate in any term, itself included
-   (ELECT-8).
-3. A node grants its vote only to a Candidate whose last log entry is at
-   least as up to date as its own: a later last term, or the same last
-   term and at least as long (ELECT-9, ELECT-10).
-4. A node becomes Leader only after grants from a strict majority of the
-   cluster, itself included, answering requests sent in that same term
-   (ELECT-11, ELECT-12).
-5. A node's term never goes down, and once it has voted in a term its
-   vote never changes while that term lasts — including across restarts,
-   which is what persisting the term and vote guarantees (PERSIST-1,
-   PERSIST-2, STATE-6).
-6. Every vote read back from a node's file matches the vote the node held
-   when it answered (PERSIST-2).
+1. At most one node becomes Leader in any term.
+2. A node votes for at most one Candidate in any term, itself included, whether the vote shows in
+   an answer or only in the node's state (ELECT-8).
+3. A node grants its vote only to a Candidate whose last log entry is at least as up to date as
+   its own: a later last term, or the same last term and at least as long (ELECT-9, ELECT-10).
+4. A node becomes Leader only after grants from a strict majority of its cluster, itself
+   included, counting only members and each voter's first answer to a request sent in that term
+   (ELECT-11, ELECT-12). A Leader whose cluster size is unknown, with no InitState, is flagged.
+5. A node's term never goes down, and once it has voted in a term, that vote never changes while
+   the term lasts, across restarts too (PERSIST-1, PERSIST-2, STATE-6).
+6. Every vote read back from a node's file matches the vote it held when it answered (PERSIST-2).
 
 Run on a directory of traces: `python -m tests.election_traces.checker test-traces/elections`.
 """
@@ -48,8 +39,14 @@ class TraceVerdict:
 
 
 def _at_least_as_up_to_date(candidate, voter):
-    """ELECT-10 on (last term, last index) pairs."""
-    return candidate[0] > voter[0] or (candidate[0] == voter[0] and candidate[1] >= voter[1])
+    """Return whether `candidate`'s (last term, last index) is at least as up to date as `voter`'s.
+
+    ELECT-10: a later last term wins; between equal last terms, the longer log wins.
+    """
+    (candidate_term, candidate_index), (voter_term, voter_index) = candidate, voter
+    return candidate_term > voter_term or (
+        candidate_term == voter_term and candidate_index >= voter_index
+    )
 
 
 def check_election_trace(entries):
@@ -68,7 +65,7 @@ def check_election_trace(entries):
     votes = defaultdict(set)
     peers = {}
     requests_seen = {}
-    grants_received = defaultdict(set)
+    first_answers = defaultdict(dict)  # (candidate, sent in term) -> {voter: granted}
     last_term_and_vote = {}
 
     for entry in entries:
@@ -104,11 +101,11 @@ def check_election_trace(entries):
                     f"node {node}'s vote in term {term} changed from {last_vote} to {vote} ({name})"
                 )
         last_term_and_vote[node] = (term, vote)
+        if vote is not None:
+            votes[(node, term)].add(vote)  # rule 2: every vote the node's state shows
 
         if name == "InitState":
             peers[node] = event.get("prop", {}).get("peers", [])
-        elif name == "BecomeCandidate":
-            votes[(node, term)].add(node)
         elif name == "ReceiveRequestVoteRequest":
             requests_seen[(node, msg["from"], msg["term"])] = (msg["logTerm"], msg["index"])
         elif name == "SendRequestVoteResponse" and not msg["reject"]:
@@ -121,8 +118,11 @@ def check_election_trace(entries):
                 )
                 verdict.problems.append(
                     f"node {node} granted a term-{msg['term']} vote to {candidate}, but "
-                    + (f"its requests were for term(s) {other_terms}" if other_terms
-                       else "no request from it had arrived")
+                    + (
+                        f"its requests were for term(s) {other_terms}"
+                        if other_terms
+                        else "no request from it had arrived"
+                    )
                 )
             elif not _at_least_as_up_to_date(candidate_log, own_log):  # rule 3
                 verdict.problems.append(
@@ -130,14 +130,23 @@ def check_election_trace(entries):
                     f"candidate's log (term {candidate_log[0]}, index {candidate_log[1]}) is "
                     f"behind its own (term {own_log[0]}, index {own_log[1]})"
                 )
-        elif name == "ReceiveRequestVoteResponse" and not msg["reject"]:
-            if event.get("prop", {}).get("sentInTerm") == msg["term"]:
-                grants_received[(node, msg["term"])].add(msg["from"])
-        elif name == "BecomeLeader":
+        elif name == "ReceiveRequestVoteResponse":
+            sent_in_term = event.get("prop", {}).get("sentInTerm")
+            members = {node, *peers.get(node, [])}
+            if sent_in_term == msg["term"] and msg["from"] in members:
+                first_answers[(node, sent_in_term)].setdefault(msg["from"], not msg["reject"])
+        elif name == "BecomeLeader":  # rule 4
             leaders[term].add(node)
-            granted = grants_received[(node, term)] | {node}
-            cluster_size = len(peers.get(node, [])) + 1
-            if 2 * len(granted) <= cluster_size:  # rule 4
+            if node not in peers:
+                verdict.problems.append(
+                    f"node {node} became leader of term {term}, but its cluster size is "
+                    "unknown (no InitState)"
+                )
+                continue
+            answers = first_answers[(node, term)]
+            granted = {voter for voter, grant in answers.items() if grant} | {node}
+            cluster_size = len(peers[node]) + 1
+            if 2 * len(granted) <= cluster_size:
                 verdict.problems.append(
                     f"node {node} became leader of term {term} with votes from {sorted(granted)} "
                     f"— not a majority of {cluster_size}"
@@ -148,9 +157,7 @@ def check_election_trace(entries):
             verdict.problems.append(f"term {term} had {len(nodes)} leaders: {sorted(nodes)}")
     for (node, term), candidates in sorted(votes.items()):  # rule 2
         if len(candidates) > 1:
-            verdict.problems.append(
-                f"node {node} voted for {sorted(candidates)} in term {term}"
-            )
+            verdict.problems.append(f"node {node} voted for {sorted(candidates)} in term {term}")
     verdict.leaders_by_term = {term: sorted(nodes) for term, nodes in sorted(leaders.items())}
     return verdict
 

@@ -1,7 +1,6 @@
-"""Public API for node persistence: stable storage for term, vote, and log.
+"""Public API of node persistence: stable storage for term, vote, and log.
 
-Other layers should import from `raftkv.persistence` only, never from its
-submodules directly.
+Import from `raftkv.persistence`, never from its submodules.
 """
 
 from raftkv.persistence.durable_node_state import DurableNodeState

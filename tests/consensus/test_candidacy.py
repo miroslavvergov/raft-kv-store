@@ -1,9 +1,6 @@
-"""Tier 1 unit tests for Candidacy (ELECT-8, ELECT-11, ELECT-12): the
-Candidate's own vote counted from the start, a majority reached at exactly
-the right grant and not one before, refusals never counting, a voter's
-repeated or changed answer counting once, answers from any other term
-ignored — including a delayed grant from an earlier election — and a
-randomized check against an independent model of the counting rules.
+"""Tier 1 tests for Candidacy, a Candidate's count of the answers to one election.
+
+ELECT-8, ELECT-11, ELECT-12.
 """
 
 import random
@@ -16,7 +13,7 @@ THREE_NODES = Cluster([1, 2, 3])
 FIVE_NODES = Cluster([1, 2, 3, 4, 5])
 
 
-# --- Starting point ------------------------------------------------------------
+# --- Starting point -------------------------------------------------------------------
 
 
 def test_starts_with_only_the_candidates_own_vote():
@@ -43,7 +40,7 @@ def test_term_and_votes_cannot_be_assigned():
         candidacy.votes_granted = frozenset({1, 2, 3})
 
 
-# --- Reaching a majority (ELECT-11, ELECT-12) -----------------------------------
+# --- Reaching a majority (ELECT-11, ELECT-12) -----------------------------------------
 
 
 def test_three_nodes_win_on_the_first_grant_from_a_peer():
@@ -70,12 +67,12 @@ def test_refusals_never_count_toward_a_majority():
     assert not candidacy.has_majority
 
 
-# --- One answer per voter -------------------------------------------------------
+# --- One answer per voter -------------------------------------------------------------
 
 
 def test_the_same_grant_delivered_again_counts_once():
-    # A retried request, or a reply the network delivers twice, is still one
-    # vote. Counting it again would let two nodes look like three.
+    # A retried request, or a reply the network delivers twice, is still one vote. Counting it
+    # again would let two nodes look like three.
     candidacy = Candidacy(term=4, candidate_id=1, cluster=FIVE_NODES)
     assert candidacy.record_vote(2, sent_in_term=4, granted=True) is True
     assert candidacy.record_vote(2, sent_in_term=4, granted=True) is False
@@ -97,14 +94,13 @@ def test_the_candidate_cannot_count_itself_twice():
     assert not candidacy.has_majority
 
 
-# --- Only answers from this election count --------------------------------------
+# --- Only answers from this election count --------------------------------------------
 
 
 def test_a_delayed_grant_from_an_earlier_election_is_not_counted():
-    # Term 4: node 1 asked node 2 for its vote, node 2 granted, and the grant
-    # got stuck in the network. Term 5: node 1 runs again — and node 2 may
-    # well have voted for node 3 this time. The old grant says nothing about
-    # term 5; counting it would give node 1 a majority it does not have.
+    # Term 4: node 1 asked node 2 for its vote, node 2 granted, and the grant got stuck in the
+    # network. Term 5: node 1 runs again, and node 2 may well have voted for node 3 this time.
+    # The old grant says nothing about term 5; counting it would give node 1 a false majority.
     candidacy = Candidacy(term=5, candidate_id=1, cluster=THREE_NODES)
     assert candidacy.record_vote(2, sent_in_term=4, granted=True) is False
     assert candidacy.votes_granted == frozenset({1})
@@ -132,14 +128,13 @@ def test_unknown_voter_raises_in_this_term_but_is_ignored_in_another():
     assert candidacy.votes_granted == frozenset({1})
 
 
-# --- Against an independent model -------------------------------------------------
+# --- Against an independent model -----------------------------------------------------
 
 
-@pytest.mark.parametrize("seed", range(50))
+@pytest.mark.parametrize("seed", range(50), ids=lambda seed: f"seed={seed}")
 def test_counting_matches_a_simple_model_across_any_sequence_of_answers(seed):
-    # Deterministic pseudo-random answers — from any member, for this term and
-    # others, grants and refusals, repeated freely — checked after every one
-    # against a direct restatement of the rules.
+    # Answers from any member, for this term and others, grants and refusals, repeated
+    # freely, each checked against a direct restatement of the counting rules.
     rng = random.Random(seed)
     members = list(range(1, rng.randint(1, 7) + 1))
     cluster = Cluster(members)

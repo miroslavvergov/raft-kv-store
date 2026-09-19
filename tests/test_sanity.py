@@ -1,3 +1,5 @@
+"""Environment check: dependencies import and async tests run."""
+
 import aiohttp
 
 

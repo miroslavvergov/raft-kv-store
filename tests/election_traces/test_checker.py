@@ -1,6 +1,6 @@
-"""Tests for the election-trace checker: a clean election passes, and each
-of its six rules is shown to fail on a trace that breaks it — so a clean
-verdict on a real trace means something.
+"""Tests for the election-trace checker: a clean election passes, and each rule flags a breach.
+
+A clean verdict on a real trace therefore means something.
 """
 
 import json
@@ -8,13 +8,14 @@ import json
 from tests.election_traces.checker import check_election_trace, main
 
 
-def event(name, nid, term, vote, role="follower", log=(0, 0), msg=None, prop=None):
+def node_event(name, *, node, term, vote, role="follower", last_log=(0, 0), msg=None, prop=None):
+    """Return a node's trace entry, as the recorder writes it; `last_log` is (term, index)."""
     fields = {
         "name": name,
-        "nid": nid,
+        "nid": node,
         "role": role,
         "state": {"term": term, "vote": vote},
-        "log": {"term": log[0], "index": log[1]},
+        "log": {"term": last_log[0], "index": last_log[1]},
     }
     if msg is not None:
         fields["msg"] = msg
@@ -23,34 +24,83 @@ def event(name, nid, term, vote, role="follower", log=(0, 0), msg=None, prop=Non
     return {"source": "node", "event": fields}
 
 
-def request(sender, receiver, term, log=(0, 0)):
-    return {"type": "RequestVote", "from": sender, "to": receiver, "term": term,
-            "logTerm": log[0], "index": log[1]}
+def node_starts(node, *, peers, term=0, vote=None):
+    """Return a node's InitState entry."""
+    return node_event("InitState", node=node, term=term, vote=vote, prop={"peers": peers})
 
 
-def answer(sender, receiver, term, granted):
-    return {"type": "RequestVoteResponse", "from": sender, "to": receiver, "term": term,
-            "reject": not granted}
+def request_msg(*, candidate, voter, term, last_log=(0, 0)):
+    """Return a RequestVote's `msg` fields; `last_log` is the Candidate's (term, index)."""
+    return {
+        "type": "RequestVote",
+        "from": candidate,
+        "to": voter,
+        "term": term,
+        "logTerm": last_log[0],
+        "index": last_log[1],
+    }
 
 
-def init(nid, peers, term=0, vote=None):
-    return event("InitState", nid, term, vote, prop={"peers": peers})
+def grant_msg(*, voter, candidate, term):
+    """Return the `msg` fields of an answer granting the vote."""
+    return _response_msg(voter, candidate, term, reject=False)
+
+
+def refusal_msg(*, voter, candidate, term):
+    """Return the `msg` fields of an answer refusing the vote."""
+    return _response_msg(voter, candidate, term, reject=True)
+
+
+def _response_msg(voter, candidate, term, reject):
+    return {
+        "type": "RequestVoteResponse",
+        "from": voter,
+        "to": candidate,
+        "term": term,
+        "reject": reject,
+    }
 
 
 def clean_election():
-    """Three nodes; node 1 wins term 1 with node 2's vote."""
+    """Return the trace of three nodes in which node 1 wins term 1 with node 2's vote."""
     return [
-        init(1, [2, 3]),
-        init(2, [1, 3]),
-        init(3, [1, 2]),
-        event("BecomeCandidate", 1, 1, 1, role="candidate"),
-        event("SendRequestVoteRequest", 1, 1, 1, role="candidate", msg=request(1, 2, 1)),
-        event("ReceiveRequestVoteRequest", 2, 0, None, msg=request(1, 2, 1)),
-        event("BecomeFollower", 2, 1, 1),
-        event("SendRequestVoteResponse", 2, 1, 1, msg=answer(2, 1, 1, True)),
-        event("ReceiveRequestVoteResponse", 1, 1, 1, role="candidate",
-              msg=answer(2, 1, 1, True), prop={"sentInTerm": 1}),
-        event("BecomeLeader", 1, 1, 1, role="leader"),
+        node_starts(1, peers=[2, 3]),
+        node_starts(2, peers=[1, 3]),
+        node_starts(3, peers=[1, 2]),
+        node_event("BecomeCandidate", node=1, term=1, vote=1, role="candidate"),
+        node_event(
+            "SendRequestVoteRequest",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=request_msg(candidate=1, voter=2, term=1),
+        ),
+        node_event(
+            "ReceiveRequestVoteRequest",
+            node=2,
+            term=0,
+            vote=None,
+            msg=request_msg(candidate=1, voter=2, term=1),
+        ),
+        node_event("BecomeFollower", node=2, term=1, vote=1),
+        node_event(
+            "SendRequestVoteResponse",
+            node=2,
+            term=1,
+            vote=1,
+            msg=grant_msg(voter=2, candidate=1, term=1),
+        ),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=grant_msg(voter=2, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=1, term=1, vote=1, role="leader"),
     ]
 
 
@@ -61,121 +111,288 @@ def test_a_clean_election_breaks_no_rule():
 
 
 def test_harness_entries_are_ignored():
+    delivery = {"name": "Deliver", "msg": request_msg(candidate=1, voter=3, term=1)}
     entries = clean_election() + [
-        {"source": "net", "event": {"name": "Deliver", "msg": request(1, 3, 1)}},
+        {"source": "net", "event": delivery},
         {"source": "state", "event": {"name": "ClusterState", "nodes": {}}},
     ]
     assert check_election_trace(entries).problems == []
 
 
-def test_rule_1_two_leaders_in_one_term():
+# --- Rule 1: at most one Leader per term ----------------------------------------------
+
+
+def test_two_leaders_in_one_term_are_flagged():
     entries = clean_election() + [
-        event("BecomeCandidate", 3, 1, 3, role="candidate"),
-        event("ReceiveRequestVoteResponse", 3, 1, 3, role="candidate",
-              msg=answer(2, 3, 1, True), prop={"sentInTerm": 1}),
-        event("BecomeLeader", 3, 1, 3, role="leader"),
+        node_event("BecomeCandidate", node=3, term=1, vote=3, role="candidate"),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=3,
+            term=1,
+            vote=3,
+            role="candidate",
+            msg=grant_msg(voter=2, candidate=3, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=3, term=1, vote=3, role="leader"),
     ]
     assert "term 1 had 2 leaders: [1, 3]" in check_election_trace(entries).problems
 
 
-def test_rule_2_two_candidates_given_a_vote_in_one_term():
+# --- Rule 2: at most one vote per node per term ---------------------------------------
+
+
+def test_a_vote_for_two_candidates_in_one_term_is_flagged():
     entries = clean_election() + [
-        event("ReceiveRequestVoteRequest", 2, 1, 1, msg=request(3, 2, 1)),
-        event("SendRequestVoteResponse", 2, 1, 3, msg=answer(2, 3, 1, True)),
+        node_event(
+            "ReceiveRequestVoteRequest",
+            node=2,
+            term=1,
+            vote=1,
+            msg=request_msg(candidate=3, voter=2, term=1),
+        ),
+        node_event(
+            "SendRequestVoteResponse",
+            node=2,
+            term=1,
+            vote=3,
+            msg=grant_msg(voter=2, candidate=3, term=1),
+        ),
     ]
     assert "node 2 voted for [1, 3] in term 1" in check_election_trace(entries).problems
 
 
-def test_rule_3_a_vote_for_a_candidate_whose_log_is_behind():
+def test_a_vote_seen_only_in_a_nodes_state_counts():
+    # Node 2 granted node 1 in term 1, then persisted a vote for node 3 that it never answered.
+    entries = clean_election() + [node_event("PersistVote", node=2, term=1, vote=3)]
+    assert "node 2 voted for [1, 3] in term 1" in check_election_trace(entries).problems
+
+
+# --- Rule 3: votes only for an up-to-date log, answering a request of that term -------
+
+
+def test_a_vote_for_a_candidate_whose_log_is_behind_is_flagged():
     entries = [
-        init(1, [2, 3]),
-        init(2, [1, 3], term=2),
-        event("ReceiveRequestVoteRequest", 2, 2, None, log=(2, 5),
-              msg=request(1, 2, 3, log=(1, 9))),
-        event("SendRequestVoteResponse", 2, 3, 1, log=(2, 5), msg=answer(2, 1, 3, True)),
+        node_starts(1, peers=[2, 3]),
+        node_starts(2, peers=[1, 3], term=2),
+        node_event(
+            "ReceiveRequestVoteRequest",
+            node=2,
+            term=2,
+            vote=None,
+            last_log=(2, 5),
+            msg=request_msg(candidate=1, voter=2, term=3, last_log=(1, 9)),
+        ),
+        node_event(
+            "SendRequestVoteResponse",
+            node=2,
+            term=3,
+            vote=1,
+            last_log=(2, 5),
+            msg=grant_msg(voter=2, candidate=1, term=3),
+        ),
     ]
-    problems = check_election_trace(entries).problems
-    assert problems == [
+    assert check_election_trace(entries).problems == [
         "node 2 voted for 1 in term 3 although the candidate's log (term 1, index 9) "
         "is behind its own (term 2, index 5)"
     ]
 
 
-def test_rule_3_a_vote_answering_a_request_from_another_term():
+def test_a_vote_answering_a_request_from_another_term_is_flagged():
     entries = [
-        init(2, [1, 3], term=5),
-        event("ReceiveRequestVoteRequest", 2, 5, None, msg=request(1, 2, 3)),
-        event("SendRequestVoteResponse", 2, 5, 1, msg=answer(2, 1, 5, True)),
+        node_starts(2, peers=[1, 3], term=5),
+        node_event(
+            "ReceiveRequestVoteRequest",
+            node=2,
+            term=5,
+            vote=None,
+            msg=request_msg(candidate=1, voter=2, term=3),
+        ),
+        node_event(
+            "SendRequestVoteResponse",
+            node=2,
+            term=5,
+            vote=1,
+            msg=grant_msg(voter=2, candidate=1, term=5),
+        ),
     ]
     assert check_election_trace(entries).problems == [
         "node 2 granted a term-5 vote to 1, but its requests were for term(s) [3]"
     ]
 
 
-def test_rule_4_a_leader_without_a_majority():
+# --- Rule 4: a Leader only with a majority of this term's grants ----------------------
+
+
+def test_a_leader_without_a_majority_is_flagged():
     entries = [
-        init(1, [2, 3, 4, 5]),
-        event("BecomeCandidate", 1, 1, 1, role="candidate"),
-        event("ReceiveRequestVoteResponse", 1, 1, 1, role="candidate",
-              msg=answer(2, 1, 1, True), prop={"sentInTerm": 1}),
-        event("BecomeLeader", 1, 1, 1, role="leader"),
+        node_starts(1, peers=[2, 3, 4, 5]),
+        node_event("BecomeCandidate", node=1, term=1, vote=1, role="candidate"),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=grant_msg(voter=2, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=1, term=1, vote=1, role="leader"),
     ]
     assert check_election_trace(entries).problems == [
         "node 1 became leader of term 1 with votes from [1, 2] — not a majority of 5"
     ]
 
 
-def test_rule_4_a_grant_from_an_earlier_election_does_not_count():
+def test_a_grant_from_an_earlier_election_does_not_count_toward_a_majority():
     entries = [
-        init(1, [2, 3]),
-        event("BecomeCandidate", 1, 2, 1, role="candidate"),
-        event("ReceiveRequestVoteResponse", 1, 2, 1, role="candidate",
-              msg=answer(2, 1, 1, True), prop={"sentInTerm": 1}),
-        event("BecomeLeader", 1, 2, 1, role="leader"),
+        node_starts(1, peers=[2, 3]),
+        node_event("BecomeCandidate", node=1, term=2, vote=1, role="candidate"),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=2,
+            vote=1,
+            role="candidate",
+            msg=grant_msg(voter=2, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=1, term=2, vote=1, role="leader"),
     ]
     assert check_election_trace(entries).problems == [
         "node 1 became leader of term 2 with votes from [1] — not a majority of 3"
     ]
 
 
-def test_rule_5_a_term_that_goes_down_across_a_restart():
-    entries = clean_election() + [init(2, [1, 3], term=0, vote=None)]
+def test_a_grant_from_a_non_member_does_not_count_toward_a_majority():
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        node_event("BecomeCandidate", node=1, term=1, vote=1, role="candidate"),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=grant_msg(voter=9, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=1, term=1, vote=1, role="leader"),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 1 became leader of term 1 with votes from [1] — not a majority of 3"
+    ]
+
+
+def test_only_a_voters_first_answer_counts_toward_a_majority():
+    # Node 2 refused, then granted in the same term: only the refusal counts.
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        node_event("BecomeCandidate", node=1, term=1, vote=1, role="candidate"),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=refusal_msg(voter=2, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=grant_msg(voter=2, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=1, term=1, vote=1, role="leader"),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 1 became leader of term 1 with votes from [1] — not a majority of 3"
+    ]
+
+
+def test_a_leader_whose_cluster_size_is_unknown_is_flagged():
+    # No InitState for node 1, so nothing says how many votes a majority needs.
+    entries = [
+        node_event("BecomeCandidate", node=1, term=1, vote=1, role="candidate"),
+        node_event(
+            "ReceiveRequestVoteResponse",
+            node=1,
+            term=1,
+            vote=1,
+            role="candidate",
+            msg=grant_msg(voter=2, candidate=1, term=1),
+            prop={"sentInTerm": 1},
+        ),
+        node_event("BecomeLeader", node=1, term=1, vote=1, role="leader"),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 1 became leader of term 1, but its cluster size is unknown (no InitState)"
+    ]
+
+
+# --- Rule 5: terms never go down; a vote never changes within its term ----------------
+
+
+def test_a_term_that_goes_down_across_a_restart_is_flagged():
+    entries = clean_election() + [node_starts(2, peers=[1, 3], term=0, vote=None)]
     problems = check_election_trace(entries).problems
     assert "node 2's term went down from 1 to 0 (InitState)" in problems
 
 
-def test_rule_5_a_vote_that_changes_within_its_term():
-    entries = clean_election() + [event("BecomeFollower", 2, 1, None)]
+def test_a_vote_that_changes_within_its_term_is_flagged():
+    entries = clean_election() + [node_event("BecomeFollower", node=2, term=1, vote=None)]
     assert (
         "node 2's vote in term 1 changed from 1 to None (BecomeFollower)"
         in check_election_trace(entries).problems
     )
 
 
-def test_rule_5_a_first_vote_in_a_term_is_not_a_change():
-    entries = [init(2, [1, 3], term=4), event("SendRequestVoteResponse", 2, 4, 3,
-                                              msg=answer(2, 3, 4, False))]
+def test_a_first_vote_in_a_term_is_not_flagged_as_a_change():
+    entries = [
+        node_starts(2, peers=[1, 3], term=4),
+        node_event(
+            "SendRequestVoteResponse",
+            node=2,
+            term=4,
+            vote=3,
+            msg=refusal_msg(voter=2, candidate=3, term=4),
+        ),
+    ]
     assert check_election_trace(entries).problems == []
 
 
-def test_rule_6_an_answer_whose_vote_was_not_on_disk():
-    entries = clean_election() + [{
-        "source": "disk",
-        "event": {"name": "DiskCheck", "nid": 2, "ok": False,
-                  "disk": {"term": 0, "vote": None}, "memory": {"term": 1, "vote": 1}},
-    }]
+# --- Rule 6: every answered vote is on disk -------------------------------------------
+
+
+def test_an_answer_whose_vote_was_not_on_disk_is_flagged():
+    disk_check = {
+        "name": "DiskCheck",
+        "nid": 2,
+        "ok": False,
+        "disk": {"term": 0, "vote": None},
+        "memory": {"term": 1, "vote": 1},
+    }
+    entries = clean_election() + [{"source": "disk", "event": disk_check}]
     assert check_election_trace(entries).problems == [
         "node 2 answered with term 1, vote 1 in memory, but its file held term 0, vote None"
     ]
 
 
+# --- Re-checking a directory of traces ------------------------------------------------
+
+
 def write_trace(path, entries, negative_control):
+    """Write `entries` to `path` as a `.jsonl` trace, headed as the recorder heads it."""
     header = {"test": {"id": path.stem, "result": "passed", "negativeControl": negative_control}}
     path.write_text("\n".join(json.dumps(line) for line in [header, *entries]) + "\n")
 
 
 def test_rechecking_a_directory_fails_only_on_unexpected_problems(tmp_path, capsys):
-    broken = clean_election() + [event("BecomeFollower", 2, 1, None)]
+    broken = clean_election() + [node_event("BecomeFollower", node=2, term=1, vote=None)]
     write_trace(tmp_path / "clean.jsonl", clean_election(), negative_control=False)
     write_trace(tmp_path / "control.jsonl", broken, negative_control=True)
     assert main(tmp_path) == 0

@@ -1,8 +1,8 @@
 """A node's stable storage: one SQLite file holding its term, vote, and log."""
 
 import contextlib
+from collections.abc import AsyncIterator
 from types import TracebackType
-from typing import AsyncIterator, Optional
 
 import aiosqlite
 
@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS node_state (
 
 CREATE TABLE IF NOT EXISTS log (
     idx INTEGER PRIMARY KEY CHECK (idx > 0),
-    term INTEGER NOT NULL,
+    term INTEGER NOT NULL CHECK (term > 0),
     command TEXT NOT NULL
 ) STRICT;
 
@@ -29,56 +29,39 @@ INSERT OR IGNORE INTO node_state (id, current_term, voted_for) VALUES (1, 0, NUL
 class SqliteStore:
     """One node's SQLite database file (DD-6), accessed through aiosqlite (DD-19).
 
-    Holds the three pieces of state PERSIST-1 through PERSIST-3 require
-    to survive a crash, in two tables (DD-23):
+    Two STRICT tables (DD-23). `node_state` is one row (`CHECK (id = 1)`) of
+    `current_term` and `voted_for`, updated in place: only the latest values
+    are reloaded (PERSIST-4, PERSIST-5), and an old term's vote is void
+    (STATE-6). `log` has one row per entry keyed by its 1-based index, so
+    REPL-8's truncation is one range delete. STRICT stores only integers in
+    INTEGER columns and rejects values it cannot convert losslessly; without
+    it `'n1'` would pass `CHECK (voted_for > 0)`, since SQLite orders text
+    above integers. So every node ID on disk is a positive integer (DD-20).
+    Commands are stored verbatim (DD-21, APPLY-7).
 
-    - `node_state` is a single row, enforced by `CHECK (id = 1)`,
-      holding `current_term` and `voted_for`. It is updated in place and
-      keeps no history: the only reader is start-up reload (PERSIST-4,
-      PERSIST-5), which needs the latest values, and STATE-6 discards a
-      vote the moment its term is left behind, so no earlier value is
-      ever meaningful again.
-    - `log` holds one row per entry, keyed by its 1-based Raft index, so
-      appending is an insert and REPL-8's "delete this entry and
-      everything after it" is a single range delete.
+    Each write is one transaction, committed or rolled back whole (DD-7), and
+    `PRAGMA synchronous = FULL` makes a commit reach the disk, not only the OS
+    cache (DD-24), as stable storage requires (PERSIST-1, PERSIST-2,
+    PERSIST-3).
 
-    Both tables are STRICT, so a column declared INTEGER accepts only
-    integers: without STRICT, SQLite would store a text value such as
-    `'n1'` in `voted_for`, and `'n1' > 0` evaluates true because SQLite
-    orders all text above all integers, so the CHECK constraint alone
-    would not stop it. Together with `CHECK (voted_for > 0)`, this makes
-    DD-20's rule — a node ID is a positive integer — hold for every value
-    that reaches disk. `command` is stored exactly as given, never
-    decoded or re-encoded (DD-21, APPLY-7).
-
-    Every write happens inside one transaction that is either committed
-    whole or rolled back whole (DD-7), and the connection runs with
-    `PRAGMA synchronous = FULL` (DD-24), so a committed transaction has
-    been flushed to the disk rather than left in the operating system's
-    cache — which is what "persist to stable storage" (PERSIST-1 through
-    PERSIST-3) requires.
-
-    Used as an async context manager: entering opens the file, creating
-    the schema if it doesn't exist yet; exiting closes it.
+    Use as an async context manager: entering opens the file and creates the
+    schema if missing; exiting closes it.
     """
 
     def __init__(self, path: str) -> None:
-        """Prepare a store backed by the SQLite file at `path`.
+        """Prepare a store for the SQLite file at `path`; nothing is opened yet.
 
         Args:
-            path: Filesystem path of this node's database file. It is
-                created on first open if it doesn't already exist.
+            path: The node's database file, created on first open if missing.
         """
         self._path = path
-        self._connection: Optional[aiosqlite.Connection] = None
+        self._connection: aiosqlite.Connection | None = None
 
     async def __aenter__(self) -> "SqliteStore":
-        """Open the database file, creating the schema on first use.
+        """Open the file with `synchronous = FULL` and create the schema if missing.
 
-        On a file that has never been used, this also inserts the single
-        `node_state` row with `current_term = 0` and no vote — the state
-        STATE-2 has a brand-new node start from. On an existing file,
-        that insert is ignored and the persisted row is left untouched.
+        A new file gets its `node_state` row at term 0 with no vote, where a
+        brand-new node starts (STATE-2); an existing row is left untouched.
 
         Returns:
             This store, ready for reads and writes.
@@ -91,35 +74,30 @@ class SqliteStore:
 
     async def __aexit__(
         self,
-        exc_type: Optional[type[BaseException]],
-        exc: Optional[BaseException],
-        traceback: Optional[TracebackType],
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
     ) -> None:
         """Close the database file."""
         await self._connection.close()
 
-    async def save_term_and_vote(
-        self, current_term: int, voted_for: Optional[int]
-    ) -> None:
-        """Persist the node's current term and vote, replacing the previous ones.
+    async def save_term_and_vote(self, current_term: int, voted_for: int | None) -> None:
+        """Persist `current_term` and `voted_for`, replacing the previous values.
 
-        Implements PERSIST-1 and PERSIST-2 as one atomic update of the
-        single `node_state` row. Both values change together wherever
-        they change at all — ELECT-3 and ELECT-4 on becoming Candidate,
-        STATE-5 and STATE-6 on observing a higher term — so they are
-        written together. This method returns only once the transaction
-        has committed, so a caller that awaits it before responding to an
-        RPC satisfies "persist before responding".
+        One atomic update of the `node_state` row (PERSIST-1, PERSIST-2), returning
+        only after the commit, so awaiting it before answering an RPC persists
+        before responding. Used for every term or vote change: becoming Candidate
+        (ELECT-3, ELECT-4), catching up to a higher term (STATE-5, STATE-6), and
+        granting a vote.
 
         Args:
             current_term: The term to persist.
-            voted_for: The node ID voted for in `current_term`, or None
-                for no vote.
+            voted_for: The node voted for in `current_term`, or None.
 
         Raises:
-            sqlite3.IntegrityError: If `current_term` is not a
-                non-negative integer, or `voted_for` is neither None nor
-                a positive integer. Nothing is written in that case.
+            sqlite3.IntegrityError: If `current_term` is negative, `voted_for` is
+                not positive, or either cannot be stored losslessly as an integer.
+                Nothing is written.
         """
         async with self._transaction() as connection:
             await connection.execute(
@@ -127,31 +105,31 @@ class SqliteStore:
                 (current_term, voted_for),
             )
 
-    async def save_log_from(self, index: int, entries: list[LogEntry]) -> None:
-        """Replace the persisted log from `index` onward with `entries`.
+    async def replace_log_from(self, index: int, entries: list[LogEntry]) -> None:
+        """Replace the persisted log from `index` onward with `entries` (PERSIST-3, REPL-8).
 
-        Implements PERSIST-3 for REPL-8's overwrite rule: every persisted
-        entry at `index` or later is deleted, then `entries` are written
-        at `index`, `index + 1`, and so on. Entries before `index` are
-        not touched. Passing no entries simply truncates the log from
-        `index` onward.
-
-        The delete and the inserts are one transaction (DD-7): a failure
-        partway through rolls the whole thing back, so the persisted log
-        is never left with the old tail deleted and only part of the new
-        one written.
+        Deletes every entry at `index` or later, then writes `entries` at `index`,
+        `index + 1`, and so on, in one transaction (DD-7), so a failure never
+        leaves the old tail deleted and the new one partly written. With no
+        entries, it only truncates.
 
         Args:
-            index: The 1-based index of the first entry to replace. The
-                entries before it must already be persisted.
-            entries: The entries to persist, in order, starting at
-                `index`.
+            index: The 1-based index of the first entry to replace; at most one past
+                the last persisted entry.
+            entries: The entries to persist, in order, from `index`.
 
         Raises:
-            sqlite3.IntegrityError: If an entry's term cannot be stored
-                as an integer. Nothing is written in that case.
+            ValueError: If `index` would leave a gap after the last persisted entry,
+                which would reload as a renumbered log. Nothing is written.
+            sqlite3.IntegrityError: If an entry's term cannot be stored losslessly
+                as an integer, or `index` is below 1 with entries given. Nothing is
+                written.
         """
         async with self._transaction() as connection:
+            async with connection.execute("SELECT COALESCE(MAX(idx), 0) FROM log") as cursor:
+                (last_index,) = await cursor.fetchone()
+            if index > last_index + 1:
+                raise ValueError(f"index {index} would leave a gap after entry {last_index}")
             await connection.execute("DELETE FROM log WHERE idx >= ?", (index,))
             await connection.executemany(
                 "INSERT INTO log (idx, term, command) VALUES (?, ?, ?)",
@@ -162,23 +140,15 @@ class SqliteStore:
             )
 
     async def load(self) -> PersistedState:
-        """Read back everything the node persisted.
+        """Return the persisted term, vote, and whole log (PERSIST-4, PERSIST-5, PERSIST-6).
 
-        Implements the reads behind PERSIST-4, PERSIST-5, and PERSIST-6:
-        the node's current term, its vote, and its whole log in index
-        order. A file that has never been written to yields
-        `current_term = 0`, no vote, and an empty log.
-
-        Returns:
-            The node's persisted term, vote, and log.
+        A file never written to yields term 0, no vote, and an empty log.
         """
         async with self._connection.execute(
             "SELECT current_term, voted_for FROM node_state WHERE id = 1"
         ) as cursor:
             current_term, voted_for = await cursor.fetchone()
-        async with self._connection.execute(
-            "SELECT term, command FROM log ORDER BY idx"
-        ) as cursor:
+        async with self._connection.execute("SELECT term, command FROM log ORDER BY idx") as cursor:
             rows = await cursor.fetchall()
         return PersistedState(
             current_term=current_term,

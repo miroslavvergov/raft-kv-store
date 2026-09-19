@@ -1,7 +1,6 @@
-"""Tier 1 persistence round-trip tests for SqliteStore (PERSIST-1 through
-PERSIST-6, DD-6, DD-7, DD-20, DD-21, DD-23): each of current_term,
-voted_for, and the log written, then reloaded from a freshly reopened file,
-and asserted on its own.
+"""Tier 1 round-trip tests for SqliteStore: each field written, then reloaded from a reopened file.
+
+PERSIST-1 through PERSIST-6, DD-6, DD-7, DD-20, DD-21, DD-23. Each field is asserted on its own.
 """
 
 import sqlite3
@@ -12,20 +11,18 @@ import pytest
 from raftkv.consensus import Log, LogEntry
 from raftkv.persistence import SqliteStore
 from tests.divergent_logs import make_log
+from tests.persistence.store_doubles import reload, term_and_vote_on_disk
 
 
-@pytest.fixture
-def db_path(tmp_path):
-    return str(tmp_path / "node.db")
+def unchecked_entry(term, command="x"):
+    """Return a LogEntry built around its own validation, so only the store's checks apply."""
+    entry = object.__new__(LogEntry)
+    object.__setattr__(entry, "term", term)
+    object.__setattr__(entry, "command", command)
+    return entry
 
 
-async def reload(path):
-    """Reopen the file from scratch, as a restarted node would, and load it."""
-    async with SqliteStore(path) as store:
-        return await store.load()
-
-
-# --- A brand-new file --------------------------------------------------------
+# --- A brand-new file -----------------------------------------------------------------
 
 
 async def test_fresh_file_loads_term_zero_no_vote_and_empty_log(db_path):
@@ -35,7 +32,7 @@ async def test_fresh_file_loads_term_zero_no_vote_and_empty_log(db_path):
     assert persisted.log == Log()
 
 
-# --- current_term and voted_for, each on its own ----------------------------
+# --- current_term and voted_for, each on its own --------------------------------------
 
 
 async def test_current_term_survives_a_reopen(db_path):
@@ -54,9 +51,7 @@ async def test_a_cleared_vote_survives_a_reopen_as_none(db_path):
     async with SqliteStore(db_path) as store:
         await store.save_term_and_vote(current_term=5, voted_for=3)
         await store.save_term_and_vote(current_term=6, voted_for=None)
-    persisted = await reload(db_path)
-    assert persisted.current_term == 6
-    assert persisted.voted_for is None
+    assert await term_and_vote_on_disk(db_path) == (6, None)
 
 
 async def test_term_and_vote_are_one_row_updated_in_place(db_path):
@@ -71,43 +66,42 @@ async def test_reopening_does_not_reset_persisted_state(db_path):
     async with SqliteStore(db_path) as store:
         await store.save_term_and_vote(current_term=5, voted_for=2)
     await reload(db_path)
-    persisted = await reload(db_path)
-    assert (persisted.current_term, persisted.voted_for) == (5, 2)
+    assert await term_and_vote_on_disk(db_path) == (5, 2)
 
 
-# --- The log, on its own ------------------------------------------------------
+# --- The log, on its own --------------------------------------------------------------
 
 
 async def test_log_survives_a_reopen(db_path):
     log = make_log([1, 1, 2, 3])
     async with SqliteStore(db_path) as store:
-        await store.save_log_from(1, list(log))
+        await store.replace_log_from(1, list(log))
     assert (await reload(db_path)).log == log
 
 
-async def test_save_log_from_replaces_everything_from_that_index(db_path):
+async def test_replace_log_from_replaces_everything_from_that_index(db_path):
     async with SqliteStore(db_path) as store:
-        await store.save_log_from(1, list(make_log([1, 1, 2, 2])))
-        await store.save_log_from(3, [LogEntry(term=3, command="new")])
+        await store.replace_log_from(1, list(make_log([1, 1, 2, 2])))
+        await store.replace_log_from(3, [LogEntry(term=3, command="new")])
     persisted = await reload(db_path)
     assert [e.term for e in persisted.log] == [1, 1, 3]
-    assert persisted.log[2].command == "new"
+    assert persisted.log.entry_at(3).command == "new"
 
 
-async def test_save_log_from_with_no_entries_truncates_the_tail(db_path):
+async def test_replace_log_from_with_no_entries_truncates_the_tail(db_path):
     async with SqliteStore(db_path) as store:
-        await store.save_log_from(1, list(make_log([1, 1, 2, 2])))
-        await store.save_log_from(3, [])
+        await store.replace_log_from(1, list(make_log([1, 1, 2, 2])))
+        await store.replace_log_from(3, [])
     assert [e.term for e in (await reload(db_path)).log] == [1, 1]
 
 
 async def test_command_is_stored_and_reloaded_verbatim(db_path):
-    # DD-21 / APPLY-7: the opaque string is written and read back exactly,
-    # never decoded or re-encoded on the way through.
+    # DD-21, APPLY-7: the opaque string is written and read back exactly, never decoded or
+    # re-encoded on the way through.
     command = '{"op": "put", "key": "x", "value": [1, 2], "request_id": "a1b2"}'
     async with SqliteStore(db_path) as store:
-        await store.save_log_from(1, [LogEntry(term=1, command=command)])
-    assert (await reload(db_path)).log[0].command == command
+        await store.replace_log_from(1, [LogEntry(term=1, command=command)])
+    assert (await reload(db_path)).log.entry_at(1).command == command
     with closing(sqlite3.connect(db_path)) as raw:
         assert raw.execute("SELECT command, typeof(command) FROM log").fetchone() == (
             command,
@@ -115,7 +109,7 @@ async def test_command_is_stored_and_reloaded_verbatim(db_path):
         )
 
 
-# --- DD-20 at the storage boundary --------------------------------------------
+# --- Invalid terms and votes at the storage boundary (DD-20) --------------------------
 
 
 async def test_non_positive_vote_is_rejected_and_nothing_changes(db_path):
@@ -123,13 +117,11 @@ async def test_non_positive_vote_is_rejected_and_nothing_changes(db_path):
         await store.save_term_and_vote(current_term=3, voted_for=2)
         with pytest.raises(sqlite3.IntegrityError):
             await store.save_term_and_vote(current_term=4, voted_for=0)
-    persisted = await reload(db_path)
-    assert (persisted.current_term, persisted.voted_for) == (3, 2)
+    assert await term_and_vote_on_disk(db_path) == (3, 2)
 
 
 async def test_non_integer_vote_is_rejected(db_path):
-    # Without STRICT tables, 'n1' would pass CHECK (voted_for > 0) and be
-    # stored as text.
+    # Without STRICT tables, 'n1' would pass CHECK (voted_for > 0) and be stored as text.
     async with SqliteStore(db_path) as store:
         with pytest.raises(sqlite3.IntegrityError):
             await store.save_term_and_vote(current_term=1, voted_for="n1")
@@ -142,17 +134,33 @@ async def test_negative_term_is_rejected(db_path):
             await store.save_term_and_vote(current_term=-1, voted_for=None)
 
 
-# --- DD-7: a failed write leaves nothing half-done ----------------------------
+# --- A failed write leaves nothing half-done (DD-7) -----------------------------------
 
 
 async def test_failed_log_write_rolls_back_the_delete_too(db_path):
     async with SqliteStore(db_path) as store:
-        await store.save_log_from(1, list(make_log([1, 1, 2, 2])))
-        bad_entry = LogEntry(term="not-an-int", command="x")
+        await store.replace_log_from(1, list(make_log([1, 1, 2, 2])))
+        bad_entry = unchecked_entry(term=0)  # the table's CHECK (term > 0) rejects it
         with pytest.raises(sqlite3.IntegrityError):
-            await store.save_log_from(3, [LogEntry(term=3, command="ok"), bad_entry])
+            await store.replace_log_from(3, [LogEntry(term=3, command="ok"), bad_entry])
     # Neither the delete of entries 3-4 nor the first insert took effect.
     assert [e.term for e in (await reload(db_path)).log] == [1, 1, 2, 2]
+
+
+async def test_a_log_term_below_one_is_rejected_and_nothing_is_written(db_path):
+    async with SqliteStore(db_path) as store:
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.replace_log_from(1, [unchecked_entry(term=0)])
+    assert (await reload(db_path)).log == Log()
+
+
+async def test_a_log_write_that_would_leave_a_gap_is_refused_and_nothing_is_written(db_path):
+    # Entry 4 after a two-entry log would reload as entry 3.
+    async with SqliteStore(db_path) as store:
+        await store.replace_log_from(1, list(make_log([1, 1])))
+        with pytest.raises(ValueError):
+            await store.replace_log_from(4, [LogEntry(term=2, command="x")])
+    assert [e.term for e in (await reload(db_path)).log] == [1, 1]
 
 
 async def test_store_remains_usable_after_a_rejected_write(db_path):

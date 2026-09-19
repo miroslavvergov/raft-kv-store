@@ -1,8 +1,6 @@
-"""Tier 1 unit tests for Cluster (ELECT-11, ELECT-12, NODE-8, DD-20): the
-strict-majority size for every cluster of 1 to 7 members, every subset of
-those clusters checked against it, the overlap between any two majorities
-checked exhaustively, repeated and non-member IDs never counting, peers,
-and membership validation.
+"""Tier 1 tests for Cluster: membership, peers, and strict majorities, for every size 1 to 7.
+
+ELECT-11, ELECT-12, NODE-8, DD-20.
 """
 
 import itertools
@@ -13,12 +11,11 @@ from raftkv.consensus import Cluster
 
 
 def all_subsets(members):
+    """Return every subset of `members`, the empty set and `members` itself included."""
     return [set(c) for r in range(len(members) + 1) for c in itertools.combinations(members, r)]
 
 
-@pytest.mark.parametrize(
-    "size, majority", [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3), (6, 4), (7, 4)]
-)
+@pytest.mark.parametrize("size, majority", [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3), (6, 4), (7, 4)])
 def test_majority_is_the_smallest_count_above_half(size, majority):
     cluster = Cluster(range(1, size + 1))
     assert cluster.majority == majority
@@ -36,8 +33,7 @@ def test_a_set_of_members_is_a_majority_exactly_when_it_reaches_that_count(size)
 
 @pytest.mark.parametrize("size", range(1, 8))
 def test_any_two_majorities_share_at_least_one_node(size):
-    # The overlap every safety argument in Raft relies on: checked for every
-    # pair of majorities, not argued.
+    # The overlap every safety argument in Raft relies on, checked for every pair of majorities.
     members = list(range(1, size + 1))
     cluster = Cluster(members)
     majorities = [s for s in all_subsets(members) if cluster.is_majority(s)]

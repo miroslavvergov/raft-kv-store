@@ -1,12 +1,13 @@
-"""Tier 1 unit tests for the pure Follower/Candidate/Leader state machine
-(STATE-1 through STATE-7) — every valid STATE-3 edge, several invalid ones,
-a forced higher-term observation confirming STATE-4/5/6 fire together, and
-a Candidate recognizing the Leader of its own term (STATE-7).
+"""Tier 1 tests for NodeState's Follower, Candidate, and Leader state machine.
+
+STATE-1 through STATE-7, ELECT-3, ELECT-4, PERSIST-4, PERSIST-5.
 """
 
 import pytest
 
-from raftkv.consensus import IllegalTransition, NodeState, Role
+from raftkv.consensus import IllegalTransitionError, NodeState, Role
+
+# --- A new node and the STATE-3 edges -------------------------------------------------
 
 
 def test_starts_as_follower_with_term_zero_and_no_vote():
@@ -46,7 +47,7 @@ def test_candidate_to_leader_is_legal():
 
 def test_follower_to_leader_is_illegal():
     node = NodeState(node_id=1)
-    with pytest.raises(IllegalTransition):
+    with pytest.raises(IllegalTransitionError):
         node.become_leader()
     assert node.role is Role.FOLLOWER  # rejected transition leaves state untouched
 
@@ -55,7 +56,7 @@ def test_leader_to_candidate_is_illegal():
     node = NodeState(node_id=1)
     node.become_candidate()
     node.become_leader()
-    with pytest.raises(IllegalTransition):
+    with pytest.raises(IllegalTransitionError):
         node.become_candidate()
     assert node.role is Role.LEADER
 
@@ -64,15 +65,19 @@ def test_leader_to_leader_is_illegal():
     node = NodeState(node_id=1)
     node.become_candidate()
     node.become_leader()
-    with pytest.raises(IllegalTransition):
+    with pytest.raises(IllegalTransitionError):
         node.become_leader()
     assert node.role is Role.LEADER
 
 
-def test_handle_observed_term_does_nothing_for_a_lower_or_equal_term():
+# --- Observing a higher term (STATE-4, STATE-5, STATE-6) ------------------------------
+
+
+@pytest.mark.parametrize("observed_term", [0, 1], ids=["lower", "equal"])
+def test_handle_observed_term_does_nothing_for_a_lower_or_equal_term(observed_term):
     node = NodeState(node_id=1)
     node.become_candidate()  # term becomes 1
-    fired = node.handle_observed_term(1)
+    fired = node.handle_observed_term(observed_term)
     assert fired is False
     assert node.role is Role.CANDIDATE
     assert node.current_term == 1
@@ -80,8 +85,8 @@ def test_handle_observed_term_does_nothing_for_a_lower_or_equal_term():
 
 
 def test_candidate_handles_higher_observed_term_and_reverts_to_follower():
-    # STATE-4 (role), STATE-5 (currentTerm), STATE-6 (votedFor) all firing
-    # together off the same trigger, as one forced RPC.
+    # STATE-4 (role), STATE-5 (currentTerm), and STATE-6 (votedFor) fire together, from one
+    # observed term.
     node = NodeState(node_id=1)
     node.become_candidate()  # role=CANDIDATE, term=1, votedFor=1
     fired = node.handle_observed_term(5)
@@ -103,8 +108,7 @@ def test_leader_handles_higher_observed_term_and_reverts_to_follower():
 
 
 def test_follower_handles_higher_observed_term_with_no_role_to_give_up():
-    # STATE-4 is scoped to Candidate/Leader only — a plain Follower has no
-    # role to give up, but STATE-5/STATE-6 still apply unconditionally.
+    # STATE-4 applies only to a Candidate or Leader; STATE-5 and STATE-6 apply to every role.
     node = NodeState(node_id=1)
     fired = node.handle_observed_term(3)
     assert fired is True
@@ -113,7 +117,7 @@ def test_follower_handles_higher_observed_term_with_no_role_to_give_up():
     assert node.voted_for is None
 
 
-# --- STATE-2 with PERSIST-4/5: reloading after a restart -------------------
+# --- Reloading after a restart (STATE-2, PERSIST-4, PERSIST-5) ------------------------
 
 
 def test_reloaded_node_starts_as_follower_with_its_persisted_term_and_vote():
@@ -124,8 +128,8 @@ def test_reloaded_node_starts_as_follower_with_its_persisted_term_and_vote():
 
 
 def test_reloaded_candidate_comes_back_as_follower_not_candidate():
-    # A node that crashed mid-candidacy persisted its own vote (ELECT-5) —
-    # it comes back remembering that vote, but in the Follower role.
+    # A node that crashed mid-candidacy persisted its own vote (ELECT-5): it comes back
+    # remembering that vote, but as a Follower.
     node = NodeState.reloaded(node_id=1, current_term=5, voted_for=1)
     assert node.role is Role.FOLLOWER
     assert node.voted_for == 1
@@ -158,13 +162,13 @@ def test_reloaded_node_becomes_candidate_from_its_reloaded_term():
     assert node.voted_for == 1
 
 
-# --- STATE-7: recognizing the Leader of an AppendEntries' term ---------------
+# --- Recognizing the Leader of an AppendEntries' term (STATE-7) -----------------------
 
 
-def test_candidate_recognizing_a_same_term_leader_reverts_to_follower_keeping_term_and_vote():
-    # Two Candidates ran in term 1 and the other one won. Its AppendEntries
-    # carries term 1 — not higher — so STATE-4 never fires; STATE-7 does. The
-    # self-vote stays: clearing it would free this node to vote again in term 1.
+def test_candidate_steps_down_to_a_same_term_leader_keeping_its_vote():
+    # Two Candidates ran in term 1 and the other won. Its AppendEntries carries term 1, not a
+    # higher one, so STATE-4 never fires; STATE-7 does. The self-vote stays: clearing it would
+    # free this node to vote again in term 1.
     node = NodeState(node_id=1)
     node.become_candidate()
     assert node.recognize_leader(1) is True

@@ -1,0 +1,10 @@
+# Formatting and lint settings agreed in the code review.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "W", "F", "I", "N", "B", "UP", "D401", "RUF022"]
+
+[lint.per-file-ignores]
+# Test names are sentences; pytest fixtures are named as nouns.
+"tests/**" = ["D401"]
