@@ -184,9 +184,13 @@ class DurableNodeState:
         """
         next_state = copy.copy(self._state)
         next_state.become_candidate()
+        # NOTE: in a one-node cluster the self-vote is already a majority and no answer will
+        # come. Winning on the copy puts the win in the same install, even if cancelled.
         if self._cluster.is_majority({next_state.node_id}):
             next_state.become_leader()
         await self._persist_then_install_state(next_state)
+        # NOTE: built from the installed state, so a request exists only for a term on disk
+        # (ELECT-5).
         return RequestVoteRequest(
             term=self._state.current_term,
             candidate_id=self._state.node_id,
@@ -252,6 +256,8 @@ class DurableNodeState:
         """
         next_state = copy.copy(self._state)
         response = next_state.handle_vote_request(request, self._log.last_position)
+        # NOTE: a refusal can still raise the term, which must persist, so the write follows a
+        # changed term or vote, not the grant.
         if (next_state.current_term, next_state.voted_for) != (
             self._state.current_term,
             self._state.voted_for,
@@ -292,6 +298,8 @@ class DurableNodeState:
                 raised after the change is persisted and installed.
         """
         next_state = copy.copy(self._state)
+        # NOTE: checked before the Candidacy, so a late answer with a higher term also updates
+        # a Follower or steps down a Leader (STATE-4, STATE-5).
         if next_state.handle_observed_term(response.term):
             await self._persist_then_install_state(next_state)
             return False
@@ -337,6 +345,8 @@ class DurableNodeState:
         changed_from = self._log.first_differing_index(next_log)
         if changed_from is None:
             return True
+        # NOTE: next_log's suffix is written, not `entries`: they differ when the conflict
+        # starts past the first incoming entry, and the store deletes from `changed_from` on.
         await self._persist_then_install(
             self._store.replace_log_from(changed_from, next_log.entries_from(changed_from)),
             next_log=next_log,
@@ -379,11 +389,15 @@ class DurableNodeState:
         """
         pending = asyncio.ensure_future(write)
         cancelled = False
+        # NOTE: `await pending` would cancel the write along with the caller; `asyncio.wait`
+        # does not, and the loop keeps waiting through each cancellation until it settles.
         while not pending.done():
             try:
                 await asyncio.wait({pending})
             except asyncio.CancelledError:
                 cancelled = True
+        # NOTE: a write task cancelled from outside may still have committed, so the store
+        # decides what to install.
         if pending.cancelled():
             cancelled = True
             committed = await self._store_holds(next_state, next_log)
@@ -391,11 +405,14 @@ class DurableNodeState:
         else:
             failure = pending.exception()
         if failure is None:
+            # NOTE: the log is installed first: realigning builds a Leadership from the log's
+            # last index (REPL-14), which must be the log this write persisted.
+            if next_log is not None:
+                self._log = next_log
             if next_state is not None:
                 self._state = next_state
                 self._align_role_records()
-            if next_log is not None:
-                self._log = next_log
+        # NOTE: cancellation outranks a write failure, which is chained as the cause.
         if cancelled:
             raise asyncio.CancelledError() from failure
         if failure is not None:
@@ -429,6 +446,8 @@ class DurableNodeState:
         earlier term's votes and Follower progress.
         """
         role, term = self._state.role, self._state.current_term
+        # NOTE: a new election leaves the role Candidate, so only the term check discards the
+        # previous term's votes.
         if role is not Role.CANDIDATE:
             self._candidacy = None
         elif self._candidacy is None or self._candidacy.term != term:

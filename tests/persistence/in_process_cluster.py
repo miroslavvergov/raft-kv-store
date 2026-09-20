@@ -150,6 +150,8 @@ class InProcessCluster:
         )
         request = await self.nodes[candidate].start_election()
         self.votes_by_voter_and_term[(candidate, request.term)].add(candidate)
+        # NOTE: in a one-node cluster the self-vote already wins the term inside start_election,
+        # with no answer left to deliver, so the Leader is noted here.
         self._note_leaders()
         self._trace_cluster_state()
         return request
@@ -170,6 +172,8 @@ class InProcessCluster:
         response = await self.nodes[voter].handle_vote_request(request)
         if response.vote_granted:
             self.votes_by_voter_and_term[(voter, request.term)].add(request.candidate_id)
+        # NOTE: with checking off the file is still read whenever tracing is on, so a mismatch
+        # reaches the trace.
         if self._check_votes_on_disk or _harness.isEnabledFor(logging.INFO):
             await self._check_vote_on_disk(voter)
         self._note_leaders()
@@ -185,6 +189,8 @@ class InProcessCluster:
             message.describe(),
             event={"name": "Deliver", "msg": message.trace_fields()},
         )
+        # NOTE: the election an answer belongs to comes from the request's term, never the
+        # answer's, since a refusal can carry a later term than the one it was sent in.
         became_leader = await self.nodes[request.candidate_id].handle_vote_response(
             voter, request.term, response
         )
@@ -219,6 +225,8 @@ class InProcessCluster:
             self.in_flight.remove(message)
         if message.response is None:
             response = await self.ask_for_vote(message.voter, message.request)
+            # NOTE: every delivery is answered afresh, so a duplicated request leaves a second
+            # answer in flight, to arrive whenever the test delivers it (FAIL-2).
             self.in_flight.append(InFlight(message.request, message.voter, response))
             return response
         await self.deliver_vote_response(message.voter, message.request, message.response)
@@ -243,7 +251,10 @@ class InProcessCluster:
             The election's RequestVote.
         """
         request = await self.fire_election_timeout(candidate)
+        # NOTE: the loop runs on after a win or a step-down, as every request left at once and
+        # the remaining answers still arrive at a node that no longer needs them.
         for voter in sorted(self.nodes[candidate].peers):
+            # NOTE: a skipped voter's request is simply lost: never answered, never retried.
             if voter not in self.nodes or (reachable is not None and voter not in reachable):
                 continue
             response = await self.ask_for_vote(voter, request)
@@ -271,6 +282,8 @@ class InProcessCluster:
 
     async def _check_vote_on_disk(self, voter):
         node = self.nodes[voter]
+        # NOTE: a second connection reads the committed file, not the node's own connection,
+        # so the check proves durability.
         persisted = await reload(self.paths[voter])
         on_disk = (persisted.current_term, persisted.voted_for)
         in_memory = (node.current_term, node.voted_for)

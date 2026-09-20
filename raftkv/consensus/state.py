@@ -150,6 +150,8 @@ class NodeState:
             and self.voted_for in (None, request.candidate_id)
             and request.last_log_position.is_at_least_as_up_to_date_as(own_last_log_position)
         )
+        # NOTE: a refusal records no vote, so this term's vote stays free for a Candidate with
+        # a complete log (ELECT-9).
         if granted:
             self.voted_for = request.candidate_id
         return RequestVoteResponse(term=self.current_term, vote_granted=granted)
@@ -179,6 +181,8 @@ class NodeState:
             must reject the RPC.
         """
         self.handle_observed_term(term)
+        # NOTE: the role check decides only at an equal term, a lower one being refused
+        # already: no rival Leader can hold this Leader's term.
         if term < self.current_term or self.role is Role.LEADER:
             return False
         self.role = Role.FOLLOWER

@@ -27,6 +27,8 @@ def without_the_lock(monkeypatch):
         original_init(self, *args, **kwargs)
         self._lock = NoLock()
 
+    # NOTE: patching the class, not one instance, strips the lock from every node a helper or
+    # a restart builds later, since `load` builds them out of the test's reach.
     monkeypatch.setattr(DurableNodeState, "__init__", init_without_lock)
 
 
@@ -51,6 +53,8 @@ async def start_cluster(tmp_path, request):
                 await cluster.start(node_id)
         return cluster
 
+    # NOTE: the trace is collected and re-checked here too, so every cluster test is checked
+    # without --trace-elections.
     with collecting_trace_records() as records:
         yield start
         for cluster in clusters:

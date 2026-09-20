@@ -66,6 +66,8 @@ def pytest_unconfigure(config):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
+    # NOTE: recording starts before pytest's own setup hook, so the nodes a fixture starts
+    # while setting up are already in the test's trace.
     if _RECORDER in item.config.stash:
         item.config.stash[_RECORDER].begin()
 
@@ -88,6 +90,8 @@ def pytest_runtest_teardown(item, nextitem):
     """
     if _RECORDER not in item.config.stash:
         return (yield)
+    # NOTE: the finally writes the trace even when the test's own teardown raises, which then
+    # propagates past the check below.
     try:
         result = yield
     finally:

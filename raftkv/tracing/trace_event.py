@@ -66,6 +66,7 @@ class TraceMessage:
             "index": self.index,
             "reject": self.reject,
         }
+        # NOTE: `is not None`, not truthiness, so `reject: false` and a 0 index or log term stay.
         return {key: value for key, value in fields.items() if value is not None}
 
 

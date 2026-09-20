@@ -63,12 +63,16 @@ def traced(report: Callable[..., None]) -> Callable[[Callable[..., Any]], Callab
             tracer = NodeTracer(node.node_id)
             if not tracer.enabled:
                 return await method(node, *args, **kwargs)
+            # NOTE: `report` sees `bound.args[1:]` with defaults filled in, so a call reads the
+            # same however it was spelled.
             bound = signature.bind(node, *args, **kwargs)
             bound.apply_defaults()
             positional = bound.args[1:]
             before = NodeSnapshot.of(node)
             try:
                 result = await method(node, *positional, **bound.kwargs)
+            # NOTE: BaseException, so a cancelled call is reported too, with any change it
+            # installed before the cancellation was raised.
             except BaseException as error:
                 _report_safely(
                     report,

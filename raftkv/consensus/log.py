@@ -32,6 +32,7 @@ class LogEntry:
     command: str
 
     def __post_init__(self) -> None:
+        # NOTE: bool is an int subclass, so True would pass as term 1 without this check.
         if isinstance(self.term, bool) or not isinstance(self.term, int):
             raise TypeError(f"LogEntry.term must be an int, got {type(self.term).__name__}")
         if self.term < 1:
@@ -89,6 +90,8 @@ class Log:
         Raises:
             IndexError: If `index` is outside that range.
         """
+        # NOTE: index 0 would read list position -1, the last entry, so the range check
+        # must reject it before the lookup.
         if not 1 <= index <= len(self._entries):
             raise IndexError(f"index {index} is outside the log's 1..{len(self._entries)}")
         return self._entries[index - 1]
@@ -138,6 +141,7 @@ class Log:
         """
         if prev_log_index == 0:
             return True
+        # NOTE: a log shorter than prev_log_index rejects the RPC; term_at would raise (REPL-5).
         if prev_log_index > len(self._entries):
             return False
         return self.term_at(prev_log_index) == prev_log_term
@@ -166,6 +170,8 @@ class Log:
         for offset, entry in enumerate(entries):
             position = prev_log_index + offset
             if position < len(new_entries):
+                # NOTE: a matching entry stays, so a delayed or duplicated RPC cannot delete
+                # entries a later one appended.
                 if new_entries[position].term != entry.term:
                     new_entries = new_entries[:position] + [entry]
             else:
@@ -185,6 +191,8 @@ class Log:
         Returns:
             The first differing index, or None if the logs are identical.
         """
+        # NOTE: comparing against a shorter or longer log is normal, so the pairs stop at the
+        # shorter one and the length check below reports where it ends.
         for position, (mine, theirs) in enumerate(zip(self._entries, other._entries, strict=False)):
             if mine != theirs:
                 return position + 1

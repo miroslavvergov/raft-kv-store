@@ -55,6 +55,8 @@ class NodeSnapshot:
             last_log_position=node.log.last_position,
             peers=node.peers,
             live_candidacy=candidacy,
+            # NOTE: the tallies are copied while live_candidacy is not, so before and after
+            # stay comparable.
             votes_granted=candidacy.votes_granted if candidacy else frozenset(),
             votes_refused=candidacy.votes_refused if candidacy else frozenset(),
             next_index={f: leadership.next_index(f) for f in followers},

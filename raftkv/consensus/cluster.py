@@ -32,6 +32,7 @@ class Cluster:
         if not member_list:
             raise ValueError("a cluster needs at least one member")
         for member in member_list:
+            # NOTE: bool is an int subclass, so True would pass as node 1 without this check.
             if isinstance(member, bool) or not isinstance(member, int) or member <= 0:
                 raise ValueError(f"node IDs are positive integers, got {member!r}")
         if len(set(member_list)) != len(member_list):

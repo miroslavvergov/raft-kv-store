@@ -90,17 +90,23 @@ def check_election_trace(entries):
         msg = event.get("msg")
 
         # Rule 5: term never goes down; a vote never changes within its term.
+        # NOTE: nothing resets a node's last term and vote when it restarts, so what it reloads
+        # is compared with what it held before the crash (PERSIST-1, PERSIST-2).
         if node in last_term_and_vote:
             last_term, last_vote = last_term_and_vote[node]
             if term < last_term:
                 verdict.problems.append(
                     f"node {node}'s term went down from {last_term} to {term} ({name})"
                 )
+            # NOTE: a term's first vote, cast from no vote, is not a change; only losing or
+            # switching a vote while the term lasts breaks the rule.
             elif term == last_term and last_vote is not None and vote != last_vote:
                 verdict.problems.append(
                     f"node {node}'s vote in term {term} changed from {last_vote} to {vote} ({name})"
                 )
         last_term_and_vote[node] = (term, vote)
+        # NOTE: a vote reaches the state without ever reaching an answer — a self-vote, or a
+        # vote persisted by a cancelled caller — and still uses up the term's one vote (ELECT-8).
         if vote is not None:
             votes[(node, term)].add(vote)  # rule 2: every vote the node's state shows
 
@@ -112,6 +118,8 @@ def check_election_trace(entries):
             candidate = msg["to"]
             votes[(node, msg["term"])].add(candidate)  # rule 2
             candidate_log = requests_seen.get((node, candidate, msg["term"]))
+            # NOTE: a grant carries the term of the request it answers, so a grant with no
+            # request of that term is a vote cast on nothing, not a gap in the trace.
             if candidate_log is None:
                 other_terms = sorted(
                     t for (n, c, t) in requests_seen if (n, c) == (node, candidate)
@@ -134,9 +142,13 @@ def check_election_trace(entries):
             sent_in_term = event.get("prop", {}).get("sentInTerm")
             members = {node, *peers.get(node, [])}
             if sent_in_term == msg["term"] and msg["from"] in members:
+                # NOTE: `setdefault` keeps the voter's first answer, so a duplicated reply
+                # cannot turn a refusal into a grant (FAIL-2).
                 first_answers[(node, sent_in_term)].setdefault(msg["from"], not msg["reject"])
         elif name == "BecomeLeader":  # rule 4
             leaders[term].add(node)
+            # NOTE: with no InitState the cluster size is unknown, so the majority check cannot
+            # run and the win is flagged; rule 1 counts it above either way.
             if node not in peers:
                 verdict.problems.append(
                     f"node {node} became leader of term {term}, but its cluster size is "
@@ -144,6 +156,8 @@ def check_election_trace(entries):
                 )
                 continue
             answers = first_answers[(node, term)]
+            # NOTE: a Candidate sends itself no request, so its own vote never arrives as an
+            # answer and is added here (ELECT-11).
             granted = {voter for voter, grant in answers.items() if grant} | {node}
             cluster_size = len(peers[node]) + 1
             if 2 * len(granted) <= cluster_size:

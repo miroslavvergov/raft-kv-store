@@ -67,7 +67,11 @@ class SqliteStore:
             This store, ready for reads and writes.
         """
         self._connection = await aiosqlite.connect(self._path)
+        # NOTE: synchronous is a per-connection setting, not stored in the file, so every open
+        # sets FULL rather than relying on the build's default (DD-24).
         await self._connection.execute("PRAGMA synchronous = FULL")
+        # NOTE: the schema's INSERT OR IGNORE seeds term 0 only into a new file, so reopening
+        # never resets a persisted term or vote (PERSIST-4, PERSIST-5).
         await self._connection.executescript(_SCHEMA)
         await self._connection.commit()
         return self
@@ -128,8 +132,12 @@ class SqliteStore:
         async with self._transaction() as connection:
             async with connection.execute("SELECT COALESCE(MAX(idx), 0) FROM log") as cursor:
                 (last_index,) = await cursor.fetchone()
+            # NOTE: `load` rebuilds the log by row order, dropping idx, so a gap would renumber
+            # every later entry on reload.
             if index > last_index + 1:
                 raise ValueError(f"index {index} would leave a gap after entry {last_index}")
+            # NOTE: deleting from `index` to the end, rather than upserting, also removes old
+            # entries past the new last one, as a conflict truncation requires (REPL-8).
             await connection.execute("DELETE FROM log WHERE idx >= ?", (index,))
             await connection.executemany(
                 "INSERT INTO log (idx, term, command) VALUES (?, ?, ?)",
@@ -162,6 +170,8 @@ class SqliteStore:
         try:
             yield self._connection
             await self._connection.commit()
+        # NOTE: BaseException, so a cancelled write rolls back too; an open transaction would
+        # otherwise be committed by the next write.
         except BaseException:
             await self._connection.rollback()
             raise

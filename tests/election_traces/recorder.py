@@ -76,6 +76,8 @@ class ElectionTraceRecorder(logging.Handler):
         for name in (LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, HARNESS):
             logger = logging.getLogger(name)
             logger.removeHandler(self)
+            # NOTE: this runs after the last test, when caplog has already restored every level
+            # it set, so clearing to NOTSET leaves these loggers as `install` found them.
             logger.setLevel(logging.NOTSET)
 
     def emit(self, record):
@@ -104,6 +106,8 @@ class ElectionTraceRecorder(logging.Handler):
             return None
         lines, entries = render(records)
         verdict = check_election_trace(entries)
+        # NOTE: sanitizing can map two test IDs to one file name, so a suffix keeps a later
+        # trace from erasing an earlier one.
         name = self._unused_name(_file_name(test_id))
         log_path = self.directory / f"{name}.log"
 
@@ -150,6 +154,8 @@ def collecting_trace_records():
     """
     handler = _RecordList()
     loggers = [logging.getLogger(name) for name in (TRACE_EVENTS_LOGGER, HARNESS)]
+    # NOTE: caplog or a running recorder may already hold these loggers at a level, which the
+    # restore below keeps.
     levels = [logger.level for logger in loggers]
     for logger in loggers:
         logger.setLevel(logging.DEBUG)
@@ -183,6 +189,7 @@ def render(records):
             entries.append(
                 {
                     "seq": len(entries) + 1,
+                    # NOTE: a trace event adds no .log line, so logLine names the line it follows.
                     "logLine": len(lines),
                     "source": "node",
                     "event": record.trace_event.as_dict(),

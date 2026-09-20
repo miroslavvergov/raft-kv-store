@@ -78,10 +78,11 @@ class NodeTracer:
         """
         if after.current_term == before.current_term:
             return
+        # NOTE: this line names the term the election starts from, so it reads `before`.
         self.emit_line("is starting a new election at term %d", before.current_term)
         self.emit_line("became candidate at term %d", after.current_term)
-        # In a one-node cluster the candidacy is won within the same call;
-        # the Candidate state is the one that was persisted, before the win.
+        # NOTE: a one-node cluster wins within this call, so `after` is already Leader; the
+        # event carries the Candidate role the node passed through.
         self.emit_event("BecomeCandidate", after.with_role(Role.CANDIDATE))
         if after.role is Role.LEADER:
             self._emit_became_leader(after)
@@ -129,6 +130,7 @@ class NodeTracer:
         was returned (failed write or cancelled caller), none is reported as sent,
         but a vote the cancelled call installed is reported.
         """
+        # NOTE: a Receive event carries the state the message arrived to, so it reads `before`.
         self.emit_event(
             "ReceiveRequestVoteRequest",
             before,
@@ -144,6 +146,8 @@ class NodeTracer:
         if after.current_term > before.current_term:
             self._emit_became_follower(after)
         if result is None:
+            # NOTE: the whole (term, vote) pair is compared, since a vote for the same node in
+            # a higher term is a new vote.
             installed = (after.current_term, after.voted_for)
             if after.voted_for is not None and installed != (before.current_term, before.voted_for):
                 self.emit_line(
@@ -161,6 +165,8 @@ class NodeTracer:
                 request.term,
             )
         else:
+            # NOTE: `after.voted_for` may be the vote just cast; the line shows the vote held
+            # in the request's term before it arrived.
             vote_in_request_term = before.voted_for if before.current_term == request.term else None
             self.emit_line(
                 "[logterm: %d, index: %d, vote: %d] %s RequestVote %s %d "
@@ -214,12 +220,16 @@ class NodeTracer:
             if after.current_term > before.current_term:
                 self._emit_became_follower(after)
             return
+        # NOTE: a win discards the Candidacy, so the live object from `before` holds the
+        # final tally.
         tally = before.live_candidacy
         counted = tally is not None and (tally.votes_granted, tally.votes_refused) != (
             before.votes_granted,
             before.votes_refused,
         )
         if not counted:
+            # NOTE: a call that raised, as on a non-member voter, did not ignore the answer, so
+            # only a completed call reports it as ignored.
             if error is None:
                 self.emit_line(
                     "[term: %d, role: %s] ignored a RequestVoteResponse message from %d "

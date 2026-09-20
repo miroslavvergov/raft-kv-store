@@ -74,6 +74,8 @@ class Candidacy:
             return False
         if voter not in self._cluster.members:
             raise KeyError(voter)
+        # NOTE: the first answer stands, so a retried or duplicated reply cannot overwrite it
+        # (FAIL-2); the Candidate's own slot already holds its self-vote.
         if voter in self._answers:
             return False
         self._answers[voter] = granted

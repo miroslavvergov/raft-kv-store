@@ -32,6 +32,8 @@ async def seed_log(path, terms):
 
 async def let_other_tasks_run():
     """Give every ready task ten event-loop turns; no real time passes."""
+    # NOTE: a task held on a write or a lock stays held through all ten turns, so a test can
+    # assert it has not finished.
     for _ in range(10):
         await asyncio.sleep(0)
 
@@ -63,6 +65,8 @@ class RecordingStore(SqliteStore):
         self.writes = []
 
     async def save_term_and_vote(self, current_term, voted_for):
+        # NOTE: the write is recorded before it runs, so one that fails or never returns still
+        # shows, and GatedStore can hold it here before it commits.
         await self._record(("term_and_vote", current_term, voted_for))
         await super().save_term_and_vote(current_term, voted_for)
 
@@ -105,6 +109,8 @@ class GatedStore(RecordingStore):
     async def _record(self, write):
         await super()._record(write)
         self.write_task = asyncio.current_task()
+        # NOTE: neither event is ever cleared: `entered` stays set after the first write, and
+        # once `release` is set every later write goes straight through.
         self.entered.set()
         await self.release.wait()
 
