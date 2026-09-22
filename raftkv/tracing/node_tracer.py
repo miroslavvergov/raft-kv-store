@@ -3,7 +3,13 @@
 import logging
 from typing import Any
 
-from raftkv.consensus import RequestVoteRequest, RequestVoteResponse, Role
+from raftkv.consensus import (
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    RequestVoteRequest,
+    RequestVoteResponse,
+    Role,
+)
 from raftkv.tracing.node_snapshot import NodeSnapshot
 from raftkv.tracing.trace_event import TraceEvent, TraceMessage
 
@@ -253,6 +259,73 @@ class NodeTracer:
         )
         if after.role is Role.LEADER and before.role is not Role.LEADER:
             self._emit_became_leader(after)
+
+    def report_append_entries(
+        self,
+        before: NodeSnapshot,
+        after: NodeSnapshot,
+        request: AppendEntriesRequest,
+        *,
+        result: AppendEntriesResponse | None,
+        error: BaseException | None,
+    ) -> None:
+        """Report `handle_append_entries`: the RPC, any step-down, the rejection, the answer.
+
+        A step-down is reported whether a higher term caused it (STATE-4, STATE-5)
+        or a Leader of the node's own term did (STATE-7). As in etcd, an accepted
+        RPC gets no line of its own; only the event records it. If no answer was
+        returned (failed write or cancelled caller), none is reported as sent.
+        """
+        # NOTE: a Receive event carries the state the message arrived to, so it reads `before`.
+        self.emit_event(
+            "ReceiveAppendEntriesRequest",
+            before,
+            TraceMessage.from_append_entries_request(request, self.node_id),
+        )
+        if request.term > before.current_term:
+            self.emit_line(
+                "[term: %d] received a MsgApp message with higher term from %d [term: %d]",
+                before.current_term,
+                request.leader_id,
+                request.term,
+            )
+        # NOTE: a term rise reports a step-down even from Follower; the role check adds the case
+        # with no term rise, a Candidate stepping down for a Leader of its own term (STATE-7).
+        stepped_down = after.role is Role.FOLLOWER and before.role is not Role.FOLLOWER
+        if after.current_term > before.current_term or stepped_down:
+            self._emit_became_follower(after)
+        if result is None:
+            return
+        if not result.success:
+            if request.term < after.current_term:
+                self.emit_line(
+                    "[term: %d] rejected a MsgApp message with lower term from %d [term: %d]",
+                    after.current_term,
+                    request.leader_id,
+                    request.term,
+                )
+            # NOTE: `after`, not `before`: a Leader that steps down for a higher term and then
+            # fails the log check was a Leader before the call, but its rejection is the log's.
+            elif after.role is Role.LEADER:
+                self.emit_line(
+                    "[term: %d, role: leader] rejected a MsgApp message from %d at the same term",
+                    after.current_term,
+                    request.leader_id,
+                )
+            else:
+                self.emit_line(
+                    "[logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %d",
+                    after.last_log_position.term,
+                    after.last_log_position.index,
+                    request.prev_log_term,
+                    request.prev_log_index,
+                    request.leader_id,
+                )
+        self.emit_event(
+            "SendAppendEntriesResponse",
+            after,
+            TraceMessage.from_append_entries_response(result, self.node_id, request.leader_id),
+        )
 
     # --- Output -----------------------------------------------------------------------
 

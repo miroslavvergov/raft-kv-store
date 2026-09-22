@@ -13,7 +13,7 @@ class Leadership:
     rewritten the logs in between. Each Follower starts at `next_index` one past
     the Leader's last log index (REPL-14) and `match_index` 0 (REPL-15).
 
-    A reply counts only if its RPC was sent in this leadership's term (REPL-16):
+    A reply counts only if its RPC was sent in this leadership's term (REPL-16, DD-25):
     an older reply describes logs that may since have been overwritten and could
     fake a commit majority. The send term is compared, not the reply's term,
     because a delayed request can come back rejected with the current term on
@@ -102,7 +102,7 @@ class Leadership:
         """Record a Follower's AppendEntries rejection, if the RPC was sent in this term.
 
         A reply to an RPC from any other term is ignored before the Follower is
-        looked up (REPL-16). Otherwise only that Follower changes: its `next_index`
+        looked up (DD-25). Otherwise only that Follower changes: its `next_index`
         drops by one (REPL-6), never to `match_index` or below. Resending from the
         lower `next_index` (REPL-7) is the caller's job.
 

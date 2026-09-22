@@ -4,6 +4,7 @@ Import from `raftkv.consensus`, never from its submodules, so their layout
 can change without breaking other layers.
 """
 
+from raftkv.consensus.append_entries import AppendEntriesRequest, AppendEntriesResponse
 from raftkv.consensus.candidacy import Candidacy
 from raftkv.consensus.cluster import Cluster
 from raftkv.consensus.errors import IllegalTransitionError
@@ -16,6 +17,8 @@ from raftkv.consensus.role import Role
 from raftkv.consensus.state import NodeState
 
 __all__ = [
+    "AppendEntriesRequest",
+    "AppendEntriesResponse",
     "Candidacy",
     "Cluster",
     "FollowerProgress",

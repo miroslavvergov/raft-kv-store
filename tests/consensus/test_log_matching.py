@@ -56,6 +56,21 @@ def test_after_append_entries_leaves_matching_entries_untouched():
     assert result.entry_at(3) is same_entry  # the very object: not replaced
 
 
+def test_a_late_rpc_repeating_held_entries_does_not_delete_the_entries_after_them():
+    # A Leader sent "after 1, here is 2", then "after 2, here is 3". The second arrived first,
+    # so the Follower holds 1-3; the first arrives late. Entry 2 matches, so nothing changes:
+    # entry 3 stays, though no incoming entry covers it and it may already be committed.
+    log = make_log([1, 1, 1])
+    late = log.after_append_entries(prev_log_index=1, entries=[log.entry_at(2)])
+    assert late == log
+
+
+def test_a_late_rpc_repeating_several_held_entries_keeps_every_entry_after_them():
+    log = make_log([1, 1, 2, 2, 2])
+    late = log.after_append_entries(prev_log_index=1, entries=log.entries_from(2)[:2])
+    assert late == log
+
+
 # --- Six diverged followers, repaired against one Leader ------------------------------
 
 

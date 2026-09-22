@@ -43,9 +43,9 @@ class FollowerProgress:
 
         The accepted RPC proves the logs match through
         `prev_log_index + entry_count` (REPL-16): `match_index` rises to that index
-        and `next_index` to at least `match_index + 1`. Neither ever decreases
-        (REPL-17), so a late, duplicated, or reordered reply (FAIL-2) cannot move
-        them back.
+        and `next_index` to at least `match_index + 1`. A success never lowers
+        either, so a late, duplicated, or reordered reply (FAIL-2) cannot move them
+        back; `match_index` never decreases at all (REPL-17).
 
         Args:
             prev_log_index: The accepted RPC's `prev_log_index`.

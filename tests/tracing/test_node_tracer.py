@@ -5,7 +5,7 @@ Nothing is built or emitted unless the loggers are enabled.
 
 import logging
 
-from raftkv.consensus import LogPosition, Role
+from raftkv.consensus import AppendEntriesResponse, LogEntry, LogPosition, Role
 from raftkv.tracing import (
     LOG_LINES_LOGGER,
     TRACE_EVENTS_LOGGER,
@@ -14,7 +14,14 @@ from raftkv.tracing import (
     TraceEvent,
     TraceMessage,
 )
+from tests.append_entries_messages import append_entries, heartbeat
 from tests.vote_messages import refused, vote_request
+
+
+def entries(*terms):
+    """Return one entry per term, commanded by position, as a Leader would send them."""
+    return [LogEntry(term=term, command=f"cmd{i + 1}") for i, term in enumerate(terms)]
+
 
 LEADER = NodeSnapshot(
     node_id=7,
@@ -42,6 +49,40 @@ def test_a_response_message_carries_reject_and_no_log_fields():
     response = refused(term=4)
     assert TraceMessage.from_vote_response(response, sender=2, receiver=1).as_dict() == {
         "type": "RequestVoteResponse",
+        "term": 4,
+        "from": 2,
+        "to": 1,
+        "reject": True,
+    }
+
+
+def test_an_append_entries_message_carries_its_previous_entry_count_and_commit():
+    request = append_entries(
+        term=4, leader=1, prev_log_index=7, prev_log_term=3, entries=entries(4, 4), leader_commit=5
+    )
+    assert TraceMessage.from_append_entries_request(request, receiver=2).as_dict() == {
+        "type": "AppendEntries",
+        "term": 4,
+        "from": 1,
+        "to": 2,
+        "logTerm": 3,
+        "index": 7,
+        "entries": 2,
+        "commit": 5,
+    }
+
+
+def test_a_heartbeats_message_still_shows_its_zero_entries_and_zero_commit():
+    # `entries: 0` and `commit: 0` are facts, not missing fields, so neither is dropped.
+    message = TraceMessage.from_append_entries_request(heartbeat(term=4, leader=1), receiver=2)
+    assert message.as_dict()["entries"] == 0
+    assert message.as_dict()["commit"] == 0
+
+
+def test_an_append_entries_response_carries_reject_and_no_log_fields():
+    response = AppendEntriesResponse(term=4, success=False)
+    assert TraceMessage.from_append_entries_response(response, sender=2, receiver=1).as_dict() == {
+        "type": "AppendEntriesResponse",
         "term": 4,
         "from": 2,
         "to": 1,

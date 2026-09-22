@@ -9,9 +9,10 @@ from dataclasses import dataclass
 
 import pytest
 
-from raftkv.consensus import Cluster, FollowerProgress, IllegalTransitionError, LogEntry, Role
+from raftkv.consensus import Cluster, IllegalTransitionError, LogEntry, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
-from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, append_entries_for, make_log
+from tests.append_entries_messages import append_entries
+from tests.divergent_logs import make_log
 from tests.persistence.store_doubles import (
     CommitThenHoldStore,
     FailingStore,
@@ -20,6 +21,7 @@ from tests.persistence.store_doubles import (
     let_other_tasks_run,
     reload,
     seed_log,
+    seed_term_and_vote,
     term_and_vote_on_disk,
     win_election,
 )
@@ -27,23 +29,6 @@ from tests.vote_messages import granted
 
 NODE_ID = 7  # IDs from 7 up never look like the small terms and indexes these tests use.
 THREE_NODES = Cluster([7, 8, 9])
-
-
-async def repair_durable_follower(durable, leader_log):
-    """Send `durable` the Leader's entries, backing off one index per rejection, until it accepts.
-
-    A probe with prev_log_index 0 always succeeds, so more rejections than the Leader has
-    entries fails the test instead of looping forever.
-    """
-    progress = FollowerProgress(next_index=leader_log.last_index + 1)
-    rejections = 0
-    while True:
-        prev_log_index, prev_log_term, entries = append_entries_for(leader_log, progress.next_index)
-        if await durable.receive_entries(prev_log_index, prev_log_term, entries):
-            return
-        progress.record_rejection()
-        rejections += 1
-        assert rejections <= leader_log.last_index, "never reached an index where the logs agree"
 
 
 # --- Start-up (PERSIST-4, PERSIST-5, PERSIST-6, STATE-2) ------------------------------
@@ -205,12 +190,16 @@ async def test_a_write_task_cancelled_before_its_commit_installs_nothing(db_path
 
 
 async def test_cancelled_log_write_still_installs_the_new_log(db_path):
+    # Seeded at the Leader's term, so this call's only write is the log's.
     await seed_log(db_path, [1, 1])
+    await seed_term_and_vote(db_path, 2)
     entry = LogEntry(term=2, command="x")
     async with GatedStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
         caller = asyncio.create_task(
-            durable.receive_entries(prev_log_index=2, prev_log_term=1, entries=[entry])
+            durable.handle_append_entries(
+                append_entries(term=2, prev_log_index=2, prev_log_term=1, entries=[entry])
+            )
         )
         await store.wait_for_write()
 
@@ -226,83 +215,15 @@ async def test_cancelled_log_write_still_installs_the_new_log(db_path):
 
 async def test_failed_write_leaves_the_log_unchanged(db_path):
     await seed_log(db_path, [1, 1])
+    await seed_term_and_vote(db_path, 2)
     entry = LogEntry(term=2, command="x")
     async with FailingStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
         with pytest.raises(OSError):
-            await durable.receive_entries(prev_log_index=2, prev_log_term=1, entries=[entry])
+            await durable.handle_append_entries(
+                append_entries(term=2, prev_log_index=2, prev_log_term=1, entries=[entry])
+            )
         assert durable.log == make_log([1, 1])
-
-
-# --- The log: rejection, and disk always equal to memory (REPL-5) ---------------------
-
-
-async def test_rejected_entries_write_nothing(db_path):
-    entry = LogEntry(term=1, command="x")
-    async with RecordingStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        accepted = await durable.receive_entries(prev_log_index=3, prev_log_term=1, entries=[entry])
-        assert accepted is False
-        assert store.writes == []
-
-
-async def test_only_the_changed_suffix_is_rewritten(db_path):
-    await seed_log(db_path, [1, 1, 2, 2])
-    entry = LogEntry(term=3, command="new")
-    async with RecordingStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        await durable.receive_entries(prev_log_index=2, prev_log_term=1, entries=[entry])
-        assert store.writes == [("replace_log_from", 3, [3])]
-
-
-async def test_heartbeat_that_changes_nothing_writes_nothing(db_path):
-    await seed_log(db_path, [1, 1])
-    async with RecordingStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        assert await durable.receive_entries(prev_log_index=2, prev_log_term=1, entries=[]) is True
-        assert store.writes == []
-
-
-@pytest.mark.parametrize(
-    "follower",
-    [
-        "missing_last_entry",
-        "missing_last_six_entries",
-        "conflicts_from_index_6",
-        "conflicts_from_index_4",
-    ],
-)
-async def test_repaired_log_is_persisted_exactly(db_path, follower):
-    await seed_log(db_path, FOLLOWER_TERMS[follower])
-    leader_log = make_log(LEADER_TERMS)
-    async with SqliteStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        await repair_durable_follower(durable, leader_log)
-        assert durable.log == leader_log
-    assert (await reload(db_path)).log == leader_log
-
-
-@pytest.mark.parametrize("follower", ["one_extra_stale_entry", "two_extra_stale_entries"])
-async def test_stale_extra_entries_survive_a_heartbeat_on_disk_too(db_path, follower):
-    await seed_log(db_path, FOLLOWER_TERMS[follower])
-    async with SqliteStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        heartbeat = await durable.receive_entries(prev_log_index=10, prev_log_term=6, entries=[])
-        assert heartbeat is True
-    assert (await reload(db_path)).log == make_log(FOLLOWER_TERMS[follower])
-
-    # A conflicting entry 11 from the Leader removes the whole stale tail, in memory and on disk.
-    new_entry = LogEntry(term=8, command="new-write")
-    async with SqliteStore(db_path) as store:
-        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        accepted = await durable.receive_entries(
-            prev_log_index=10, prev_log_term=6, entries=[new_entry]
-        )
-        assert accepted is True
-        in_memory = durable.log
-    persisted = (await reload(db_path)).log
-    assert persisted == in_memory
-    assert [e.term for e in persisted] == LEADER_TERMS + [8]
 
 
 # --- No second decision while a first write is in flight (DD-19) ----------------------

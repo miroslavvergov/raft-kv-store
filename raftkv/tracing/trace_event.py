@@ -3,7 +3,12 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-from raftkv.consensus import RequestVoteRequest, RequestVoteResponse
+from raftkv.consensus import (
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    RequestVoteRequest,
+    RequestVoteResponse,
+)
 
 
 @dataclass(frozen=True)
@@ -13,13 +18,19 @@ class TraceMessage:
     `as_dict` uses etcd's trace-format keys, so a trace reads like etcd's.
 
     Attributes:
-        type: "RequestVote" or "RequestVoteResponse".
+        type: "RequestVote", "RequestVoteResponse", "AppendEntries", or
+            "AppendEntriesResponse".
         sender: The sender's node ID.
         receiver: The receiver's node ID.
         term: The term the message carries.
-        log_term: The Candidate's last log term, for a request; else None.
-        index: The Candidate's last log index, for a request; else None.
-        reject: Whether the vote was refused, for a response; else None.
+        log_term: The Candidate's last log term, or a Leader's previous-entry
+            term; else None.
+        index: The Candidate's last log index, or a Leader's previous-entry
+            index; else None.
+        reject: Whether the vote or the entries were refused, for a response;
+            else None.
+        entry_count: How many entries an AppendEntries carries; else None.
+        commit: The Leader's commit index, for an AppendEntries; else None.
     """
 
     type: str
@@ -29,6 +40,8 @@ class TraceMessage:
     log_term: int | None = None
     index: int | None = None
     reject: bool | None = None
+    entry_count: int | None = None
+    commit: int | None = None
 
     @classmethod
     def from_vote_request(cls, request: RequestVoteRequest, receiver: int) -> "TraceMessage":
@@ -55,6 +68,35 @@ class TraceMessage:
             reject=not response.vote_granted,
         )
 
+    @classmethod
+    def from_append_entries_request(
+        cls, request: AppendEntriesRequest, receiver: int
+    ) -> "TraceMessage":
+        """Describe an AppendEntries from its Leader to `receiver`."""
+        return cls(
+            type="AppendEntries",
+            sender=request.leader_id,
+            receiver=receiver,
+            term=request.term,
+            log_term=request.prev_log_term,
+            index=request.prev_log_index,
+            entry_count=len(request.entries),
+            commit=request.leader_commit,
+        )
+
+    @classmethod
+    def from_append_entries_response(
+        cls, response: AppendEntriesResponse, sender: int, receiver: int
+    ) -> "TraceMessage":
+        """Describe a Follower's answer, from `sender` (the Follower) to `receiver` (the Leader)."""
+        return cls(
+            type="AppendEntriesResponse",
+            sender=sender,
+            receiver=receiver,
+            term=response.term,
+            reject=not response.success,
+        )
+
     def as_dict(self) -> dict[str, Any]:
         """Return the message in etcd's trace-format keys, leaving out fields that don't apply."""
         fields = {
@@ -64,6 +106,8 @@ class TraceMessage:
             "to": self.receiver,
             "logTerm": self.log_term,
             "index": self.index,
+            "entries": self.entry_count,
+            "commit": self.commit,
             "reject": self.reject,
         }
         # NOTE: `is not None`, not truthiness, so `reject: false` and a 0 index or log term stay.
@@ -76,7 +120,8 @@ class TraceEvent:
 
     Names are etcd's: `InitState`, `BecomeCandidate`, `BecomeFollower`,
     `BecomeLeader`, `SendRequestVoteRequest`, `ReceiveRequestVoteRequest`,
-    `SendRequestVoteResponse`, `ReceiveRequestVoteResponse`; plus `PersistVote`,
+    `SendRequestVoteResponse`, `ReceiveRequestVoteResponse`,
+    `ReceiveAppendEntriesRequest`, `SendAppendEntriesResponse`; plus `PersistVote`,
     for a vote a cancelled call installed without answering. Receive events
     carry the state the message arrived to; all others, the state after the
     step. A change appears only once persisted and installed, so a trace never

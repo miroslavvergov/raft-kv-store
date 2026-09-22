@@ -7,11 +7,12 @@ from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
 from raftkv.consensus import (
+    AppendEntriesRequest,
+    AppendEntriesResponse,
     Candidacy,
     Cluster,
     Leadership,
     Log,
-    LogEntry,
     NodeState,
     RequestVoteRequest,
     RequestVoteResponse,
@@ -72,6 +73,9 @@ class DurableNodeState:
         voted_for: The node voted for in `current_term`, as last persisted, or
             None.
         log: The log, as last persisted.
+        commit_index: The highest log index known to be committed; 0 after a
+            restart, since it is never persisted and a Leader's next AppendEntries
+            restores it (REPL-13).
         peers: The IDs of every other cluster member.
         candidacy: The current term's vote tally while Candidate; else None.
         leadership: The current term's Follower progress while Leader; else
@@ -98,6 +102,9 @@ class DurableNodeState:
         self._store = store
         self._cluster = cluster
         self._peers = cluster.peers_of(state.node_id)
+        # NOTE: commitment is not persisted, so a restarted node starts at 0 and relearns it
+        # from the Leader; nothing is lost, since an entry's durability is the log's job.
+        self._commit_index = 0
         self._candidacy: Candidacy | None = None
         self._leadership: Leadership | None = None
         self._lock = asyncio.Lock()
@@ -145,6 +152,10 @@ class DurableNodeState:
     @property
     def log(self) -> Log:
         return self._log
+
+    @property
+    def commit_index(self) -> int:
+        return self._commit_index
 
     @property
     def peers(self) -> frozenset[int]:
@@ -313,45 +324,97 @@ class DurableNodeState:
         return True
 
     @_holding_the_lock
-    async def receive_entries(
-        self, prev_log_index: int, prev_log_term: int, entries: list[LogEntry]
-    ) -> bool:
-        """Accept a Leader's entries into the log, persisting them before returning.
+    @traced(NodeTracer.report_append_entries)
+    async def handle_append_entries(self, request: AppendEntriesRequest) -> AppendEntriesResponse:
+        """Answer a Leader's AppendEntries, persisting every change before returning.
 
-        The log half of a Follower's AppendEntries. It does not check the RPC's
-        term; the AppendEntries handler must, before calling it. Rejects, writing
-        nothing, unless `Log.matches` accepts `prev_log_index` and `prev_log_term`
-        (REPL-5). Otherwise computes the new log (REPL-8) and persists only the
-        suffix from the first differing index (PERSIST-3), so disk always equals
-        memory: a heartbeat that changes nothing writes nothing, and a stale,
-        unconflicted tail stays on disk too.
+        The Follower's side of AppendEntries, in one lock hold (DD-8):
+
+        1. Decide on the term (`NodeState.recognize_leader`: STATE-4, STATE-5,
+           STATE-6, STATE-7). A Leader of an older term is refused and nothing
+           changes.
+        2. Reject unless the log agrees at `prev_log_index` (REPL-5); a rejection
+           still keeps any term this RPC brought.
+        3. Otherwise take the entries in (REPL-8) and advance `commit_index`
+           (REPL-13).
+
+        Whatever changed among term, vote, and log is persisted before the answer
+        exists (PERSIST-1, PERSIST-2, PERSIST-3), both together in one transaction.
+        The term check and the log change share this one lock hold on purpose:
+        between two separate hooks a newer term could arrive, and the entries of a
+        deposed Leader would still be written under it.
 
         Args:
-            prev_log_index: The 1-based index of the entry preceding `entries`.
-            prev_log_term: The term that entry must have.
-            entries: The Leader's entries, in order, from `prev_log_index + 1`.
+            request: The Leader's AppendEntries.
 
         Returns:
-            True if accepted and persisted; False if REPL-5's check rejected them.
+            The answer to send back, carrying `current_term` after step 1 so an
+            outdated Leader learns the newer term and steps down.
 
         Raises:
-            sqlite3.Error: If the write fails. The log is unchanged.
+            sqlite3.Error: If the write fails. Nothing changes and no answer is
+                returned.
             asyncio.CancelledError: If the caller was cancelled during the write;
-                raised after the new log is persisted and installed.
+                raised after the change is persisted and installed, with
+                `commit_index` not advanced.
         """
-        if not self._log.matches(prev_log_index, prev_log_term):
-            return False
-        next_log = self._log.after_append_entries(prev_log_index, entries)
-        changed_from = self._log.first_differing_index(next_log)
-        if changed_from is None:
-            return True
-        # NOTE: next_log's suffix is written, not `entries`: they differ when the conflict
-        # starts past the first incoming entry, and the store deletes from `changed_from` on.
-        await self._persist_then_install(
-            self._store.replace_log_from(changed_from, next_log.entries_from(changed_from)),
-            next_log=next_log,
+        next_state = copy.copy(self._state)
+        if not next_state.recognize_leader(request.term):
+            # NOTE: recognize_leader changes nothing when it refuses, so there is nothing to
+            # install or persist and the node's own term goes back untouched.
+            return AppendEntriesResponse(term=self.current_term, success=False)
+        accepted = self._log.matches(request.prev_log_index, request.prev_log_term)
+        next_log = (
+            self._log.after_append_entries(request.prev_log_index, list(request.entries))
+            if accepted
+            else None
         )
-        return True
+        await self._persist_then_install_append_entries(next_state, next_log)
+        if accepted:
+            # NOTE: after the install, so a failed write commits nothing; a cancelled caller
+            # installs the entries but commits nothing until the Leader's retry. In memory
+            # only: commitment is recomputed from the Leader after a restart.
+            self._commit_index = request.commit_index_after(self._commit_index)
+        return AppendEntriesResponse(term=self.current_term, success=accepted)
+
+    async def _persist_then_install_append_entries(
+        self, next_state: NodeState, next_log: Log | None
+    ) -> None:
+        """Persist whatever `handle_append_entries` changed, then install it.
+
+        Term and vote change when the RPC carried a higher term (STATE-5, STATE-6);
+        the log changes when accepted entries differ from what is held. Both
+        changing is one transaction (DD-7). Only the suffix from the first
+        differing index is written (PERSIST-3), so disk always equals memory: a
+        heartbeat that changes nothing writes nothing, and a stale, unconflicted
+        tail stays on disk too. A Candidate stepping down for a Leader of its own
+        term changes neither, and is installed without a write, role not being
+        persisted (STATE-2).
+
+        Args:
+            next_state: The state decided on a copy, to install.
+            next_log: The log after accepting the entries, or None if rejected.
+        """
+        changed_from = None if next_log is None else self._log.first_differing_index(next_log)
+        state_changed = (next_state.current_term, next_state.voted_for) != (
+            self._state.current_term,
+            self._state.voted_for,
+        )
+        # NOTE: next_log's suffix is written, not the RPC's entries: they differ when the
+        # conflict starts past the first incoming entry, and the store deletes from there on.
+        entries = [] if changed_from is None else next_log.entries_from(changed_from)
+        if state_changed and changed_from is not None:
+            write = self._store.save_term_vote_and_log_from(
+                next_state.current_term, next_state.voted_for, changed_from, entries
+            )
+        elif state_changed:
+            write = self._store.save_term_and_vote(next_state.current_term, next_state.voted_for)
+        elif changed_from is not None:
+            write = self._store.replace_log_from(changed_from, entries)
+        else:
+            self._install(next_state, next_log)
+            return
+        await self._persist_then_install(write, next_state=next_state, next_log=next_log)
 
     async def _persist_then_install_state(self, next_state: NodeState) -> None:
         """Persist `next_state`'s term and vote, then install it via `_persist_then_install`."""
@@ -363,7 +426,7 @@ class DurableNodeState:
     async def _persist_then_install(
         self,
         write: Coroutine[Any, Any, None],
-        next_state: NodeState | None = None,
+        next_state: NodeState,
         next_log: Log | None = None,
     ) -> None:
         """Run `write` to completion, then install what it persisted.
@@ -379,8 +442,8 @@ class DurableNodeState:
 
         Args:
             write: The store write that makes the change durable.
-            next_state: The NodeState to install once `write` commits, if any.
-            next_log: The Log to install once `write` commits, if any.
+            next_state: The NodeState to install once `write` commits.
+            next_log: The Log to install once `write` commits; None leaves the log.
 
         Raises:
             asyncio.CancelledError: If the caller was cancelled during the write.
@@ -405,23 +468,26 @@ class DurableNodeState:
         else:
             failure = pending.exception()
         if failure is None:
-            # NOTE: the log is installed first: realigning builds a Leadership from the log's
-            # last index (REPL-14), which must be the log this write persisted.
-            if next_log is not None:
-                self._log = next_log
-            if next_state is not None:
-                self._state = next_state
-                self._align_role_records()
+            self._install(next_state, next_log)
         # NOTE: cancellation outranks a write failure, which is chained as the cause.
         if cancelled:
             raise asyncio.CancelledError() from failure
         if failure is not None:
             raise failure
 
-    async def _store_holds(self, next_state: NodeState | None, next_log: Log | None) -> bool:
-        """Return whether the store holds `next_state`'s term and vote and `next_log`."""
+    def _install(self, next_state: NodeState, next_log: Log | None) -> None:
+        """Install a persisted state, and log if given, realigning the role records."""
+        # NOTE: the log is installed first: realigning builds a Leadership from the log's
+        # last index (REPL-14), which must be the log this write persisted.
+        if next_log is not None:
+            self._log = next_log
+        self._state = next_state
+        self._align_role_records()
+
+    async def _store_holds(self, next_state: NodeState, next_log: Log | None) -> bool:
+        """Return whether the store holds `next_state`'s term and vote, and `next_log` if given."""
         persisted = await self._store.load()
-        state_held = next_state is None or (persisted.current_term, persisted.voted_for) == (
+        state_held = (persisted.current_term, persisted.voted_for) == (
             next_state.current_term,
             next_state.voted_for,
         )

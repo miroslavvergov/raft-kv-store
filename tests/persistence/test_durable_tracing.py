@@ -10,8 +10,9 @@ import pytest
 from raftkv.consensus import Cluster, Log, LogEntry, NodeState, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, NodeSnapshot
+from tests.append_entries_messages import append_entries
 from tests.election_traces.checker import check_election_trace
-from tests.persistence.store_doubles import FailingStore, GatedStore, seed_log
+from tests.persistence.store_doubles import FailingStore, GatedStore, seed_log, win_election
 from tests.vote_messages import granted, refused, vote_request
 
 NODE_ID = 7  # IDs from 7 up never look like the small terms and indexes these tests use.
@@ -255,8 +256,11 @@ async def test_every_method_accepts_its_arguments_by_keyword(db_path, tracing_on
             state=NodeState(NODE_ID), log=Log(), store=store, cluster=THREE_NODES
         )
         entry = LogEntry(term=1, command="x")
-        assert await durable.receive_entries(prev_log_index=0, prev_log_term=0, entries=[entry])
-        assert await durable.handle_observed_term(term=1) is True
+        answer = await durable.handle_append_entries(
+            request=append_entries(term=1, prev_log_index=0, prev_log_term=0, entries=[entry])
+        )
+        assert answer.success is True
+        assert await durable.handle_observed_term(term=1) is False  # already caught up by the RPC
         answer = await durable.handle_vote_request(
             request=vote_request(term=1, candidate=8, last_log_term=1, last_log_index=1)
         )
@@ -310,3 +314,152 @@ async def test_a_real_three_node_election_trace_passes_the_checker(start_cluster
     verdict = check_election_trace(entries)
     assert verdict.problems == []
     assert verdict.leaders_by_term == {1: [1]}
+
+
+# --- AppendEntries, in etcd's MsgApp wording ------------------------------------------
+
+
+async def test_a_higher_term_append_entries_is_reported_as_a_step_down(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.start_election()
+        await durable.handle_append_entries(append_entries(term=5, leader=8))
+
+    assert log_lines(tracing_on)[-2:] == [
+        "7 [term: 1] received a MsgApp message with higher term from 8 [term: 5]",
+        "7 became follower at term 5",
+    ]
+    assert [e["name"] for e in trace_events(tracing_on)][-3:] == [
+        "ReceiveAppendEntriesRequest",
+        "BecomeFollower",
+        "SendAppendEntriesResponse",
+    ]
+
+
+async def test_a_candidate_stepping_down_in_its_own_term_is_reported(db_path, tracing_on):
+    # STATE-7: no term rises, so only the role change marks it.
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.start_election()
+        await durable.handle_append_entries(append_entries(term=1, leader=8))
+
+    assert log_lines(tracing_on)[-1] == "7 became follower at term 1"
+    assert [e["name"] for e in trace_events(tracing_on)][-2:] == [
+        "BecomeFollower",
+        "SendAppendEntriesResponse",
+    ]
+
+
+async def test_a_failed_consistency_check_is_reported_with_both_positions(db_path, tracing_on):
+    await seed_log(db_path, [1, 1])
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.handle_append_entries(
+            append_entries(term=4, leader=8, prev_log_index=9, prev_log_term=4)
+        )
+
+    # etcd's wording: the node's own last position first, then the one the Leader named.
+    assert log_lines(tracing_on)[-1] == (
+        "7 [logterm: 1, index: 2] rejected MsgApp [logterm: 4, index: 9] from 8"
+    )
+
+
+async def test_an_outdated_leader_is_reported_as_rejected_for_its_term(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.handle_observed_term(9)
+        await durable.handle_append_entries(append_entries(term=3, leader=8))
+
+    assert log_lines(tracing_on)[-1] == (
+        "7 [term: 9] rejected a MsgApp message with lower term from 8 [term: 3]"
+    )
+    [answer] = [e for e in trace_events(tracing_on) if e["name"] == "SendAppendEntriesResponse"]
+    assert answer["msg"] == {
+        "type": "AppendEntriesResponse",
+        "term": 9,
+        "from": 7,
+        "to": 8,
+        "reject": True,
+    }
+
+
+async def test_a_leader_refusing_its_own_term_is_reported_as_such_not_as_a_log_mismatch(
+    db_path, tracing_on
+):
+    # The log check never runs here: a Leader refuses any AppendEntries at its own term.
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        await durable.handle_append_entries(append_entries(term=durable.current_term, leader=8))
+
+    assert log_lines(tracing_on)[-1] == (
+        "7 [term: 1, role: leader] rejected a MsgApp message from 8 at the same term"
+    )
+
+
+async def test_a_leader_stepping_down_then_failing_the_log_check_is_reported_as_a_log_mismatch(
+    db_path, tracing_on
+):
+    # It was a Leader when the RPC arrived, but it stepped down for the higher term and its log
+    # then failed the check, so the rejection is the log's.
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        await durable.handle_append_entries(
+            append_entries(term=5, leader=8, prev_log_index=4, prev_log_term=5)
+        )
+
+    assert log_lines(tracing_on)[-3:] == [
+        "7 [term: 1] received a MsgApp message with higher term from 8 [term: 5]",
+        "7 became follower at term 5",
+        "7 [logterm: 0, index: 0] rejected MsgApp [logterm: 5, index: 4] from 8",
+    ]
+
+
+async def test_an_accepted_append_entries_gets_no_line_of_its_own(db_path, tracing_on):
+    # etcd logs nothing on success; the event records it.
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        lines_before = len(log_lines(tracing_on))
+        answer = await durable.handle_append_entries(
+            append_entries(term=1, leader=8, entries=[LogEntry(1, "x")], leader_commit=1)
+        )
+
+    assert answer.success is True
+    # Only the term catch-up's own two lines, and nothing at all about the entries stored.
+    assert log_lines(tracing_on)[lines_before:] == [
+        "7 [term: 0] received a MsgApp message with higher term from 8 [term: 1]",
+        "7 became follower at term 1",
+    ]
+    [received] = [e for e in trace_events(tracing_on) if e["name"] == "ReceiveAppendEntriesRequest"]
+    assert received["msg"] == {
+        "type": "AppendEntries",
+        "term": 1,
+        "from": 8,
+        "to": 7,
+        "logTerm": 0,
+        "index": 0,
+        "entries": 1,
+        "commit": 1,
+    }
+
+
+async def test_a_cancelled_append_entries_reports_no_answer_as_sent(db_path, tracing_on):
+    async with GatedStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        caller = asyncio.create_task(
+            durable.handle_append_entries(
+                append_entries(term=4, leader=8, entries=[LogEntry(4, "x")])
+            )
+        )
+        await store.wait_for_write()
+        caller.cancel()
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    names = [e["name"] for e in trace_events(tracing_on)]
+    assert "ReceiveAppendEntriesRequest" in names
+    # The change it persisted is reported; the answer it never returned is not.
+    assert "BecomeFollower" in names
+    assert "SendAppendEntriesResponse" not in names

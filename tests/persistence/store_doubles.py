@@ -30,6 +30,16 @@ async def seed_log(path, terms):
         await store.replace_log_from(1, list(make_log(terms)))
 
 
+async def seed_term_and_vote(path, term, vote=None):
+    """Write a term and vote straight to a node's file, as a node that already ran would hold.
+
+    For tests whose store double fails or holds every write, where the node cannot reach that
+    term through a call of its own.
+    """
+    async with SqliteStore(path) as store:
+        await store.save_term_and_vote(term, vote)
+
+
 async def let_other_tasks_run():
     """Give every ready task ten event-loop turns; no real time passes."""
     # NOTE: a task held on a write or a lock stays held through all ten turns, so a test can
@@ -57,7 +67,9 @@ class RecordingStore(SqliteStore):
     """A real SqliteStore that also records every write it is asked to make.
 
     Attributes:
-        writes: ("term_and_vote", term, vote) or ("replace_log_from", index, [terms]), in order.
+        writes: ("term_and_vote", term, vote), ("replace_log_from", index, [terms]), or
+            ("term_vote_and_log", term, vote, index, [terms]), in order. The third is one
+            transaction, so a test can tell a combined write from two separate ones.
     """
 
     def __init__(self, path):
@@ -74,6 +86,12 @@ class RecordingStore(SqliteStore):
         await self._record(("replace_log_from", index, [e.term for e in entries]))
         await super().replace_log_from(index, entries)
 
+    async def save_term_vote_and_log_from(self, current_term, voted_for, index, entries):
+        await self._record(
+            ("term_vote_and_log", current_term, voted_for, index, [e.term for e in entries])
+        )
+        await super().save_term_vote_and_log_from(current_term, voted_for, index, entries)
+
     async def _record(self, write):
         self.writes.append(write)
 
@@ -85,6 +103,9 @@ class FailingStore(SqliteStore):
         raise OSError("disk full")
 
     async def replace_log_from(self, index, entries):
+        raise OSError("disk full")
+
+    async def save_term_vote_and_log_from(self, current_term, voted_for, index, entries):
         raise OSError("disk full")
 
 
@@ -138,6 +159,10 @@ class CommitThenHoldStore(SqliteStore):
 
     async def replace_log_from(self, index, entries):
         await super().replace_log_from(index, entries)
+        await self._hold()
+
+    async def save_term_vote_and_log_from(self, current_term, voted_for, index, entries):
+        await super().save_term_vote_and_log_from(current_term, voted_for, index, entries)
         await self._hold()
 
     async def _hold(self):
