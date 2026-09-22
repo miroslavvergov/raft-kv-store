@@ -13,7 +13,9 @@ from raftkv.consensus import (
     Cluster,
     Leadership,
     Log,
+    LogEntry,
     NodeState,
+    NotLeaderError,
     RequestVoteRequest,
     RequestVoteResponse,
     Role,
@@ -63,7 +65,13 @@ class DurableNodeState:
     ones, so no votes or Follower progress carry across terms. Neither is
     persisted. The only way to become Leader is a majority of granted votes
     (ELECT-11), in `handle_vote_response` or, when the node's own vote is a
-    majority, in `start_election`.
+    majority, in `start_election`; a new Leader then appends an empty entry in
+    its term, so the entries before it can commit (APPLY-3).
+
+    A Leader appends client commands (`append_command`), builds each Follower's
+    AppendEntries (`append_entries_request_for`), and records the answers
+    (`handle_append_entries_response`), committing what a majority holds from
+    its own term. A Follower answers AppendEntries (`handle_append_entries`).
 
     Attributes:
         node_id: This node's permanent positive-integer identity.
@@ -180,18 +188,23 @@ class DurableNodeState:
         commit (ELECT-5), under the same lock hold, from the new term, this node's
         ID, and its last log index and term (ELECT-7). In a single-node cluster the
         own vote is a majority (ELECT-11), so the node becomes Leader in the same
-        install, even if the caller is cancelled; the request has no one to go to.
+        install, even if the caller is cancelled, then appends its empty entry,
+        which commits at once; the request has no one to go to.
 
         Returns:
             The RequestVote to send to every peer (ELECT-6).
 
         Raises:
             IllegalTransitionError: If the node is Leader. Nothing changes.
-            sqlite3.Error: If the write fails. Nothing changes.
-            asyncio.CancelledError: If the caller was cancelled during the write;
-                raised after the new term and vote are persisted and installed. No
-                request is returned, so the node stays a Candidate in the new term
-                until its next election timeout.
+            sqlite3.Error: If the term-and-vote write fails, nothing changes. If a
+                single-node cluster's empty-entry write fails, the node is Leader and
+                keeps that log for the term, with no entry of its own term.
+            asyncio.CancelledError: If the caller was cancelled during a write, raised
+                once that write is persisted and installed. No request is returned.
+                Cancelled during the term-and-vote write, a node in a multi-node cluster
+                stays a Candidate until its next election timeout, and a single-node
+                Leader is left without its empty entry; cancelled during the empty
+                entry's write, the entry is installed but not committed.
         """
         next_state = copy.copy(self._state)
         next_state.become_candidate()
@@ -200,6 +213,8 @@ class DurableNodeState:
         if self._cluster.is_majority({next_state.node_id}):
             next_state.become_leader()
         await self._persist_then_install_state(next_state)
+        if self._state.role is Role.LEADER:
+            await self._append_empty_entry()
         # NOTE: built from the installed state, so a request exists only for a term on disk
         # (ELECT-5).
         return RequestVoteRequest(
@@ -291,7 +306,7 @@ class DurableNodeState:
            answers to requests from other terms and repeated answers.
         3. Once granted votes, its own included, form a strict majority (ELECT-11,
            ELECT-12), the node becomes Leader with a fresh `Leadership` (REPL-14,
-           REPL-15).
+           REPL-15) and appends its empty entry, persisted before returning.
 
         Args:
             voter: The ID of the peer that answered.
@@ -304,8 +319,9 @@ class DurableNodeState:
         Raises:
             KeyError: If the node is a Candidate, `sent_in_term` is the current
                 term, and `voter` is not a member.
-            sqlite3.Error: If persisting a higher term fails. Nothing changes.
-            asyncio.CancelledError: If the caller was cancelled during that write;
+            sqlite3.Error: If persisting a higher term fails, nothing changes. If
+                persisting the empty entry fails, the node is Leader without it.
+            asyncio.CancelledError: If the caller was cancelled during a write;
                 raised after the change is persisted and installed.
         """
         next_state = copy.copy(self._state)
@@ -320,7 +336,7 @@ class DurableNodeState:
             return False
         if not self._candidacy.has_majority:
             return False
-        self._become_leader()
+        await self._become_leader()
         return True
 
     @_holding_the_lock
@@ -376,6 +392,127 @@ class DurableNodeState:
             # only: commitment is recomputed from the Leader after a restart.
             self._commit_index = request.commit_index_after(self._commit_index)
         return AppendEntriesResponse(term=self.current_term, success=accepted)
+
+    @_holding_the_lock
+    @traced(NodeTracer.report_append_command)
+    async def append_command(self, command: str) -> int:
+        """Append a client command to this Leader's log, persisted before returning (REPL-1).
+
+        The entry takes the current term. Returns once it is on disk, not once it
+        is committed; waiting for that is the caller's. In a single-node cluster
+        the Leader alone is a majority, so the entry commits at once (APPLY-1).
+
+        Args:
+            command: The command, serialized once by the KV Store layer (DD-21).
+
+        Returns:
+            The entry's 1-based log index.
+
+        Raises:
+            NotLeaderError: If the node is not Leader (CLIENT-6). Nothing changes.
+            TypeError: If `command` is not a str.
+            ValueError: If `command` is empty, which marks a new Leader's empty entry.
+            sqlite3.Error: If the write fails. Nothing changes.
+            asyncio.CancelledError: If the caller was cancelled during the write;
+                raised after the entry is persisted and installed, with
+                `commit_index` not advanced.
+        """
+        # NOTE: checked before the entry is built: a node that never led may be at term 0,
+        # which no entry can carry.
+        if self._leadership is None:
+            raise NotLeaderError(f"node {self.node_id} is {self.role.value}, not leader")
+        entry = LogEntry(term=self.current_term, command=command)
+        if entry.is_empty:
+            raise ValueError("an empty command is reserved for a new Leader's empty entry")
+        return await self._append_to_own_log(entry)
+
+    @_holding_the_lock
+    @traced(NodeTracer.report_append_entries_request)
+    async def append_entries_request_for(self, follower: int) -> AppendEntriesRequest:
+        """Return the AppendEntries this Leader sends a Follower now (REPL-2).
+
+        Built by `Leadership.append_entries_request_for` from the Follower's
+        `next_index`, this node's log, and its commit index (REPL-4). Changes
+        nothing; taken under the lock, so it never reflects a change still being
+        written.
+
+        Args:
+            follower: A peer of this node.
+
+        Raises:
+            NotLeaderError: If the node is not Leader.
+            KeyError: If `follower` is not a peer.
+        """
+        if self._leadership is None:
+            raise NotLeaderError(f"node {self.node_id} is {self.role.value}, not leader")
+        return self._leadership.append_entries_request_for(
+            follower, self._log, self.node_id, self._commit_index
+        )
+
+    @_holding_the_lock
+    @traced(NodeTracer.report_append_entries_response)
+    async def handle_append_entries_response(
+        self, follower: int, request: AppendEntriesRequest, response: AppendEntriesResponse
+    ) -> bool:
+        """Record a Follower's answer to this node's AppendEntries; advance the commit index.
+
+        The Leader's side of AppendEntries:
+
+        1. An answer with a higher term: catch up and step down (STATE-4, STATE-5,
+           STATE-6), persisting the new term and cleared vote; nothing else.
+        2. Otherwise only a Leader records it, and only an answer to an RPC sent in
+           this term counts (REPL-16, DD-25); `request` is the RPC answered, so its
+           term is the term it was sent in.
+        3. A success raises the Follower's `match_index` to the last entry `request`
+           carried (REPL-16, REPL-17), then advances `commit_index` (APPLY-1,
+           APPLY-2, APPLY-3). A rejection of the probe now outstanding lowers its
+           `next_index` (REPL-6); a duplicate or a late rejection of an earlier
+           probe changes nothing (FAIL-1).
+
+        Args:
+            follower: The Follower that answered.
+            request: The AppendEntries it answered.
+            response: Its answer.
+
+        Returns:
+            True if a rejection lowered the Follower's `next_index` to at or below
+            `request.prev_log_index`, so a resend reaches further back (REPL-7);
+            False otherwise, including a rejection of a request with
+            `prev_log_index` 0, where nothing earlier is left to send.
+
+        Raises:
+            KeyError: If the node is Leader, `request` was sent in its term, and
+                `follower` is not one of its Followers.
+            sqlite3.Error: If persisting a higher term fails. Nothing changes.
+            asyncio.CancelledError: If the caller was cancelled during that write;
+                raised after the change is persisted and installed.
+        """
+        next_state = copy.copy(self._state)
+        if next_state.handle_observed_term(response.term):
+            await self._persist_then_install_state(next_state)
+            return False
+        if self._leadership is None:
+            return False
+        if not response.success:
+            # NOTE: kept although `record_rejection` re-checks the term: it guards the
+            # `next_index` lookup below, which has none, so an answer from a non-member is a
+            # KeyError only when it answers this term's request.
+            if request.term != self._leadership.term:
+                return False
+            # NOTE: only the probe now outstanding is backed off from, so a duplicate or a
+            # late rejection of an earlier probe leaves `next_index` where it is (FAIL-1).
+            if self._leadership.next_index(follower) != request.prev_log_index + 1:
+                return False
+            self._leadership.record_rejection(follower, request.term)
+            # NOTE: the back-off stops at the floor, `match_index + 1`, where a resend would
+            # repeat the rejected request; a correct Follower never rejects prev_log_index 0.
+            return self._leadership.next_index(follower) <= request.prev_log_index
+        counted = self._leadership.record_success(
+            follower, request.term, request.prev_log_index, len(request.entries)
+        )
+        if counted:
+            self._advance_commit_index()
+        return False
 
     async def _persist_then_install_append_entries(
         self, next_state: NodeState, next_log: Log | None
@@ -493,15 +630,43 @@ class DurableNodeState:
         )
         return state_held and (next_log is None or persisted.log == next_log)
 
-    def _become_leader(self) -> None:
-        """Become Leader of the current term with a fresh Leadership.
+    async def _become_leader(self) -> None:
+        """Become Leader of the current term with a fresh Leadership, then append its empty entry.
 
         Applies `NodeState.become_leader` (STATE-3's Candidate-to-Leader edge)
-        under the lock, once the Candidacy has a majority (ELECT-11). Writes
-        nothing: role is not persisted.
+        once the Candidacy has a majority (ELECT-11). Role is not persisted; the
+        empty entry is.
         """
         self._state.become_leader()
         self._align_role_records()
+        await self._append_empty_entry()
+
+    async def _append_empty_entry(self) -> None:
+        """Append this Leader's empty entry, so earlier entries can commit (APPLY-3)."""
+        # NOTE: appended after the Leadership is built, so each Follower's next_index is this
+        # entry's index and the first AppendEntries carries it.
+        await self._append_to_own_log(LogEntry.empty(self._state.current_term))
+
+    async def _append_to_own_log(self, entry: LogEntry) -> int:
+        """Persist `entry` at the end of this Leader's log, install it, advance commitment.
+
+        Returns:
+            The entry's 1-based log index.
+        """
+        next_log = self._log.after_append_entries(self._log.last_index, [entry])
+        await self._persist_then_install(
+            self._store.replace_log_from(next_log.last_index, [entry]),
+            next_state=self._state,
+            next_log=next_log,
+        )
+        self._advance_commit_index()
+        return next_log.last_index
+
+    def _advance_commit_index(self) -> None:
+        """Raise this Leader's commit index as `Leadership.commit_index_after` allows."""
+        self._commit_index = self._leadership.commit_index_after(
+            self._commit_index, self._log, self._cluster.majority
+        )
 
     def _align_role_records(self) -> None:
         """Make the Candidacy and Leadership match the current role and term.

@@ -1,15 +1,24 @@
 """InProcessCluster: real nodes, each with its own SQLite file, whose RPCs are direct calls.
 
-The test decides whose election timeout fires and which messages arrive, in what order, and which
-are lost or repeated. Each voter's vote is read back from its file before its answer is handed on
-(PERSIST-1, PERSIST-2), and every step is reported to the election trace (tests/conftest.py).
+The test decides whose election timeout fires, which Leader sends when, and which messages arrive,
+in what order, and which are lost or repeated. Each voter's vote is read back from its file before
+its answer is handed on (PERSIST-1, PERSIST-2); every committed entry is recorded and checked
+against every node that commits it and every later Leader; and every step is reported to the
+trace (tests/conftest.py).
 """
 
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
 
-from raftkv.consensus import Cluster, RequestVoteRequest, RequestVoteResponse, Role
+from raftkv.consensus import (
+    AppendEntriesRequest,
+    AppendEntriesResponse,
+    Cluster,
+    RequestVoteRequest,
+    RequestVoteResponse,
+    Role,
+)
 from raftkv.persistence import DurableNodeState, SqliteStore
 from tests.divergent_logs import make_log
 from tests.election_traces.recorder import HARNESS
@@ -22,7 +31,7 @@ def trace_step(source, message, *args, event=None):
     """Report one harness step to the election trace, if one is being recorded.
 
     Args:
-        source: "net", "clock", "crash", "disk", or "state".
+        source: "net", "clock", "cmd", "crash", "disk", or "state".
         message: A %-style format string, filled from `args`.
         event: The step as a structured event, for the `.jsonl` trace.
     """
@@ -69,12 +78,60 @@ class InFlight:
         }
 
 
+@dataclass(frozen=True)
+class AppendEntriesInFlight:
+    """An AppendEntries on its way to `follower`, or, once `response` is set, the answer back."""
+
+    request: AppendEntriesRequest
+    follower: int
+    response: AppendEntriesResponse | None = None
+
+    def describe(self):
+        """Return the message as one line of the `.log` trace."""
+        request = self.request
+        if self.response is None:
+            return (
+                f"AppendEntries(term {request.term}, after {request.prev_log_index}"
+                f"@t{request.prev_log_term}, {len(request.entries)} entries, "
+                f"commit {request.leader_commit}) from {request.leader_id} to {self.follower}"
+            )
+        answer = "accepted" if self.response.success else "rejected"
+        return (
+            f"AppendEntriesResponse(term {self.response.term}, {answer}) "
+            f"from {self.follower} to {request.leader_id}"
+        )
+
+    def trace_fields(self):
+        """Return the message as trace-event fields, in etcd's `msg` shape."""
+        if self.response is None:
+            return {
+                "type": "AppendEntries",
+                "term": self.request.term,
+                "from": self.request.leader_id,
+                "to": self.follower,
+                "index": self.request.prev_log_index,
+                "logTerm": self.request.prev_log_term,
+                "entries": len(self.request.entries),
+                "commit": self.request.leader_commit,
+            }
+        return {
+            "type": "AppendEntriesResponse",
+            "term": self.response.term,
+            "from": self.follower,
+            "to": self.request.leader_id,
+            "reject": not self.response.success,
+        }
+
+
 class InProcessCluster:
     """Real nodes whose RPCs are direct calls; nothing happens unless the test does it.
 
-    Messages are delivered at once (`ask_for_vote`, `deliver_vote_response`, `run_election`) or
-    put in flight (`send_requests`) to be delivered, duplicated, or dropped later, in any order.
-    Every Leader and every granted vote is recorded per term, for `assert_election_safety`.
+    Messages are delivered at once (`ask_for_vote`, `deliver_vote_response`, `run_election`,
+    `replicate`) or put in flight (`send_requests`, `send_append_entries`) to be delivered,
+    duplicated, or dropped later, in any order. Every Leader and every granted vote is recorded
+    per term, for `assert_election_safety`. Every committed entry is recorded the first time any
+    node commits it, and after each step every committing node and every Leader is checked to
+    still hold it (`assert_log_safety`).
 
     Attributes:
         paths: Each node's SQLite file.
@@ -83,6 +140,8 @@ class InProcessCluster:
         leaders_by_term: Every node ever seen as Leader, per term.
         votes_by_voter_and_term: Every Candidate each node granted its vote, per term,
             its own vote as a Candidate included.
+        committed: Every committed entry, by index, with the term of the node first seen
+            committing it, as (entry, term).
     """
 
     def __init__(self, directory, member_ids, check_votes_on_disk=True):
@@ -92,6 +151,7 @@ class InProcessCluster:
         self.in_flight = []
         self.leaders_by_term = defaultdict(set)
         self.votes_by_voter_and_term = defaultdict(set)
+        self.committed = {}
         self._stores = {}
         self._check_votes_on_disk = check_votes_on_disk
 
@@ -152,7 +212,7 @@ class InProcessCluster:
         self.votes_by_voter_and_term[(candidate, request.term)].add(candidate)
         # NOTE: in a one-node cluster the self-vote already wins the term inside start_election,
         # with no answer left to deliver, so the Leader is noted here.
-        self._note_leaders()
+        self._check_after_step()
         self._trace_cluster_state()
         return request
 
@@ -176,7 +236,7 @@ class InProcessCluster:
         # reaches the trace.
         if self._check_votes_on_disk or _harness.isEnabledFor(logging.INFO):
             await self._check_vote_on_disk(voter)
-        self._note_leaders()
+        self._check_after_step()
         self._trace_cluster_state()
         return response
 
@@ -194,7 +254,7 @@ class InProcessCluster:
         became_leader = await self.nodes[request.candidate_id].handle_vote_response(
             voter, request.term, response
         )
-        self._note_leaders()
+        self._check_after_step()
         self._trace_cluster_state()
         return became_leader
 
@@ -223,6 +283,17 @@ class InProcessCluster:
             )
         else:
             self.in_flight.remove(message)
+        if isinstance(message, AppendEntriesInFlight):
+            if message.response is None:
+                response = await self.deliver_append_entries(message.follower, message.request)
+                self.in_flight.append(
+                    AppendEntriesInFlight(message.request, message.follower, response)
+                )
+                return response
+            await self.deliver_append_entries_response(
+                message.follower, message.request, message.response
+            )
+            return None
         if message.response is None:
             response = await self.ask_for_vote(message.voter, message.request)
             # NOTE: every delivery is answered afresh, so a duplicated request leaves a second
@@ -260,6 +331,131 @@ class InProcessCluster:
             response = await self.ask_for_vote(voter, request)
             await self.deliver_vote_response(voter, request, response)
         return request
+
+    # --- Replication -------------------------------------------------------------------
+
+    async def append_command(self, leader, command):
+        """Have `leader` append a client command to its log; return the entry's index."""
+        trace_step(
+            "cmd",
+            "a client asks node %d to store %r",
+            leader,
+            command,
+            event={"name": "ClientCommand", "nid": leader, "command": command},
+        )
+        index = await self.nodes[leader].append_command(command)
+        self._check_after_step()
+        self._trace_cluster_state()
+        return index
+
+    async def send_append_entries(self, leader, follower):
+        """Put `leader`'s current AppendEntries for `follower` in flight; return the message."""
+        request = await self.nodes[leader].append_entries_request_for(follower)
+        message = AppendEntriesInFlight(request, follower)
+        self.in_flight.append(message)
+        return message
+
+    async def deliver_append_entries(self, follower, request):
+        """Deliver an AppendEntries to `follower` and return its answer."""
+        message = AppendEntriesInFlight(request, follower)
+        trace_step(
+            "net",
+            "deliver %s",
+            message.describe(),
+            event={"name": "Deliver", "msg": message.trace_fields()},
+        )
+        response = await self.nodes[follower].handle_append_entries(request)
+        self._check_after_step()
+        self._trace_cluster_state()
+        return response
+
+    async def deliver_append_entries_response(self, follower, request, response):
+        """Deliver `follower`'s answer to the Leader; return whether the Leader should resend."""
+        message = AppendEntriesInFlight(request, follower, response)
+        trace_step(
+            "net",
+            "deliver %s",
+            message.describe(),
+            event={"name": "Deliver", "msg": message.trace_fields()},
+        )
+        resend = await self.nodes[request.leader_id].handle_append_entries_response(
+            follower, request, response
+        )
+        self._check_after_step()
+        self._trace_cluster_state()
+        return resend
+
+    async def replicate(self, leader, follower):
+        """Send AppendEntries from `leader` to `follower`, and the answer back, until no resend.
+
+        That is an acceptance, a step-down on a higher term, or a rejection with nothing earlier
+        left to send. Each rejection lowers `next_index` by one, and a request with
+        `prev_log_index` 0 always matches, so more rejections than the first request's
+        `prev_log_index` fails the test.
+
+        Returns:
+            How many AppendEntries the Follower rejected first.
+        """
+        rejections, most_rejections = 0, None
+        while True:
+            request = await self.nodes[leader].append_entries_request_for(follower)
+            # NOTE: the bound comes from the first request: each back-off lowers prev_log_index,
+            # so a later request's would shrink the bound as the loop runs.
+            if most_rejections is None:
+                most_rejections = request.prev_log_index
+            response = await self.deliver_append_entries(follower, request)
+            resend = await self.deliver_append_entries_response(follower, request, response)
+            if not resend:
+                return rejections
+            rejections += 1
+            assert rejections <= most_rejections, "never reached a matching entry"
+
+    async def replicate_to_all(self, leader):
+        """Replicate from `leader` to every running peer, lowest ID first.
+
+        A peer stays untouched once `leader` has stepped down on a reply.
+        """
+        for follower in sorted(self.nodes[leader].peers):
+            if follower not in self.nodes or self.nodes[leader].role is not Role.LEADER:
+                continue
+            await self.replicate(leader, follower)
+
+    def assert_log_safety(self):
+        """Assert that no committed entry was ever changed or lost.
+
+        Records every node's committed entries the first time they are seen, then asserts: no
+        node commits past the end of its log; every node that has committed an index holds the
+        entry first committed there; and every running Leader whose term is at least the term
+        that entry was first seen committed in holds it. A Leader of an earlier term, and a
+        lagging Follower, may lack an entry committed after them.
+        """
+        for node_id, node in self.nodes.items():
+            assert node.commit_index <= node.log.last_index, (
+                f"node {node_id} has commit index {node.commit_index} but holds only "
+                f"{node.log.last_index} entries"
+            )
+            for index in range(1, node.commit_index + 1):
+                entry = node.log.entry_at(index)
+                first, _ = self.committed.setdefault(index, (entry, node.current_term))
+                assert entry == first, (
+                    f"node {node_id} committed {entry} at index {index}, but {first} was "
+                    "committed there before"
+                )
+        for node_id, node in self.nodes.items():
+            if node.role is not Role.LEADER:
+                continue
+            for index, (entry, term) in self.committed.items():
+                if node.current_term < term:
+                    continue
+                held = node.log.entry_at(index) if index <= node.log.last_index else None
+                assert held == entry, (
+                    f"leader {node_id} of term {node.current_term} holds {held} at index "
+                    f"{index}, where {entry} was committed in term {term}"
+                )
+
+    def log_terms(self):
+        """Return each running node's log as a list of entry terms, by node ID."""
+        return {n: [e.term for e in node.log] for n, node in self.nodes.items()}
 
     def leaders(self):
         """Return the running nodes that are Leader now, of any term."""
@@ -307,13 +503,15 @@ class InProcessCluster:
         if self._check_votes_on_disk:
             assert on_disk == in_memory
 
-    def _note_leaders(self):
+    def _check_after_step(self):
+        """Record every running Leader, per term, and assert that no committed entry was lost."""
         for node_id, node in self.nodes.items():
             if node.role is Role.LEADER:
                 self.leaders_by_term[node.current_term].add(node_id)
+        self.assert_log_safety()
 
     def _trace_cluster_state(self):
-        """Report every running node's role, term, vote, and collected votes."""
+        """Report each running node's role, term, vote, log length, commit index, and votes."""
         if not _harness.isEnabledFor(logging.INFO):
             return
         parts, nodes = [], {}
@@ -322,7 +520,10 @@ class InProcessCluster:
             if node is None:
                 parts.append(f"{node_id} down")
                 continue
-            part = f"{node_id} {node.role.value} t{node.current_term} v{node.voted_for or 0}"
+            part = (
+                f"{node_id} {node.role.value} t{node.current_term} v{node.voted_for or 0}"
+                f" log{node.log.last_index} c{node.commit_index}"
+            )
             if node.candidacy is not None:
                 part += f" votes{sorted(node.candidacy.votes_granted)}"
             parts.append(part)
@@ -330,6 +531,8 @@ class InProcessCluster:
                 "role": node.role.value,
                 "term": node.current_term,
                 "vote": node.voted_for,
+                "lastIndex": node.log.last_index,
+                "commit": node.commit_index,
             }
         trace_step("state", "%s", " | ".join(parts), event={"name": "ClusterState", "nodes": nodes})
 

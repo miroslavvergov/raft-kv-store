@@ -92,6 +92,8 @@ class NodeTracer:
         self.emit_event("BecomeCandidate", after.with_role(Role.CANDIDATE))
         if after.role is Role.LEADER:
             self._emit_became_leader(after)
+            self._emit_replicate(before, after)
+            self._emit_commit(before, after)
         if result is None:
             return
         for peer in sorted(after.peers):
@@ -259,6 +261,8 @@ class NodeTracer:
         )
         if after.role is Role.LEADER and before.role is not Role.LEADER:
             self._emit_became_leader(after)
+            self._emit_replicate(before, after)
+            self._emit_commit(before, after)
 
     def report_append_entries(
         self,
@@ -321,11 +325,115 @@ class NodeTracer:
                     request.prev_log_index,
                     request.leader_id,
                 )
+        self._emit_commit(before, after)
         self.emit_event(
             "SendAppendEntriesResponse",
             after,
             TraceMessage.from_append_entries_response(result, self.node_id, request.leader_id),
         )
+
+    def report_append_command(
+        self,
+        before: NodeSnapshot,
+        after: NodeSnapshot,
+        command: str,
+        *,
+        result: int | None,
+        error: BaseException | None,
+    ) -> None:
+        """Report `append_command`: the entry the Leader appended, and a commit it made.
+
+        Nothing is reported if no entry was installed: a refused command, a
+        non-Leader, or a failed write.
+        """
+        self._emit_replicate(before, after)
+        self._emit_commit(before, after)
+
+    def report_append_entries_request(
+        self,
+        before: NodeSnapshot,
+        after: NodeSnapshot,
+        follower: int,
+        *,
+        result: AppendEntriesRequest | None,
+        error: BaseException | None,
+    ) -> None:
+        """Report `append_entries_request_for`: the AppendEntries built for a Follower."""
+        if result is not None:
+            self.emit_event(
+                "SendAppendEntriesRequest",
+                after,
+                TraceMessage.from_append_entries_request(result, follower),
+            )
+
+    def report_append_entries_response(
+        self,
+        before: NodeSnapshot,
+        after: NodeSnapshot,
+        follower: int,
+        request: AppendEntriesRequest,
+        response: AppendEntriesResponse,
+        *,
+        result: bool | None,
+        error: BaseException | None,
+    ) -> None:
+        """Report `handle_append_entries_response`: a step-down, a rejection, or a commit.
+
+        Always reports the answer received. Unless the call raised, it adds a line for
+        a step-down on a higher term, for an answer ignored as sent in another term or
+        reaching a non-Leader, for a rejection that lowered the Follower's
+        `next_index`, and for one that lowered nothing. Any rise in the commit index
+        is reported too.
+        """
+        self.emit_event(
+            "ReceiveAppendEntriesResponse",
+            before,
+            TraceMessage.from_append_entries_response(response, follower, self.node_id),
+            {"sentInTerm": request.term},
+        )
+        if response.term > before.current_term:
+            self.emit_line(
+                "[term: %d] received a MsgAppResp message with higher term from %d [term: %d]",
+                before.current_term,
+                follower,
+                response.term,
+            )
+            if after.current_term > before.current_term:
+                self._emit_became_follower(after)
+            return
+        if before.role is not Role.LEADER or request.term != before.current_term:
+            if error is None:
+                self.emit_line(
+                    "[term: %d, role: %s] ignored a MsgAppResp message from %d [sent in term: %d]",
+                    before.current_term,
+                    before.role.value,
+                    follower,
+                    request.term,
+                )
+            return
+        if not response.success:
+            if result:
+                self.emit_line(
+                    "received MsgAppResp(rejected) from %d for index %d",
+                    follower,
+                    request.prev_log_index,
+                )
+                self.emit_line(
+                    "decreased progress of %d to [next = %d, match = %d]",
+                    follower,
+                    after.next_index[follower],
+                    after.match_index[follower],
+                )
+            elif error is None:
+                # NOTE: a duplicate, a rejection of a probe already backed off from, or one at
+                # the floor: nothing moved, so the trace says why the answer changed nothing.
+                self.emit_line(
+                    "ignored MsgAppResp(rejected) from %d for index %d [next = %d]",
+                    follower,
+                    request.prev_log_index,
+                    after.next_index[follower],
+                )
+        self._emit_commit(before, after)
 
     # --- Output -----------------------------------------------------------------------
 
@@ -375,6 +483,47 @@ class NodeTracer:
 
     def _emit_became_leader(self, after: NodeSnapshot) -> None:
         self.emit_line("became leader at term %d", after.current_term)
+        # NOTE: the whole log goes with it, so a trace alone shows whether a new Leader holds
+        # every entry committed before its term.
         self.emit_event(
-            "BecomeLeader", after, properties={"next": after.next_index, "match": after.match_index}
+            "BecomeLeader",
+            after,
+            properties={
+                "next": after.next_index,
+                "match": after.match_index,
+                "log": [[entry.term, entry.command] for entry in after.log],
+            },
         )
+
+    def _emit_replicate(self, before: NodeSnapshot, after: NodeSnapshot) -> None:
+        """Report the entries a Leader appended to its own log during the call."""
+        if after.log.last_index > before.log.last_index:
+            self.emit_event(
+                "Replicate",
+                after,
+                properties={"entries": _entries(after, before.log.last_index + 1, None)},
+            )
+
+    def _emit_commit(self, before: NodeSnapshot, after: NodeSnapshot) -> None:
+        """Report a rise in the commit index, with every entry it newly commits."""
+        if after.commit_index > before.commit_index:
+            self.emit_event(
+                "Commit",
+                after,
+                properties={
+                    "commit": after.commit_index,
+                    "entries": _entries(after, before.commit_index + 1, after.commit_index),
+                },
+            )
+
+
+def _entries(state: NodeSnapshot, first: int, last: int | None) -> list[list[Any]]:
+    """Return `state`'s log entries from `first` through `last` (the end if None).
+
+    Each is `[index, term, command]`, so a trace shows exactly which entry each index holds.
+    """
+    last = state.log.last_index if last is None else last
+    return [
+        [index, state.log.entry_at(index).term, state.log.entry_at(index).command]
+        for index in range(first, last + 1)
+    ]

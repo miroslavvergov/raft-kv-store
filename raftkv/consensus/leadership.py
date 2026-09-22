@@ -2,7 +2,9 @@
 
 from collections.abc import Iterable
 
+from raftkv.consensus.append_entries import AppendEntriesRequest
 from raftkv.consensus.follower_progress import FollowerProgress
+from raftkv.consensus.log import Log
 
 
 class Leadership:
@@ -121,3 +123,60 @@ class Leadership:
             return False
         self._progress[follower].record_rejection()
         return True
+
+    def append_entries_request_for(
+        self, follower: int, log: Log, leader_id: int, commit_index: int
+    ) -> AppendEntriesRequest:
+        """Return the AppendEntries to send a Follower now (REPL-2, REPL-3, REPL-4).
+
+        It carries every entry from the Follower's `next_index` to the end of `log`,
+        with `prev_log_index` and `prev_log_term` naming the entry just before
+        `next_index`, so an accepted RPC leaves the Follower's log matching this one
+        from `next_index` on, and a caught-up Follower gets a heartbeat. Built in this
+        leadership's term, which is what an answer is later checked against (REPL-16,
+        DD-25).
+
+        Args:
+            follower: The Follower to send to.
+            log: The Leader's log.
+            leader_id: The Leader's node ID.
+            commit_index: The Leader's commit index.
+
+        Raises:
+            KeyError: If `follower` is not one of this leadership's Followers.
+        """
+        next_index = self._progress[follower].next_index
+        return AppendEntriesRequest(
+            term=self._term,
+            leader_id=leader_id,
+            prev_log_index=next_index - 1,
+            prev_log_term=log.term_at(next_index - 1),
+            entries=log.entries_from(next_index),
+            leader_commit=commit_index,
+        )
+
+    def commit_index_after(self, commit_index: int, log: Log, majority: int) -> int:
+        """Return the Leader's commit index given what its Followers have confirmed.
+
+        The highest index on at least `majority` nodes, the Leader counting with
+        its whole log (APPLY-1), is committed only if its entry is from this
+        leadership's term (APPLY-2). An earlier term's entry on a majority can
+        still be overwritten by a later Leader, so it commits only when a
+        current-term entry after it does (APPLY-3). Never below `commit_index`.
+
+        Args:
+            commit_index: The Leader's commit index so far.
+            log: The Leader's log.
+            majority: How many members make a strict majority (`Cluster.majority`).
+        """
+        held = sorted(
+            [log.last_index, *(progress.match_index for progress in self._progress.values())],
+            reverse=True,
+        )
+        # NOTE: the `majority`-th highest index is on at least `majority` nodes, and no higher
+        # index is. Terms never fall along a log, so if this entry is from an earlier term,
+        # every entry before it is too, and nothing new can commit.
+        on_a_majority = held[majority - 1]
+        if on_a_majority <= commit_index or log.term_at(on_a_majority) != self._term:
+            return commit_index
+        return on_a_majority

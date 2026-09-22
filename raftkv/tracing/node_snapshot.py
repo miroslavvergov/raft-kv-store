@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-from raftkv.consensus import Candidacy, LogPosition, Role
+from raftkv.consensus import Candidacy, Log, LogPosition, Role
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,8 @@ class NodeSnapshot:
         votes_refused: The Candidacy's refusals when the snapshot was taken.
         next_index: Each Follower's next index, while Leader.
         match_index: Each Follower's match index, while Leader.
+        commit_index: Its commit index.
+        log: Its whole log; immutable, so holding it keeps this moment's log.
     """
 
     node_id: int
@@ -37,6 +39,8 @@ class NodeSnapshot:
     votes_refused: frozenset[int] = frozenset()
     next_index: dict[int, int] = field(default_factory=dict)
     match_index: dict[int, int] = field(default_factory=dict)
+    commit_index: int = 0
+    log: Log = field(default_factory=Log)
 
     @classmethod
     def of(cls, node: Any) -> "NodeSnapshot":
@@ -61,6 +65,8 @@ class NodeSnapshot:
             votes_refused=candidacy.votes_refused if candidacy else frozenset(),
             next_index={f: leadership.next_index(f) for f in followers},
             match_index={f: leadership.match_index(f) for f in followers},
+            commit_index=node.commit_index,
+            log=node.log,
         )
 
     def with_role(self, role: Role) -> "NodeSnapshot":

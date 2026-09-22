@@ -10,7 +10,7 @@ import pytest
 from raftkv.consensus import Cluster, Log, LogEntry, NodeState, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, NodeSnapshot
-from tests.append_entries_messages import append_entries
+from tests.append_entries_messages import accepted, append_entries, rejected
 from tests.election_traces.checker import check_election_trace
 from tests.persistence.store_doubles import FailingStore, GatedStore, seed_log, win_election
 from tests.vote_messages import granted, refused, vote_request
@@ -27,6 +27,8 @@ SINGLE_NODE_ELECTION_EVENTS = [
     ("InitState", "follower"),
     ("BecomeCandidate", "candidate"),
     ("BecomeLeader", "leader"),
+    ("Replicate", "leader"),  # its empty entry
+    ("Commit", "leader"),  # alone a majority, so the empty entry commits at once
 ]
 
 
@@ -71,11 +73,16 @@ async def test_winning_an_election_is_reported_as_etcd_reports_it(db_path, traci
         "SendRequestVoteRequest",
         "ReceiveRequestVoteResponse",
         "BecomeLeader",
+        "Replicate",
     ]
-    assert trace_events(tracing_on)[-1]["prop"] == {
+    became_leader, replicate = trace_events(tracing_on)[-2:]
+    # next_index points at the empty entry, so the first AppendEntries carries it.
+    assert became_leader["prop"] == {
         "next": {8: 1, 9: 1},
         "match": {8: 0, 9: 0},
+        "log": [[1, ""]],
     }
+    assert replicate["prop"] == {"entries": [[1, 1, ""]]}
 
 
 async def test_a_single_node_election_is_reported_as_candidate_then_leader(db_path, tracing_on):
@@ -95,8 +102,13 @@ async def test_a_cancelled_single_node_election_is_still_reported_as_won(db_path
         store.release.set()
         with pytest.raises(asyncio.CancelledError):
             await election
+        # The cancellation is raised after the win is installed, so the empty entry is never
+        # appended, and none is reported.
+        assert len(durable.log) == 0
     assert log_lines(tracing_on) == SINGLE_NODE_ELECTION_LINES
-    assert [(e["name"], e["role"]) for e in trace_events(tracing_on)] == SINGLE_NODE_ELECTION_EVENTS
+    assert [(e["name"], e["role"]) for e in trace_events(tracing_on)] == (
+        SINGLE_NODE_ELECTION_EVENTS[:3]
+    )
 
 
 async def test_a_counted_refusal_is_reported_as_a_rejection(db_path, tracing_on):
@@ -412,7 +424,7 @@ async def test_a_leader_stepping_down_then_failing_the_log_check_is_reported_as_
     assert log_lines(tracing_on)[-3:] == [
         "7 [term: 1] received a MsgApp message with higher term from 8 [term: 5]",
         "7 became follower at term 5",
-        "7 [logterm: 0, index: 0] rejected MsgApp [logterm: 5, index: 4] from 8",
+        "7 [logterm: 1, index: 1] rejected MsgApp [logterm: 5, index: 4] from 8",
     ]
 
 
@@ -463,3 +475,141 @@ async def test_a_cancelled_append_entries_reports_no_answer_as_sent(db_path, tra
     # The change it persisted is reported; the answer it never returned is not.
     assert "BecomeFollower" in names
     assert "SendAppendEntriesResponse" not in names
+
+
+# --- The Leader's side: Replicate, SendAppendEntriesRequest, MsgAppResp, Commit ---------
+
+
+async def test_a_command_is_reported_as_a_replicated_entry_with_no_line(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        lines_before = len(log_lines(tracing_on))
+        await durable.append_command("x=5")
+
+    assert log_lines(tracing_on)[lines_before:] == []  # etcd logs no line for a proposal
+    replicate = trace_events(tracing_on)[-1]
+    assert (replicate["name"], replicate["prop"]) == ("Replicate", {"entries": [[2, 1, "x=5"]]})
+
+
+async def test_a_single_nodes_command_is_reported_replicated_then_committed(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, Cluster([NODE_ID]))
+        await durable.start_election()
+        await durable.append_command("x=5")
+
+    replicate, commit = trace_events(tracing_on)[-2:]
+    assert replicate["name"] == "Replicate"
+    assert (commit["name"], commit["prop"]) == ("Commit", {"commit": 2, "entries": [[2, 1, "x=5"]]})
+
+
+async def test_building_a_request_is_reported_as_sending_it(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        await durable.append_entries_request_for(8)
+
+    sent = trace_events(tracing_on)[-1]
+    assert sent["name"] == "SendAppendEntriesRequest"
+    assert sent["msg"] == {
+        "type": "AppendEntries",
+        "term": 1,
+        "from": 7,
+        "to": 8,
+        "logTerm": 0,
+        "index": 0,
+        "entries": 1,
+        "commit": 0,
+    }
+
+
+async def test_a_confirmation_that_commits_is_reported_with_every_entry_it_commits(
+    db_path, tracing_on
+):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        await durable.append_command("x=5")
+        request = await durable.append_entries_request_for(8)
+        await durable.handle_append_entries_response(8, request, accepted(term=1))
+
+    received, commit = trace_events(tracing_on)[-2:]
+    assert (received["name"], received["prop"]) == (
+        "ReceiveAppendEntriesResponse",
+        {"sentInTerm": 1},
+    )
+    assert (commit["name"], commit["prop"]) == (
+        "Commit",
+        {"commit": 2, "entries": [[1, 1, ""], [2, 1, "x=5"]]},
+    )
+
+
+async def test_a_rejection_is_reported_as_lowering_the_followers_progress(db_path, tracing_on):
+    await seed_log(db_path, [1, 1])
+    async with SqliteStore(db_path) as store:
+        await store.save_term_and_vote(current_term=1, voted_for=None)
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)  # term 2; next_index 3 for each Follower
+        request = await durable.append_entries_request_for(9)
+        await durable.handle_append_entries_response(9, request, rejected(term=2))
+
+    assert log_lines(tracing_on)[-2:] == [
+        "7 received MsgAppResp(rejected) from 9 for index 2",
+        "7 decreased progress of 9 to [next = 2, match = 0]",
+    ]
+
+
+async def test_an_answer_with_a_higher_term_is_reported_as_a_step_down(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        request = await durable.append_entries_request_for(9)
+        await durable.handle_append_entries_response(9, request, rejected(term=4))
+
+    assert log_lines(tracing_on)[-2:] == [
+        "7 [term: 1] received a MsgAppResp message with higher term from 9 [term: 4]",
+        "7 became follower at term 4",
+    ]
+
+
+async def test_an_answer_to_an_earlier_terms_request_is_reported_as_ignored(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        old_request = await durable.append_entries_request_for(8)
+        await durable.handle_observed_term(2)
+        await win_election(durable)  # term 3
+        await durable.handle_append_entries_response(8, old_request, accepted(term=1))
+
+    assert log_lines(tracing_on)[-1] == (
+        "7 [term: 3, role: leader] ignored a MsgAppResp message from 8 [sent in term: 1]"
+    )
+
+
+async def test_a_follower_learning_the_commit_index_reports_what_it_commits(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.handle_append_entries(
+            append_entries(term=1, leader=8, entries=[LogEntry(1, "x=5")], leader_commit=1)
+        )
+
+    commit, answer = trace_events(tracing_on)[-2:]
+    assert (commit["name"], commit["prop"]) == ("Commit", {"commit": 1, "entries": [[1, 1, "x=5"]]})
+    assert answer["name"] == "SendAppendEntriesResponse"
+
+
+async def test_a_rejection_that_lowered_nothing_is_reported_as_ignored(db_path, tracing_on):
+    # The second copy of a rejection answers a probe already backed off from, so nothing moves;
+    # without a line of its own the trace would look the same as a rejection that was acted on.
+    await seed_log(db_path, [1, 1])
+    async with SqliteStore(db_path) as store:
+        await store.save_term_and_vote(current_term=1, voted_for=None)
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)  # term 2; next_index 3 for each Follower
+        request = await durable.append_entries_request_for(9)
+        await durable.handle_append_entries_response(9, request, rejected(term=2))
+        await durable.handle_append_entries_response(9, request, rejected(term=2))
+
+    assert (
+        log_lines(tracing_on)[-1] == "7 ignored MsgAppResp(rejected) from 9 for index 2 [next = 2]"
+    )

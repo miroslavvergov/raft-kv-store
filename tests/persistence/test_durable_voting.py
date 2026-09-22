@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from raftkv.consensus import Cluster, IllegalTransitionError, Role
+from raftkv.consensus import Cluster, IllegalTransitionError, LogEntry, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
 from tests.persistence.store_doubles import (
     FailingStore,
@@ -208,7 +208,10 @@ async def test_winning_again_later_starts_a_new_leadership_from_scratch(db_path)
 
         assert durable.leadership is not old_leadership
         assert durable.leadership.term == second.term == 4
-        assert (durable.leadership.next_index(8), durable.leadership.match_index(8)) == (1, 0)
+        # One past the log it won with, which ends with term 1's empty entry; the new empty
+        # entry is appended after, so next_index points at it.
+        assert (durable.leadership.next_index(8), durable.leadership.match_index(8)) == (2, 0)
+        assert durable.log.entry_at(2) == LogEntry.empty(4)
 
 
 async def test_a_leader_cannot_start_an_election(db_path):
@@ -278,7 +281,9 @@ async def test_a_leader_asked_for_a_vote_in_a_higher_term_steps_down(db_path):
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
         await win_election(durable)
-        response = await durable.handle_vote_request(vote_request(term=2, candidate=9))
+        # The Candidate's log matches the Leader's, whose last entry is its term-1 empty entry.
+        up_to_date = vote_request(term=2, candidate=9, last_log_term=1, last_log_index=1)
+        response = await durable.handle_vote_request(up_to_date)
         assert response == granted(term=2)
         assert (durable.role, durable.current_term, durable.voted_for) == (Role.FOLLOWER, 2, 9)
         assert durable.leadership is None

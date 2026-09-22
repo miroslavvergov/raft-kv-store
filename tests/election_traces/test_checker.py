@@ -400,3 +400,157 @@ def test_rechecking_a_directory_fails_only_on_unexpected_problems(tmp_path, caps
     write_trace(tmp_path / "broken.jsonl", broken, negative_control=False)
     assert main(tmp_path) == 1
     assert "PROBLEMS  broken" in capsys.readouterr().out
+
+
+# --- Rules 7-9: committed entries agree, survive into every new Leader, never go back --
+
+
+def commit_event(node, *, term, commit, entries, role="follower"):
+    """Return a node's Commit entry; `entries` are the newly committed `[index, term, command]`."""
+    return node_event(
+        "Commit",
+        node=node,
+        term=term,
+        vote=None,
+        role=role,
+        prop={"commit": commit, "entries": entries},
+    )
+
+
+def leader_starts_and_wins(node, *, term, log, peers=(2, 3)):
+    """Return a node's InitState and its BecomeLeader for `term`; `log` is [term, command] pairs."""
+    return [
+        node_starts(node, peers=list(peers)),
+        node_event(
+            "BecomeLeader",
+            node=node,
+            term=term,
+            vote=node,
+            role="leader",
+            prop={"next": {}, "match": {}, "log": log},
+        ),
+    ]
+
+
+def test_nodes_committing_the_same_entries_break_no_rule():
+    entries = [
+        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        commit_event(2, term=1, commit=1, entries=[[1, 1, ""]]),
+        commit_event(2, term=1, commit=2, entries=[[2, 1, "x=5"]]),
+    ]
+    assert check_election_trace(entries).problems == []
+
+
+def test_two_nodes_committing_different_commands_at_one_index_is_flagged():
+    entries = [
+        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        commit_event(2, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=6"]]),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 2 committed (term 1, 'x=6') at index 2, but node 1 committed (term 1, 'x=5') there"
+    ]
+
+
+def test_two_nodes_committing_entries_of_different_terms_at_one_index_is_flagged():
+    entries = [
+        commit_event(1, term=2, commit=1, entries=[[1, 2, "x=5"]], role="leader"),
+        commit_event(3, term=3, commit=1, entries=[[1, 3, "x=5"]]),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 3 committed (term 3, 'x=5') at index 1, but node 1 committed (term 2, 'x=5') there"
+    ]
+
+
+def test_a_conflict_in_an_earlier_entry_of_a_multi_entry_commit_is_flagged():
+    # The conflict is at index 2, not at the newest entry the Commit event reports.
+    entries = [
+        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        commit_event(2, term=1, commit=3, entries=[[1, 1, ""], [2, 1, "x=6"], [3, 1, "y=7"]]),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 2 committed (term 1, 'x=6') at index 2, but node 1 committed (term 1, 'x=5') there"
+    ]
+
+
+def test_a_new_leader_holding_every_committed_entry_breaks_no_rule():
+    entries = [
+        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        *leader_starts_and_wins(2, term=2, log=[[1, ""], [1, "x=5"], [2, ""]], peers=(1, 3)),
+    ]
+    problems = check_election_trace(entries).problems
+    # The win itself breaks rule 4 here (no votes in this short trace), so check only rule 8.
+    assert not [p for p in problems if "holding" in p]
+
+
+def test_a_new_leader_missing_a_committed_entry_is_flagged():
+    entries = [
+        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        *leader_starts_and_wins(2, term=2, log=[[1, ""], [2, ""]], peers=(1, 3)),
+    ]
+    assert (
+        "node 2 became leader of term 2 holding [2, ''] at index 2, where (term 1, 'x=5') was "
+        "committed in term 1" in check_election_trace(entries).problems
+    )
+
+
+def test_a_new_leader_whose_log_is_too_short_for_a_committed_entry_is_flagged():
+    entries = [
+        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        *leader_starts_and_wins(2, term=2, log=[[1, ""]], peers=(1, 3)),
+    ]
+    assert (
+        "node 2 became leader of term 2 holding None at index 2, where (term 1, 'x=5') was "
+        "committed in term 1" in check_election_trace(entries).problems
+    )
+
+
+def test_a_commit_index_that_goes_down_while_running_is_flagged():
+    entries = [
+        node_starts(2, peers=[1, 3]),
+        commit_event(2, term=1, commit=3, entries=[[1, 1, ""], [2, 1, "a"], [3, 1, "b"]]),
+        commit_event(2, term=1, commit=2, entries=[]),
+    ]
+    assert check_election_trace(entries).problems == ["node 2's commit index went down from 3 to 2"]
+
+
+def test_a_commit_index_relearned_from_zero_after_a_restart_is_not_flagged():
+    entries = [
+        node_starts(2, peers=[1, 3]),
+        commit_event(2, term=1, commit=3, entries=[[1, 1, ""], [2, 1, "a"], [3, 1, "b"]]),
+        node_starts(2, peers=[1, 3], term=1),
+        commit_event(2, term=1, commit=1, entries=[[1, 1, ""]]),
+    ]
+    assert check_election_trace(entries).problems == []
+
+
+def test_a_leader_of_an_earlier_term_missing_a_later_terms_commit_is_not_flagged():
+    # Node 1 ran for term 1 and node 2 granted, but the grant was delayed in the network. Node 3
+    # won term 2 and committed. The grant then arrives and node 1 becomes a legitimate term-1
+    # Leader without node 3's entry: rule 8 says nothing about a Leader of an earlier term.
+    entries = [
+        commit_event(3, term=2, commit=1, entries=[[1, 2, ""]], role="leader"),
+        *leader_starts_and_wins(1, term=1, log=[], peers=(2, 3)),
+    ]
+    assert not [p for p in check_election_trace(entries).problems if "holding" in p]
+
+
+def test_a_leader_of_the_same_term_as_the_commit_must_still_hold_it():
+    entries = [
+        commit_event(3, term=2, commit=1, entries=[[1, 2, "x=5"]], role="leader"),
+        *leader_starts_and_wins(1, term=2, log=[[2, "other"]], peers=(2, 3)),
+    ]
+    assert (
+        "node 1 became leader of term 2 holding [2, 'other'] at index 1, where (term 2, 'x=5') "
+        "was committed in term 2" in check_election_trace(entries).problems
+    )
+
+
+def test_a_leader_of_an_earlier_term_missing_an_old_entry_committed_later_is_not_flagged():
+    # The entries are from term 1, but a term-3 Leader is the first to commit them. What rule 8
+    # compares is the term they were committed in, not the term they were written in, so a
+    # term-2 Leader that lacks them is not flagged.
+    entries = [
+        commit_event(3, term=3, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        *leader_starts_and_wins(1, term=2, log=[], peers=(2, 3)),
+    ]
+    assert not [p for p in check_election_trace(entries).problems if "holding" in p]

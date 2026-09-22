@@ -91,7 +91,8 @@ async def test_leader_observing_higher_term_steps_down_and_persists(db_path):
     assert await term_and_vote_on_disk(db_path) == (5, None)
 
 
-async def test_becoming_leader_writes_nothing(db_path):
+async def test_becoming_leader_writes_only_its_empty_entry(db_path):
+    # Role is not persisted; the empty entry a new Leader appends in its term is.
     async with RecordingStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
         request = await durable.start_election()
@@ -99,7 +100,7 @@ async def test_becoming_leader_writes_nothing(db_path):
         response = granted(term=request.term)
         assert await durable.handle_vote_response(8, request.term, response) is True
         assert durable.role is Role.LEADER
-        assert store.writes == writes_before
+        assert store.writes == [*writes_before, ("replace_log_from", 1, [1])]
 
 
 async def test_illegal_transition_changes_nothing_in_memory_or_on_disk(db_path):

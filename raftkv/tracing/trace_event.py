@@ -121,7 +121,10 @@ class TraceEvent:
     Names are etcd's: `InitState`, `BecomeCandidate`, `BecomeFollower`,
     `BecomeLeader`, `SendRequestVoteRequest`, `ReceiveRequestVoteRequest`,
     `SendRequestVoteResponse`, `ReceiveRequestVoteResponse`,
-    `ReceiveAppendEntriesRequest`, `SendAppendEntriesResponse`; plus `PersistVote`,
+    `SendAppendEntriesRequest`, `ReceiveAppendEntriesRequest`,
+    `SendAppendEntriesResponse`, `ReceiveAppendEntriesResponse`, `Replicate` (a
+    Leader appended entries to its own log), and `Commit` (the commit index
+    rose, with every entry it newly commits); plus `PersistVote`,
     for a vote a cancelled call installed without answering. Receive events
     carry the state the message arrived to; all others, the state after the
     step. A change appears only once persisted and installed, so a trace never

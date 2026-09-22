@@ -82,3 +82,15 @@ def test_log_entry_rejects_a_term_below_one(term):
 
 def test_repr_shows_the_entries():
     assert repr(Log([LogEntry(term=1, command="a")])) == "Log([LogEntry(term=1, command='a')])"
+
+
+# --- The empty entry a new Leader appends ---------------------------------------------
+
+
+def test_the_empty_entry_carries_its_term_and_no_command():
+    entry = LogEntry.empty(5)
+    assert (entry.term, entry.command, entry.is_empty) == (5, "", True)
+
+
+def test_an_entry_with_a_command_is_not_marked_empty():
+    assert LogEntry(term=5, command="x=5").is_empty is False

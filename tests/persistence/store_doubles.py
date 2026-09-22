@@ -127,11 +127,16 @@ class GatedStore(RecordingStore):
         """Wait until a write is being held; fail the test after `timeout` seconds without one."""
         await asyncio.wait_for(self.entered.wait(), timeout)
 
+    def hold_next_write(self):
+        """Hold the next write in flight again, after earlier writes were let through."""
+        self.entered.clear()
+        self.release.clear()
+
     async def _record(self, write):
         await super()._record(write)
         self.write_task = asyncio.current_task()
-        # NOTE: neither event is ever cleared: `entered` stays set after the first write, and
-        # once `release` is set every later write goes straight through.
+        # NOTE: only hold_next_write clears the events: until it runs, `entered` stays set once
+        # a write has arrived, and a set `release` lets every later write straight through.
         self.entered.set()
         await self.release.wait()
 

@@ -5,10 +5,20 @@
 overwrite any of them.
 """
 
-from raftkv.consensus import AppendEntriesRequest
+from raftkv.consensus import AppendEntriesRequest, AppendEntriesResponse
 
 LEADER_ID = 8
 LEADER_TERM = 8
+
+
+def accepted(*, term):
+    """Return a Follower's answer accepting an AppendEntries, carrying `term`."""
+    return AppendEntriesResponse(term=term, success=True)
+
+
+def rejected(*, term):
+    """Return a Follower's answer rejecting an AppendEntries, carrying `term`."""
+    return AppendEntriesResponse(term=term, success=False)
 
 
 def append_entries(
