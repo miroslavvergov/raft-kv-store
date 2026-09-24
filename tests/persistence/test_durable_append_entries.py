@@ -9,7 +9,7 @@ import asyncio
 
 import pytest
 
-from raftkv.consensus import Cluster, Log, LogEntry, Role
+from raftkv.consensus import Cluster, CommittedEntryConflictError, Log, LogEntry, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
 from tests.append_entries_messages import append_entries, append_entries_at, heartbeat
 from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
@@ -348,22 +348,64 @@ async def test_a_late_rpc_repeating_a_held_entry_keeps_the_committed_entry_after
     assert (await reload(db_path)).log == Log(FIRST_THREE)
 
 
-@pytest.mark.negative_control
-async def test_negative_control_blind_truncation_deletes_a_committed_entry(db_path, monkeypatch):
-    # Proves the test above can fail: a Follower that cuts its log at prev_log_index and
-    # appends, instead of keeping matching entries, loses committed entry 3 in memory and on
-    # disk while still reporting it as committed.
+async def test_a_broken_merge_rule_is_stopped_before_it_loses_a_committed_entry(
+    db_path, monkeypatch
+):
+    # With the merge rule replaced by blind truncation, the late RPC would delete committed
+    # entry 3. The guard in handle_append_entries refuses it by name, with nothing changed in
+    # memory or on disk, rather than letting the loss happen silently.
     def blind_truncate(log, prev_log_index, entries):
         return Log(list(log)[:prev_log_index] + list(entries))
 
     monkeypatch.setattr(Log, "after_append_entries", blind_truncate)
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        await accept_three_then_replay_an_earlier_rpc(durable)
+        with pytest.raises(CommittedEntryConflictError, match="would change entry 3"):
+            await accept_three_then_replay_an_earlier_rpc(durable)
 
-        assert durable.log == Log(FIRST_THREE[:2])
-        assert durable.commit_index == 3  # committed through an entry the node no longer holds
-    assert (await reload(db_path)).log == Log(FIRST_THREE[:2])
+        assert durable.log == Log(FIRST_THREE)
+        assert durable.commit_index == 3
+    assert (await reload(db_path)).log == Log(FIRST_THREE)
+
+
+# --- Committed entries are never overwritten --------------------------------------------
+
+
+async def test_an_append_entries_that_would_change_a_committed_entry_is_refused(db_path):
+    # Only a broken election or commit rule could send this: a Leader of term 5 whose entry 2
+    # differs from one this node has already committed. Nothing is installed, not even term 5.
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=FIRST_THREE, leader_commit=3)
+        )
+        rewrite = append_entries(
+            term=5, prev_log_index=1, prev_log_term=4, entries=[LogEntry(5, "other")]
+        )
+
+        with pytest.raises(CommittedEntryConflictError, match="committed through 3"):
+            await durable.handle_append_entries(rewrite)
+
+        assert (durable.log, durable.current_term) == (Log(FIRST_THREE), 4)
+    persisted = await reload(db_path)
+    assert (persisted.log, persisted.current_term) == (Log(FIRST_THREE), 4)
+
+
+async def test_an_uncommitted_entry_just_past_the_commit_index_may_still_be_replaced(db_path):
+    # The boundary: entries 1 and 2 are committed, entry 3 is not, so a new Leader may still
+    # overwrite entry 3.
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=FIRST_THREE, leader_commit=2)
+        )
+        replacement = append_entries(
+            term=5, prev_log_index=2, prev_log_term=4, entries=[LogEntry(5, "other")]
+        )
+
+        assert (await durable.handle_append_entries(replacement)).success is True
+
+        assert [e.command for e in durable.log] == ["cmd1", "cmd2", "other"]
 
 
 # --- Repairing a divergent Follower through the real handler --------------------------

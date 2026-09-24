@@ -11,7 +11,7 @@ import random
 
 import pytest
 
-from raftkv.consensus import Log, LogEntry, LogPosition, Role
+from raftkv.consensus import CommittedEntryConflictError, Log, LogEntry, LogPosition, Role
 from tests.persistence.in_process_cluster import AppendEntriesInFlight
 
 
@@ -182,12 +182,11 @@ async def test_a_duplicated_old_append_entries_arriving_late_deletes_nothing(thr
     assert three_nodes.nodes[2].commit_index == 3
 
 
-@pytest.mark.negative_control
-async def test_negative_control_blind_truncation_loses_a_committed_entry_in_a_cluster(
+async def test_a_broken_merge_rule_is_stopped_before_a_committed_entry_is_lost(
     three_nodes, monkeypatch
 ):
-    # Proves the test above can fail, and that the harness notices: a Follower that cuts its
-    # log at prev_log_index loses committed entry 3 when the late copy arrives.
+    # Node 2 has committed entry 3 when a late copy of an earlier AppendEntries arrives. Under
+    # blind truncation that copy would delete entry 3; the node refuses it by name instead.
     await three_nodes.append_command(1, "a=1")
     first = await three_nodes.send_append_entries(1, 2)
     await three_nodes.deliver(first, keep_copy=True)
@@ -199,9 +198,22 @@ async def test_negative_control_blind_truncation_loses_a_committed_entry_in_a_cl
         return Log(list(log)[:prev_log_index] + list(entries))
 
     monkeypatch.setattr(Log, "after_append_entries", blind_truncate)
-    with pytest.raises(AssertionError, match="node 2 has commit index 3 but holds only 2"):
+    with pytest.raises(CommittedEntryConflictError):
         await three_nodes.deliver(first)
-    assert commands(three_nodes, 2) == ["", "a=1"]
+    assert commands(three_nodes, 2) == ["", "a=1", "b=2"]
+
+
+@pytest.mark.negative_control
+async def test_negative_control_a_node_committing_past_its_own_log_is_caught(three_nodes):
+    # Proves the harness's "no node commits past the end of its log" check can fire. Real code
+    # can no longer reach this state, so it is forged by reaching into _commit_index.
+    await three_nodes.append_command(1, "a=1")
+    await three_nodes.replicate(1, 2)
+    node = three_nodes.nodes[2]
+    node._commit_index = node.log.last_index + 1
+
+    with pytest.raises(AssertionError, match="has commit index 3 but holds only 2"):
+        three_nodes.assert_log_safety()
 
 
 async def test_answers_arriving_out_of_order_never_lower_progress(three_nodes):

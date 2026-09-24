@@ -7,7 +7,11 @@ can change without breaking other layers.
 from raftkv.consensus.append_entries import AppendEntriesRequest, AppendEntriesResponse
 from raftkv.consensus.candidacy import Candidacy
 from raftkv.consensus.cluster import Cluster
-from raftkv.consensus.errors import IllegalTransitionError, NotLeaderError
+from raftkv.consensus.errors import (
+    CommittedEntryConflictError,
+    IllegalTransitionError,
+    NotLeaderError,
+)
 from raftkv.consensus.follower_progress import FollowerProgress
 from raftkv.consensus.leadership import Leadership
 from raftkv.consensus.log import Log, LogEntry
@@ -21,6 +25,7 @@ __all__ = [
     "AppendEntriesResponse",
     "Candidacy",
     "Cluster",
+    "CommittedEntryConflictError",
     "FollowerProgress",
     "IllegalTransitionError",
     "Leadership",

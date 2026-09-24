@@ -16,3 +16,13 @@ class NotLeaderError(Exception):
     Only a Leader appends a client command (REPL-1, CLIENT-6) or replicates its
     log (REPL-2). Nothing changes when it is raised.
     """
+
+
+class CommittedEntryConflictError(Exception):
+    """Raised when an AppendEntries would change an entry this node has committed.
+
+    Committed entries are never overwritten: the election and commit rules
+    guarantee a legitimate Leader already holds every one of them. Seeing this
+    means one of those rules has failed, so the node refuses the RPC with
+    nothing changed rather than rewrite history it may already have applied.
+    """

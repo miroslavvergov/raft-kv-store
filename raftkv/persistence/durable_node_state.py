@@ -12,6 +12,7 @@ from raftkv.consensus import (
     AppendEntriesResponse,
     Candidacy,
     Cluster,
+    CommittedEntryConflictError,
     Leadership,
     Log,
     LogEntry,
@@ -418,6 +419,8 @@ class DurableNodeState:
             outdated Leader learns the newer term and steps down.
 
         Raises:
+            CommittedEntryConflictError: If accepting the entries would change one
+                this node has committed. Nothing changes and no answer is returned.
             sqlite3.Error: If the write fails. Nothing changes and no answer is
                 returned.
             asyncio.CancelledError: If the caller was cancelled during the write;
@@ -435,7 +438,15 @@ class DurableNodeState:
             if accepted
             else None
         )
-        await self._persist_then_install_append_entries(next_state, next_log)
+        changed_from = None if next_log is None else self._log.first_differing_index(next_log)
+        # NOTE: the election and commit rules already rule this out; checking it here turns a
+        # broken rule into a named failure before anything is written, not a lost entry later.
+        if changed_from is not None and changed_from <= self._commit_index:
+            raise CommittedEntryConflictError(
+                f"node {self.node_id} committed through {self._commit_index}, but an "
+                f"AppendEntries from {request.leader_id} would change entry {changed_from}"
+            )
+        await self._persist_then_install_append_entries(next_state, next_log, changed_from)
         if accepted:
             # NOTE: after the install, so a failed write commits nothing; a cancelled caller
             # installs the entries but commits nothing until the Leader's retry. In memory
@@ -600,7 +611,7 @@ class DurableNodeState:
         return applied
 
     async def _persist_then_install_append_entries(
-        self, next_state: NodeState, next_log: Log | None
+        self, next_state: NodeState, next_log: Log | None, changed_from: int | None
     ) -> None:
         """Persist whatever `handle_append_entries` changed, then install it.
 
@@ -616,8 +627,9 @@ class DurableNodeState:
         Args:
             next_state: The state decided on a copy, to install.
             next_log: The log after accepting the entries, or None if rejected.
+            changed_from: The first index where `next_log` differs from the current
+                log, or None if it does not.
         """
-        changed_from = None if next_log is None else self._log.first_differing_index(next_log)
         state_changed = (next_state.current_term, next_state.voted_for) != (
             self._state.current_term,
             self._state.voted_for,
