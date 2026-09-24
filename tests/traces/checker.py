@@ -23,7 +23,7 @@ It reads only the nodes' trace events and the harness's disk checks, and imports
 10. Every node applies the same command at each index, one index at a time with no gaps; a
    restart resets the count, as the state machine is rebuilt from the log (APPLY-4, APPLY-6).
 
-Run on a directory of traces: `python -m tests.election_traces.checker test-traces/elections`.
+Run on a directory of traces: `python -m tests.traces.checker test-traces/elections`.
 """
 
 import json

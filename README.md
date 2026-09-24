@@ -16,6 +16,20 @@ strategy this project implements against.
     pytest -q
     ruff format raftkv tests && ruff check raftkv tests   # settings in ruff.toml
 
+## Layout
+
+    raftkv/
+      consensus/   pure Raft rules: log, roles, voting, replication, commit (no I/O)
+      node/        DurableNodeState: runs those rules and persists before acting
+      storage/     SQLite storage of term, vote, and log
+      kvstore/     the key-value state machine committed entries are applied to
+      tracing/     log lines and trace events for every node decision
+    tests/
+      consensus/ node/ storage/ kvstore/ tracing/   one folder per package
+      cluster/     several nodes over a simulated network, with safety checks
+      traces/      the trace recorder and checker behind --trace-elections
+      support/     message builders, log fixtures, and store doubles
+
 ## Tracing elections
 
     pytest --trace-elections
@@ -41,7 +55,7 @@ to see *why* a test passed or failed, not just *that* it did.
   carrying the node's term, vote, role, and last log entry.
 
 Every trace is also re-checked by an independent checker that reads only the
-trace (`tests/election_traces/checker.py`): at most one Leader per term, at
+trace (`tests/traces/checker.py`): at most one Leader per term, at
 most one vote per node per term, votes only for up-to-date logs, Leaders only
 with a majority, terms and votes that survive restarts, votes on disk before
 answering, every node committing the same entry at each index, every new
@@ -52,7 +66,7 @@ fails at teardown;
 tests marked `negative_control` break one on purpose, and the summary at the
 end shows what the checker found in them. To re-check saved traces later:
 
-    python -m tests.election_traces.checker test-traces/elections
+    python -m tests.traces.checker test-traces/elections
 
 Without the option nothing is recorded, and tracing costs a logger level
 check per call.

@@ -22,7 +22,7 @@ from raftkv.consensus import (
     RequestVoteResponse,
     Role,
 )
-from raftkv.persistence.sqlite_store import SqliteStore
+from raftkv.storage import SqliteStore
 from raftkv.tracing import NodeTracer, traced
 
 

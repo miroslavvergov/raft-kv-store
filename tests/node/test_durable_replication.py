@@ -19,9 +19,10 @@ from raftkv.consensus import (
     NotLeaderError,
     Role,
 )
-from raftkv.persistence import DurableNodeState, SqliteStore
-from tests.append_entries_messages import accepted, append_entries, rejected
-from tests.persistence.store_doubles import (
+from raftkv.node import DurableNodeState
+from raftkv.storage import SqliteStore
+from tests.support.append_entries_messages import accepted, append_entries, rejected
+from tests.support.store_doubles import (
     GatedStore,
     RecordingStore,
     let_other_tasks_run,
@@ -31,7 +32,7 @@ from tests.persistence.store_doubles import (
     term_and_vote_on_disk,
     win_election,
 )
-from tests.vote_messages import granted
+from tests.support.vote_messages import granted
 
 NODE_ID = 7
 THREE_NODES = Cluster([7, 8, 9])

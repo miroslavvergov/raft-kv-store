@@ -9,7 +9,7 @@ import random
 import pytest
 
 from raftkv.consensus import Cluster, Leadership, Log, LogEntry
-from tests.divergent_logs import make_log
+from tests.support.divergent_logs import make_log
 
 LEADER = 1
 

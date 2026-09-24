@@ -8,12 +8,13 @@ import asyncio
 import pytest
 
 from raftkv.consensus import Cluster, Log, LogEntry, NodeState, Role
-from raftkv.persistence import DurableNodeState, SqliteStore
+from raftkv.node import DurableNodeState
+from raftkv.storage import SqliteStore
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, NodeSnapshot
-from tests.append_entries_messages import accepted, append_entries, heartbeat, rejected
-from tests.election_traces.checker import check_election_trace
-from tests.persistence.store_doubles import FailingStore, GatedStore, seed_log, win_election
-from tests.vote_messages import granted, refused, vote_request
+from tests.support.append_entries_messages import accepted, append_entries, heartbeat, rejected
+from tests.support.store_doubles import FailingStore, GatedStore, seed_log, win_election
+from tests.support.vote_messages import granted, refused, vote_request
+from tests.traces.checker import check_election_trace
 
 NODE_ID = 7  # IDs from 7 up never look like the small terms and indexes these tests use.
 THREE_NODES = Cluster([7, 8, 9])

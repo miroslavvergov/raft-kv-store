@@ -8,7 +8,7 @@ import random
 import pytest
 
 from raftkv.consensus import Leadership
-from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, append_entries_for, make_log
+from tests.support.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, append_entries_for, make_log
 
 TERM = 7
 FOLLOWERS = [2, 3, 4, 5]

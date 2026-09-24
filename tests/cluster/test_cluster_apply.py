@@ -144,12 +144,12 @@ async def test_negative_control_two_nodes_applying_different_commands_is_caught(
 
 
 def test_the_raft_layer_never_imports_the_kv_layer():
-    # DD-12: the consensus and persistence layers reach the state machine only through the
-    # callback they were handed, so neither may import the KV Store layer.
+    # DD-12: the Raft layers reach the state machine only through the callback they were
+    # handed, so none may import the KV Store layer.
     root = pathlib.Path(__file__).resolve().parents[2] / "raftkv"
     offenders = [
         f"{source.relative_to(root.parent)}: {line.strip()}"
-        for package in ("consensus", "persistence", "tracing")
+        for package in ("consensus", "node", "storage", "tracing")
         for source in (root / package).glob("*.py")
         for line in source.read_text().splitlines()
         if line.startswith(("import ", "from ")) and "kvstore" in line

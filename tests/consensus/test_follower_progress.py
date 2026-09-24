@@ -8,7 +8,7 @@ import random
 import pytest
 
 from raftkv.consensus import FollowerProgress
-from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log, repair
+from tests.support.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log, repair
 
 # --- Starting state -------------------------------------------------------------------
 

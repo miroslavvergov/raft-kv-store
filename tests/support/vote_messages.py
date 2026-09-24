@@ -1,4 +1,4 @@
-"""RequestVote messages, built by keyword, shared by the consensus and persistence tests."""
+"""RequestVote messages, built by keyword, shared by the consensus and node tests."""
 
 from raftkv.consensus import RequestVoteRequest, RequestVoteResponse
 

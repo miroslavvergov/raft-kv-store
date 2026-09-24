@@ -1,7 +1,7 @@
-"""Project-wide pytest setup: tracing fixtures and the `--trace-elections` option.
+"""Project-wide pytest setup: shared fixtures and the `--trace-elections` option.
 
 With `--trace-elections`, every test that runs a node writes its trace to `test-traces/elections/`,
-and the checker (tests/election_traces/checker.py) re-checks it. A passing test whose trace breaks
+and the checker (tests/traces/checker.py) re-checks it. A passing test whose trace breaks
 a rule fails at teardown, unless it is marked `negative_control`.
 """
 
@@ -10,10 +10,56 @@ import logging
 import pytest
 
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER
-from tests.election_traces.recorder import ElectionTraceRecorder
+from tests.cluster.in_process_cluster import InProcessCluster
+from tests.traces.checker import check_election_trace
+from tests.traces.recorder import ElectionTraceRecorder, collecting_trace_records, render
 
 _RECORDER = pytest.StashKey[ElectionTraceRecorder]()
 _OUTCOME = pytest.StashKey[str]()
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    """Return the path of a node's SQLite file, not yet created."""
+    return str(tmp_path / "node.db")
+
+
+@pytest.fixture
+async def start_cluster(tmp_path, request):
+    """Return a function that starts an InProcessCluster; every cluster is stopped at teardown.
+
+    The function takes the member IDs and, by keyword: `preload`, each node's starting file as
+    InProcessCluster.preload's arguments; `down`, the nodes left stopped; and
+    `check_votes_on_disk`. The test's election trace is re-checked at teardown, and the test
+    fails if it breaks a rule, unless it is marked `negative_control`.
+    """
+    clusters = []
+
+    async def start(member_ids, *, preload=None, down=(), check_votes_on_disk=True):
+        cluster = InProcessCluster(tmp_path, member_ids, check_votes_on_disk=check_votes_on_disk)
+        clusters.append(cluster)
+        for node_id, starting_file in (preload or {}).items():
+            await cluster.preload(node_id, **starting_file)
+        for node_id in cluster.member_ids:
+            if node_id not in down:
+                await cluster.start(node_id)
+        return cluster
+
+    # NOTE: the trace is collected and re-checked here too, so every cluster test is checked
+    # without --trace-elections.
+    with collecting_trace_records() as records:
+        yield start
+        for cluster in clusters:
+            await cluster.stop_all()
+    if request.node.get_closest_marker("negative_control") is not None:
+        return
+    _, entries = render(records)
+    problems = check_election_trace(entries).problems
+    if problems:
+        pytest.fail(
+            "the election trace breaks a safety rule:\n  - " + "\n  - ".join(problems),
+            pytrace=False,
+        )
 
 
 def _set_tracing_level(caplog, level):

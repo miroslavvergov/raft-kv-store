@@ -9,8 +9,8 @@ import random
 import pytest
 
 from raftkv.consensus import Role
-from raftkv.persistence import SqliteStore
-from tests.persistence.store_doubles import term_and_vote_on_disk
+from raftkv.storage import SqliteStore
+from tests.support.store_doubles import term_and_vote_on_disk
 
 
 @pytest.fixture

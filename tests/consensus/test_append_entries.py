@@ -7,7 +7,7 @@ Leader's commit index), REPL-13 (what a Follower does with it).
 import pytest
 
 from raftkv.consensus import LogEntry
-from tests.append_entries_messages import append_entries, heartbeat
+from tests.support.append_entries_messages import append_entries, heartbeat
 
 
 def entries(*terms):

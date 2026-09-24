@@ -10,10 +10,11 @@ import asyncio
 import pytest
 
 from raftkv.consensus import Cluster, CommittedEntryConflictError, Log, LogEntry, Role
-from raftkv.persistence import DurableNodeState, SqliteStore
-from tests.append_entries_messages import append_entries, append_entries_at, heartbeat
-from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
-from tests.persistence.store_doubles import (
+from raftkv.node import DurableNodeState
+from raftkv.storage import SqliteStore
+from tests.support.append_entries_messages import append_entries, append_entries_at, heartbeat
+from tests.support.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
+from tests.support.store_doubles import (
     FailingStore,
     GatedStore,
     RecordingStore,

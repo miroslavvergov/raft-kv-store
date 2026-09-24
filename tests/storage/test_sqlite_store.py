@@ -9,9 +9,9 @@ from contextlib import closing
 import pytest
 
 from raftkv.consensus import Log, LogEntry
-from raftkv.persistence import SqliteStore
-from tests.divergent_logs import make_log
-from tests.persistence.store_doubles import reload, term_and_vote_on_disk
+from raftkv.storage import SqliteStore
+from tests.support.divergent_logs import make_log
+from tests.support.store_doubles import reload, term_and_vote_on_disk
 
 
 def unchecked_entry(term, command="x"):

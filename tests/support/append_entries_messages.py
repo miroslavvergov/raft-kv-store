@@ -1,4 +1,4 @@
-"""AppendEntries messages, built by keyword, shared by the consensus and persistence tests.
+"""AppendEntries messages, built by keyword, shared by the consensus and node tests.
 
 `LEADER_ID` and `LEADER_TERM` are the Leader the divergent-log fixtures describe: it holds
 `LEADER_TERMS` and leads a term above every entry term in those logs, so its entries may

@@ -12,7 +12,7 @@ import random
 import pytest
 
 from raftkv.consensus import CommittedEntryConflictError, Log, LogEntry, LogPosition, Role
-from tests.persistence.in_process_cluster import AppendEntriesInFlight
+from tests.cluster.in_process_cluster import AppendEntriesInFlight
 
 
 @pytest.fixture

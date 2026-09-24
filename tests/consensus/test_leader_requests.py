@@ -7,7 +7,7 @@ does the Leader's commit index), REPL-14 (start one past the Leader's last entry
 import pytest
 
 from raftkv.consensus import Leadership
-from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
+from tests.support.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log
 
 TERM = 8
 LEADER_ID = 1

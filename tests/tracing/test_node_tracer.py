@@ -14,8 +14,8 @@ from raftkv.tracing import (
     TraceEvent,
     TraceMessage,
 )
-from tests.append_entries_messages import append_entries, heartbeat
-from tests.vote_messages import refused, vote_request
+from tests.support.append_entries_messages import append_entries, heartbeat
+from tests.support.vote_messages import refused, vote_request
 
 
 def entries(*terms):

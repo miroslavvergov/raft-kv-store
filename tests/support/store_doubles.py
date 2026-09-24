@@ -1,4 +1,4 @@
-"""Store doubles and disk helpers shared by the persistence tests.
+"""Store doubles and disk helpers shared by the node, storage, and cluster tests.
 
 Each store is a real SqliteStore that also records, fails, or holds in flight every write,
 before or after it commits. NoLock stands in for DD-8's lock in negative controls.
@@ -7,9 +7,9 @@ before or after it commits. NoLock stands in for DD-8's lock in negative control
 import asyncio
 
 from raftkv.consensus import Role
-from raftkv.persistence import SqliteStore
-from tests.divergent_logs import make_log
-from tests.vote_messages import granted
+from raftkv.storage import SqliteStore
+from tests.support.divergent_logs import make_log
+from tests.support.vote_messages import granted
 
 
 async def reload(path):

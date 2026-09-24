@@ -20,10 +20,11 @@ from raftkv.consensus import (
     Role,
 )
 from raftkv.kvstore import KeyValueStore
-from raftkv.persistence import DurableNodeState, SqliteStore
-from tests.divergent_logs import make_log
-from tests.election_traces.recorder import HARNESS
-from tests.persistence.store_doubles import reload
+from raftkv.node import DurableNodeState
+from raftkv.storage import SqliteStore
+from tests.support.divergent_logs import make_log
+from tests.support.store_doubles import reload
+from tests.traces.recorder import HARNESS
 
 _harness = logging.getLogger(HARNESS)
 

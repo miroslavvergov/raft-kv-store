@@ -14,7 +14,7 @@ import shutil
 from typing import NamedTuple
 
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER
-from tests.election_traces.checker import TraceVerdict, check_election_trace
+from tests.traces.checker import TraceVerdict, check_election_trace
 
 HARNESS = "tests.cluster"
 
@@ -222,7 +222,7 @@ def _checker_summary(verdict, negative_control):
 
 
 def _file_name(test_id):
-    """Turn `tests/persistence/test_x.py::test_y[3]` into `persistence.test_x__test_y-3`."""
+    """Turn `tests/node/test_x.py::test_y[3]` into `node.test_x__test_y-3`."""
     path, _, name = test_id.partition("::")
     parts = path.removesuffix(".py").split("/")
     if parts[0] == "tests":

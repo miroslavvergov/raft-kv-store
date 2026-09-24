@@ -6,7 +6,7 @@ REPL-5 through REPL-8, DD-21.
 import pytest
 
 from raftkv.consensus import Log, LogEntry
-from tests.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log, repair
+from tests.support.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log, repair
 
 # --- The consistency check (REPL-5) ---------------------------------------------------
 

@@ -5,7 +5,7 @@ A clean verdict on a real trace therefore means something.
 
 import json
 
-from tests.election_traces.checker import check_election_trace, main
+from tests.traces.checker import check_election_trace, main
 
 
 def node_event(name, *, node, term, vote, role="follower", last_log=(0, 0), msg=None, prop=None):

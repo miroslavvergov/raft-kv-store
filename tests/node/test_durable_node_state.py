@@ -10,10 +10,11 @@ from dataclasses import dataclass
 import pytest
 
 from raftkv.consensus import Cluster, IllegalTransitionError, LogEntry, Role
-from raftkv.persistence import DurableNodeState, SqliteStore
-from tests.append_entries_messages import append_entries
-from tests.divergent_logs import make_log
-from tests.persistence.store_doubles import (
+from raftkv.node import DurableNodeState
+from raftkv.storage import SqliteStore
+from tests.support.append_entries_messages import append_entries
+from tests.support.divergent_logs import make_log
+from tests.support.store_doubles import (
     CommitThenHoldStore,
     FailingStore,
     GatedStore,
@@ -25,7 +26,7 @@ from tests.persistence.store_doubles import (
     term_and_vote_on_disk,
     win_election,
 )
-from tests.vote_messages import granted
+from tests.support.vote_messages import granted
 
 NODE_ID = 7  # IDs from 7 up never look like the small terms and indexes these tests use.
 THREE_NODES = Cluster([7, 8, 9])

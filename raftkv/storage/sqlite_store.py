@@ -7,7 +7,7 @@ from types import TracebackType
 import aiosqlite
 
 from raftkv.consensus import Log, LogEntry
-from raftkv.persistence.persisted_state import PersistedState
+from raftkv.storage.persisted_state import PersistedState
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS node_state (

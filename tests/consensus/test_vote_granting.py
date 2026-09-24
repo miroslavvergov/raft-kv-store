@@ -9,7 +9,7 @@ from collections import defaultdict
 import pytest
 
 from raftkv.consensus import LogPosition, NodeState, Role
-from tests.vote_messages import granted, refused, vote_request
+from tests.support.vote_messages import granted, refused, vote_request
 
 EMPTY_LOG = LogPosition(term=0, index=0)
 
