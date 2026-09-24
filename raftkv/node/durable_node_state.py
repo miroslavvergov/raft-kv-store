@@ -74,6 +74,8 @@ class DurableNodeState:
     AppendEntries (`append_entries_request_for`), and records the answers
     (`handle_append_entries_response`), committing what a majority holds from
     its own term. A Follower answers AppendEntries (`handle_append_entries`).
+    Every node hands its committed commands, in order, to the `apply` callback
+    (`apply_committed`).
 
     Attributes:
         node_id: This node's permanent positive-integer identity.

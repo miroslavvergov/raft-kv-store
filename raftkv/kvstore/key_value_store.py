@@ -1,7 +1,6 @@
 """The KV Store layer's state machine: the commands it builds, and what applying one does."""
 
 import json
-from typing import Any
 
 
 class KeyValueStore:
@@ -69,6 +68,6 @@ class KeyValueStore:
         """Return the value stored under `key`, or None if there is none."""
         return self._values.get(key)
 
-    def as_dict(self) -> dict[str, Any]:
+    def as_dict(self) -> dict[str, str]:
         """Return a copy of the whole map, for comparing replicas."""
         return dict(self._values)
