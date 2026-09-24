@@ -19,6 +19,7 @@ from raftkv.consensus import (
     RequestVoteResponse,
     Role,
 )
+from raftkv.kvstore import KeyValueStore
 from raftkv.persistence import DurableNodeState, SqliteStore
 from tests.divergent_logs import make_log
 from tests.election_traces.recorder import HARNESS
@@ -31,7 +32,7 @@ def trace_step(source, message, *args, event=None):
     """Report one harness step to the election trace, if one is being recorded.
 
     Args:
-        source: "net", "clock", "cmd", "crash", "disk", or "state".
+        source: "net", "clock", "cmd", "apply", "crash", "disk", or "state".
         message: A %-style format string, filled from `args`.
         event: The step as a structured event, for the `.jsonl` trace.
     """
@@ -152,6 +153,8 @@ class InProcessCluster:
         self.leaders_by_term = defaultdict(set)
         self.votes_by_voter_and_term = defaultdict(set)
         self.committed = {}
+        self.applied = {}  # index -> the command the first node seen at that index applied
+        self.kv = {}
         self._stores = {}
         self._check_votes_on_disk = check_votes_on_disk
 
@@ -167,11 +170,18 @@ class InProcessCluster:
             await store.save_term_and_vote(current_term, voted_for)
 
     async def start(self, node_id):
-        """Start a node from its file."""
+        """Start a node from its file, with an empty state machine.
+
+        The state machine is not persisted, so a restart gets a fresh one and rebuilds it by
+        applying the log again (APPLY-4).
+        """
         store = SqliteStore(self.paths[node_id])
         await store.__aenter__()
         self._stores[node_id] = store
-        self.nodes[node_id] = await DurableNodeState.load(node_id, store, self.cluster)
+        self.kv[node_id] = KeyValueStore()
+        self.nodes[node_id] = await DurableNodeState.load(
+            node_id, store, self.cluster, apply=self.kv[node_id].apply
+        )
 
     async def stop(self, node_id):
         """Stop a node, losing everything it holds in memory."""
@@ -423,13 +433,25 @@ class InProcessCluster:
     def assert_log_safety(self):
         """Assert that no committed entry was ever changed or lost.
 
-        Records every node's committed entries the first time they are seen, then asserts: no
-        node commits past the end of its log; every node that has committed an index holds the
-        entry first committed there; and every running Leader whose term is at least the term
-        that entry was first seen committed in holds it. A Leader of an earlier term, and a
-        lagging Follower, may lack an entry committed after them.
+        Records every node's committed and applied entries the first time they are seen, then
+        asserts: no node applies past what it has committed; every node applies the same command
+        at each index (APPLY-4, APPLY-6); no node commits past the end of its log; every node that
+        has committed an index holds the entry first committed there; and every running Leader
+        whose term is at least the term that entry was first seen committed in holds it. A Leader
+        of an earlier term, and a lagging Follower, may lack an entry committed after them.
         """
         for node_id, node in self.nodes.items():
+            assert node.last_applied <= node.commit_index, (
+                f"node {node_id} applied through {node.last_applied} but has only committed "
+                f"{node.commit_index}"
+            )
+            for index in range(1, node.last_applied + 1):
+                command = node.log.entry_at(index).command
+                first = self.applied.setdefault(index, command)
+                assert command == first, (
+                    f"node {node_id} applied {command!r} at index {index}, where {first!r} was "
+                    "applied before"
+                )
             assert node.commit_index <= node.log.last_index, (
                 f"node {node_id} has commit index {node.commit_index} but holds only "
                 f"{node.log.last_index} entries"
@@ -452,6 +474,37 @@ class InProcessCluster:
                     f"leader {node_id} of term {node.current_term} holds {held} at index "
                     f"{index}, where {entry} was committed in term {term}"
                 )
+
+    async def apply_everywhere(self):
+        """Let every running node apply everything it has committed."""
+        for node_id in sorted(self.nodes):
+            await self.apply_on(node_id)
+
+    async def apply_on(self, node_id):
+        """Let one node apply everything it has committed; return how many commands it ran."""
+        applied = await self.nodes[node_id].apply_committed()
+        if applied:
+            trace_step(
+                "apply",
+                "node %d applied %d command(s), through index %d",
+                node_id,
+                applied,
+                self.nodes[node_id].last_applied,
+                event={
+                    "name": "ApplyStep",
+                    "nid": node_id,
+                    "applied": self.nodes[node_id].last_applied,
+                },
+            )
+        self._check_after_step()
+        self._trace_cluster_state()
+        return applied
+
+    def maps(self):
+        """Return each running node's key-value map, by node ID."""
+        return {
+            node_id: store.as_dict() for node_id, store in self.kv.items() if node_id in self.nodes
+        }
 
     def log_terms(self):
         """Return each running node's log as a list of entry terms, by node ID."""

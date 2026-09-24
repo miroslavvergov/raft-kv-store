@@ -22,8 +22,9 @@ _LEGEND = """\
 # Lines marked "raft" are a node's own log, in etcd's raft log format; each
 # starts with the node's ID, and "vote: 0" means no vote cast yet.
 # net = a message delivered, dropped, or duplicated · clock = an election timeout
-# fires · cmd = a client command reaches a node · crash = a node restarts from its
-# file · disk = a vote read back from a node's file · state = every running node
+# fires · cmd = a client command reaches a node · apply = a node applies committed
+# entries to its state machine · crash = a node restarts from its file · disk = a
+# vote read back from a node's file · state = every running node
 # after the step (t = term, v = vote, log = last log index, c = commit index)."""
 
 

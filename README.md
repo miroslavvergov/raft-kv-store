@@ -29,13 +29,15 @@ to see *why* a test passed or failed, not just *that* it did.
   raft uses (`2 [logterm: 0, index: 0, vote: 0] cast RequestVote for 1 ...`;
   `vote: 0` means no vote cast yet), interleaved with what the harness did:
   `net` (a message delivered, dropped, or duplicated), `clock` (an election
-  timeout fires), `cmd` (a client command reaches a node), `crash` (a node
+  timeout fires), `cmd` (a client command reaches a node), `apply` (a node
+  applies committed entries to its state machine), `crash` (a node
   restarts from its file), `disk` (a vote read back from a node's file),
   `state` (every node after the step: role, term, vote, last log index, and
   commit index).
 - `<test>.jsonl` — for tools. The same run as structured events in the shape
   of etcd's `TracingEvent` (`BecomeCandidate`, `ReceiveRequestVoteRequest`,
-  `SendRequestVoteResponse`, `BecomeLeader`, `Replicate`, `Commit`, ...), each
+  `SendRequestVoteResponse`, `BecomeLeader`, `Replicate`, `Commit`, `Apply`, ...),
+  each
   carrying the node's term, vote, role, and last log entry.
 
 Every trace is also re-checked by an independent checker that reads only the
@@ -43,8 +45,10 @@ trace (`tests/election_traces/checker.py`): at most one Leader per term, at
 most one vote per node per term, votes only for up-to-date logs, Leaders only
 with a majority, terms and votes that survive restarts, votes on disk before
 answering, every node committing the same entry at each index, every new
-Leader holding every entry committed in its term or earlier, and commit
-indexes that never go down while a node runs. A passing test whose trace breaks a rule fails at teardown;
+Leader holding every entry committed in its term or earlier, commit indexes
+that never go down while a node runs, and every node applying the same command
+at each index, one index at a time. A passing test whose trace breaks a rule
+fails at teardown;
 tests marked `negative_control` break one on purpose, and the summary at the
 end shows what the checker found in them. To re-check saved traces later:
 
@@ -74,6 +78,11 @@ term, vote, and log in SQLite (persisted before every answer), leader election
 (voting, vote counting, stepping down), and replication: a Leader appends
 client commands and an empty entry on winning, sends each Follower what it
 lacks, backs off on rejection, and commits what a majority holds from its own
-term; a Follower accepts entries and learns the commit index. Not yet built:
-applying committed entries, timers, the HTTP transport, and the key-value
-store.
+term; a Follower accepts entries and learns the commit index. Committed
+entries are applied in order to a key-value state machine, which every node
+rebuilds by replaying its log after a restart, and a Leader knows whether it
+has committed in its own term, the condition a linearizable read waits on.
+Nothing in `raftkv/` drives the applying yet — the tests call it. Not yet
+built: that driver, a `propose()` that waits for commit and apply, a
+`read_barrier()` for linearizable reads, request-ID deduplication, timers, the
+HTTP transport, and the client API.

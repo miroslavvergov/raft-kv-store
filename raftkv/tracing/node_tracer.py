@@ -435,6 +435,29 @@ class NodeTracer:
                 )
         self._emit_commit(before, after)
 
+    def report_apply(
+        self,
+        before: NodeSnapshot,
+        after: NodeSnapshot,
+        *,
+        result: int | None,
+        error: BaseException | None,
+    ) -> None:
+        """Report `apply_committed`: every index the node applied, empty entries included.
+
+        An empty entry takes an index without reaching the state machine, so reporting
+        it keeps a trace's indexes aligned with the log's.
+        """
+        if after.last_applied > before.last_applied:
+            self.emit_event(
+                "Apply",
+                after,
+                properties={
+                    "applied": after.last_applied,
+                    "entries": _entries(after, before.last_applied + 1, after.last_applied),
+                },
+            )
+
     # --- Output -----------------------------------------------------------------------
 
     def emit_line(self, message: str, *args: Any) -> None:

@@ -25,6 +25,7 @@ class NodeSnapshot:
         next_index: Each Follower's next index, while Leader.
         match_index: Each Follower's match index, while Leader.
         commit_index: Its commit index.
+        last_applied: How far its log has been applied.
         log: Its whole log; immutable, so holding it keeps this moment's log.
     """
 
@@ -40,6 +41,7 @@ class NodeSnapshot:
     next_index: dict[int, int] = field(default_factory=dict)
     match_index: dict[int, int] = field(default_factory=dict)
     commit_index: int = 0
+    last_applied: int = 0
     log: Log = field(default_factory=Log)
 
     @classmethod
@@ -66,6 +68,7 @@ class NodeSnapshot:
             next_index={f: leadership.next_index(f) for f in followers},
             match_index={f: leadership.match_index(f) for f in followers},
             commit_index=node.commit_index,
+            last_applied=node.last_applied,
             log=node.log,
         )
 

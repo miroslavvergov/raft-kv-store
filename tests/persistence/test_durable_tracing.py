@@ -10,7 +10,7 @@ import pytest
 from raftkv.consensus import Cluster, Log, LogEntry, NodeState, Role
 from raftkv.persistence import DurableNodeState, SqliteStore
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER, NodeSnapshot
-from tests.append_entries_messages import accepted, append_entries, rejected
+from tests.append_entries_messages import accepted, append_entries, heartbeat, rejected
 from tests.election_traces.checker import check_election_trace
 from tests.persistence.store_doubles import FailingStore, GatedStore, seed_log, win_election
 from tests.vote_messages import granted, refused, vote_request
@@ -613,3 +613,25 @@ async def test_a_rejection_that_lowered_nothing_is_reported_as_ignored(db_path, 
     assert (
         log_lines(tracing_on)[-1] == "7 ignored MsgAppResp(rejected) from 9 for index 2 [next = 2]"
     )
+
+
+async def test_each_apply_reports_one_event_naming_only_the_entries_it_advanced_past(
+    db_path, tracing_on
+):
+    # The checker's rule about applying in order reads these events, so a trace that reported
+    # the wrong indexes, or none, would disarm it without any test noticing.
+    async with SqliteStore(db_path) as store:
+        await store.replace_log_from(1, [LogEntry(term=1, command=c) for c in ("", "a", "b")])
+        durable = await DurableNodeState.load(
+            NODE_ID, store, THREE_NODES, apply=lambda command: None
+        )
+        for commit in (2, 3):
+            await durable.handle_append_entries(
+                heartbeat(term=1, leader=8, prev_log_index=3, prev_log_term=1, commit=commit)
+            )
+            await durable.apply_committed()
+
+    assert [e["prop"] for e in trace_events(tracing_on) if e["name"] == "Apply"] == [
+        {"applied": 2, "entries": [[1, 1, ""], [2, 1, "a"]]},
+        {"applied": 3, "entries": [[3, 1, "b"]]},
+    ]

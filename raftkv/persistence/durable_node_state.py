@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import functools
+import inspect
 from collections.abc import Awaitable, Callable, Coroutine
 from typing import Any
 
@@ -84,6 +85,11 @@ class DurableNodeState:
         commit_index: The highest log index known to be committed; 0 after a
             restart, since it is never persisted and a Leader's next AppendEntries
             restores it (REPL-13).
+        last_applied: The highest log index applied; 0 after a restart, since the
+            state machine is rebuilt by applying the log again. An empty entry
+            advances it without reaching the state machine (DD-26).
+        has_committed_in_current_term: Whether an entry of the current term is
+            committed, which a Leader must have before answering a read (CLIENT-10).
         peers: The IDs of every other cluster member.
         candidacy: The current term's vote tally while Candidate; else None.
         leadership: The current term's Follower progress while Leader; else
@@ -91,7 +97,14 @@ class DurableNodeState:
     """
 
     @traced(NodeTracer.report_started)
-    def __init__(self, state: NodeState, log: Log, store: SqliteStore, cluster: Cluster) -> None:
+    def __init__(
+        self,
+        state: NodeState,
+        log: Log,
+        store: SqliteStore,
+        cluster: Cluster,
+        apply: Callable[[str], Any] | None = None,
+    ) -> None:
         """Wrap a state and log that already equal what `store` holds.
 
         Not checked; `load` builds one from a store and guarantees it.
@@ -101,10 +114,20 @@ class DurableNodeState:
             log: The node's log.
             store: The open store holding the persisted copy of both.
             cluster: The cluster this node is a member of.
+            apply: The KV Store layer's callback for one committed command (DD-12);
+                without it `apply_committed` refuses to pass a command on. It runs
+                under the node's lock, so it must not call back into this node, and
+                must apply the command or raise, never partly apply it and raise.
 
         Raises:
             ValueError: If this node is not a member of `cluster`.
+            TypeError: If `apply` is a coroutine function. It would be called and
+                its coroutine dropped unawaited, advancing `last_applied` past
+                entries the state machine never saw; and awaiting it under the
+                node's lock could only deadlock.
         """
+        if inspect.iscoroutinefunction(apply):
+            raise TypeError("the apply callback must be synchronous, not a coroutine function")
         self._state = state
         self._log = log
         self._store = store
@@ -113,13 +136,23 @@ class DurableNodeState:
         # NOTE: commitment is not persisted, so a restarted node starts at 0 and relearns it
         # from the Leader; nothing is lost, since an entry's durability is the log's job.
         self._commit_index = 0
+        # NOTE: like the commit index, how far the log has been applied is not persisted: a
+        # restarted node rebuilds its state machine by applying the log again from the start.
+        self._last_applied = 0
+        self._apply = apply
         self._candidacy: Candidacy | None = None
         self._leadership: Leadership | None = None
         self._lock = asyncio.Lock()
         self._align_role_records()
 
     @classmethod
-    async def load(cls, node_id: int, store: SqliteStore, cluster: Cluster) -> "DurableNodeState":
+    async def load(
+        cls,
+        node_id: int,
+        store: SqliteStore,
+        cluster: Cluster,
+        apply: Callable[[str], Any] | None = None,
+    ) -> "DurableNodeState":
         """Rebuild a node from `store`, as a Follower (STATE-2).
 
         Reloads term, vote, and log (PERSIST-4, PERSIST-5, PERSIST-6); the node
@@ -130,6 +163,9 @@ class DurableNodeState:
             node_id: This node's permanent positive-integer identity.
             store: The node's open store.
             cluster: The cluster this node is a member of.
+            apply: The KV Store layer's callback for one committed command (DD-12).
+                It must belong to a state machine holding nothing yet: nothing is
+                applied here, so the caller applies the whole log from index 1.
 
         Returns:
             The node, ready to accept or issue RPCs.
@@ -139,7 +175,7 @@ class DurableNodeState:
         """
         persisted = await store.load()
         state = NodeState.reloaded(node_id, persisted.current_term, persisted.voted_for)
-        return cls(state, persisted.log, store, cluster)
+        return cls(state, persisted.log, store, cluster, apply)
 
     @property
     def node_id(self) -> int:
@@ -164,6 +200,20 @@ class DurableNodeState:
     @property
     def commit_index(self) -> int:
         return self._commit_index
+
+    @property
+    def last_applied(self) -> int:
+        return self._last_applied
+
+    @property
+    def has_committed_in_current_term(self) -> bool:
+        """Whether the entry at `commit_index` is from the current term (CLIENT-10, DD-26).
+
+        Terms never fall along a log, so if any current-term entry is committed then
+        the entry at `commit_index` is one too, and checking that one index is enough.
+        Only meaningful on a Leader, which answers no read until this holds.
+        """
+        return self._commit_index > 0 and self._log.term_at(self._commit_index) == self.current_term
 
     @property
     def peers(self) -> frozenset[int]:
@@ -513,6 +563,41 @@ class DurableNodeState:
         if counted:
             self._advance_commit_index()
         return False
+
+    @_holding_the_lock
+    @traced(NodeTracer.report_apply)
+    async def apply_committed(self) -> int:
+        """Apply every committed entry not yet applied, in order; return how many carried a command.
+
+        Walks from `last_applied + 1` to `commit_index` and applies each entry
+        exactly once, in log order (APPLY-4), never reaching past what is committed
+        (APPLY-5). A new Leader's empty entry carries no command, so it advances
+        `last_applied` without reaching the state machine (DD-26). Applying changes
+        nothing on disk: the state machine is rebuilt from the log after a restart.
+
+        Returns:
+            How many commands were handed to the state machine; empty entries are
+            not counted.
+
+        Raises:
+            RuntimeError: If an entry carries a command and no callback was given.
+                No command is applied; `last_applied` stops at the entry before it.
+            Exception: Whatever the callback raised. `last_applied` stops at the
+                entry before the one that failed, so the same entry is retried.
+        """
+        applied = 0
+        while self._last_applied < self._commit_index:
+            entry = self._log.entry_at(self._last_applied + 1)
+            if not entry.is_empty:
+                if self._apply is None:
+                    raise RuntimeError(
+                        f"node {self.node_id} has no state machine to apply "
+                        f"index {self._last_applied + 1} to"
+                    )
+                self._apply(entry.command)
+                applied += 1
+            self._last_applied += 1
+        return applied
 
     async def _persist_then_install_append_entries(
         self, next_state: NodeState, next_log: Log | None

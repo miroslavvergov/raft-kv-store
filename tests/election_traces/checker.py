@@ -20,6 +20,8 @@ It reads only the nodes' trace events and the harness's disk checks, and imports
    term has committed, which legitimately elects a Leader that is behind.
 9. A node's commit index never goes down while it runs; a restart resets it, as it is not
    persisted.
+10. Every node applies the same command at each index, one index at a time with no gaps; a
+   restart resets the count, as the state machine is rebuilt from the log (APPLY-4, APPLY-6).
 
 Run on a directory of traces: `python -m tests.election_traces.checker test-traces/elections`.
 """
@@ -75,6 +77,8 @@ def check_election_trace(entries):
     last_term_and_vote = {}
     committed = {}  # index -> (entry term, command, the node and term that first committed it)
     last_commit = {}  # node -> its commit index since it last started
+    applied = {}  # index -> (command, the first node seen applying it)
+    last_applied = {}  # node -> how far it has applied since it last started
 
     for entry in entries:
         event = entry.get("event")
@@ -121,6 +125,7 @@ def check_election_trace(entries):
         if name == "InitState":
             peers[node] = event.get("prop", {}).get("peers", [])
             last_commit[node] = 0  # rule 9: commitment is relearned after every start
+            last_applied[node] = 0  # rule 10: the state machine is rebuilt from the log
         elif name == "Commit":
             commit = event["prop"]["commit"]
             if commit < last_commit.get(node, 0):  # rule 9
@@ -135,6 +140,23 @@ def check_election_trace(entries):
                         f"node {node} committed (term {entry_term}, {command!r}) at index "
                         f"{index}, but node {first[2]} committed (term {first[0]}, "
                         f"{first[1]!r}) there"
+                    )
+        elif name == "Apply":
+            for index, _entry_term, command in event["prop"]["entries"]:  # rule 10
+                expected = last_applied.get(node, 0) + 1
+                if index != expected:
+                    verdict.problems.append(
+                        f"node {node} applied index {index} when it should have applied "
+                        f"{expected} next"
+                    )
+                # NOTE: the high-water mark, not the index just seen, so one replayed event
+                # cannot resync the check and hide the ones after it.
+                last_applied[node] = max(index, last_applied.get(node, 0))
+                first = applied.setdefault(index, (command, node))
+                if command != first[0]:
+                    verdict.problems.append(
+                        f"node {node} applied {command!r} at index {index}, but node {first[1]} "
+                        f"applied {first[0]!r} there"
                     )
         elif name == "ReceiveRequestVoteRequest":
             requests_seen[(node, msg["from"], msg["term"])] = (msg["logTerm"], msg["index"])

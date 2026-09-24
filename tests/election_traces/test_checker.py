@@ -554,3 +554,88 @@ def test_a_leader_of_an_earlier_term_missing_an_old_entry_committed_later_is_not
         *leader_starts_and_wins(1, term=2, log=[], peers=(2, 3)),
     ]
     assert not [p for p in check_election_trace(entries).problems if "holding" in p]
+
+
+# --- Rule 10: every node applies the same commands, in order, with no gaps -------------
+
+
+def apply_event(node, *, term, entries, role="follower"):
+    """Return a node's Apply entry; `entries` are the newly applied `[index, term, command]`."""
+    return node_event(
+        "Apply",
+        node=node,
+        term=term,
+        vote=None,
+        role=role,
+        prop={"applied": entries[-1][0], "entries": entries},
+    )
+
+
+def test_nodes_applying_the_same_commands_in_the_same_order_break_no_rule():
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        node_starts(2, peers=[1, 3]),
+        apply_event(1, term=1, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        apply_event(2, term=1, entries=[[1, 1, ""]]),
+        apply_event(2, term=1, entries=[[2, 1, "x=5"]]),
+    ]
+    assert check_election_trace(entries).problems == []
+
+
+def test_two_nodes_applying_different_commands_at_one_index_is_flagged():
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        node_starts(2, peers=[1, 3]),
+        apply_event(1, term=1, entries=[[1, 1, "x=5"]], role="leader"),
+        apply_event(2, term=1, entries=[[1, 1, "x=6"]]),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 2 applied 'x=6' at index 1, but node 1 applied 'x=5' there"
+    ]
+
+
+def test_skipping_an_index_when_applying_is_flagged():
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        apply_event(1, term=1, entries=[[1, 1, "a"], [3, 1, "c"]], role="leader"),
+    ]
+    assert "node 1 applied index 3 when it should have applied 2 next" in (
+        check_election_trace(entries).problems
+    )
+
+
+def test_applying_an_index_twice_is_flagged():
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        apply_event(1, term=1, entries=[[1, 1, "a"]], role="leader"),
+        apply_event(1, term=1, entries=[[1, 1, "a"]], role="leader"),
+    ]
+    assert "node 1 applied index 1 when it should have applied 2 next" in (
+        check_election_trace(entries).problems
+    )
+
+
+def test_a_restarted_node_applying_from_index_one_again_is_not_flagged():
+    # The state machine is not persisted, so a restart replays the whole log.
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        apply_event(1, term=1, entries=[[1, 1, "a"], [2, 1, "b"]], role="leader"),
+        node_starts(1, peers=[2, 3], term=1),
+        apply_event(1, term=1, entries=[[1, 1, "a"], [2, 1, "b"]]),
+    ]
+    assert check_election_trace(entries).problems == []
+
+
+def test_replaying_an_old_index_does_not_lower_what_the_checker_expects_next():
+    # The high-water mark means a second replay is flagged too, rather than the checker
+    # quietly resyncing to the replayed index and missing it.
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        apply_event(1, term=1, entries=[[1, 1, "a"], [2, 1, "b"], [3, 1, "c"]], role="leader"),
+        apply_event(1, term=1, entries=[[2, 1, "b"]], role="leader"),
+        apply_event(1, term=1, entries=[[3, 1, "c"]], role="leader"),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 1 applied index 2 when it should have applied 4 next",
+        "node 1 applied index 3 when it should have applied 4 next",
+    ]
