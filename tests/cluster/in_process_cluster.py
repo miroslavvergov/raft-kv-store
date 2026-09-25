@@ -24,21 +24,9 @@ from raftkv.node import DurableNodeState
 from raftkv.storage import SqliteStore
 from tests.support.divergent_logs import make_log
 from tests.support.store_doubles import reload
-from tests.traces.recorder import HARNESS
+from tests.traces.recorder import HARNESS, trace_step
 
 _harness = logging.getLogger(HARNESS)
-
-
-def trace_step(source, message, *args, event=None):
-    """Report one harness step to the election trace, if one is being recorded.
-
-    Args:
-        source: "net", "clock", "cmd", "apply", "crash", "disk", or "state".
-        message: A %-style format string, filled from `args`.
-        event: The step as a structured event, for the `.jsonl` trace.
-    """
-    if _harness.isEnabledFor(logging.INFO):
-        _harness.info(message, *args, extra={"trace_source": source, "trace_event": event})
 
 
 @dataclass(frozen=True)
@@ -346,7 +334,7 @@ class InProcessCluster:
     # --- Replication -------------------------------------------------------------------
 
     async def append_command(self, leader, command):
-        """Have `leader` append a client command to its log; return the entry's index."""
+        """Have `leader` append a client command to its log; return the entry's position."""
         trace_step(
             "cmd",
             "a client asks node %d to store %r",
@@ -354,10 +342,10 @@ class InProcessCluster:
             command,
             event={"name": "ClientCommand", "nid": leader, "command": command},
         )
-        index = await self.nodes[leader].append_command(command)
+        position = await self.nodes[leader].append_command(command)
         self._check_after_step()
         self._trace_cluster_state()
-        return index
+        return position
 
     async def send_append_entries(self, leader, follower):
         """Put `leader`'s current AppendEntries for `follower` in flight; return the message."""

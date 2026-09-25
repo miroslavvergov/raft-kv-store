@@ -2,7 +2,7 @@
 
 This is what the rest of the system exists to provide: a command a client gives one node is
 committed, applied on every node in the same order, and survives crashes and leader changes.
-APPLY-4, APPLY-5, APPLY-6, APPLY-7, DD-12, DD-26.
+APPLY-4, APPLY-5, APPLY-6, APPLY-7, DD-12, DD-26, DD-28.
 """
 
 import pathlib
@@ -147,10 +147,12 @@ def test_the_raft_layer_never_imports_the_kv_layer():
     # DD-12: the Raft layers reach the state machine only through the callback they were
     # handed, so none may import the KV Store layer.
     root = pathlib.Path(__file__).resolve().parents[2] / "raftkv"
+    raft_packages = [p for p in root.iterdir() if p.is_dir() and (p / "__init__.py").exists()]
     offenders = [
         f"{source.relative_to(root.parent)}: {line.strip()}"
-        for package in ("consensus", "node", "storage", "tracing")
-        for source in (root / package).glob("*.py")
+        for package in raft_packages
+        if package.name != "kvstore"
+        for source in package.glob("*.py")
         for line in source.read_text().splitlines()
         if line.startswith(("import ", "from ")) and "kvstore" in line
     ]

@@ -1,6 +1,7 @@
 """Tier 2 tests for both sides of RequestVote through DurableNodeState.
 
-DD-8, DD-18, DD-19, DD-22. No request or answer exists until its term and vote are on disk.
+ELECT-3 through ELECT-11, DD-8, DD-18, DD-19, DD-22. No request or answer exists until its term
+and vote are on disk.
 """
 
 import asyncio
@@ -17,6 +18,7 @@ from tests.support.store_doubles import (
     RecordingStore,
     let_other_tasks_run,
     seed_log,
+    seed_term_and_vote,
     term_and_vote_on_disk,
     win_election,
 )
@@ -32,10 +34,11 @@ FIVE_NODES = Cluster([7, 8, 9, 10, 11])
 
 async def test_the_request_carries_the_new_term_and_the_last_log_entry(db_path):
     await seed_log(db_path, [1, 1, 2])
+    await seed_term_and_vote(db_path, 2)
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
         request = await durable.start_election()
-    assert request == vote_request(term=1, candidate=NODE_ID, last_log_term=2, last_log_index=3)
+    assert request == vote_request(term=3, candidate=NODE_ID, last_log_term=2, last_log_index=3)
 
 
 async def test_the_request_does_not_exist_until_the_self_vote_is_on_disk(db_path):
@@ -117,11 +120,23 @@ async def test_a_node_outside_the_cluster_cannot_be_loaded(db_path):
             await DurableNodeState.load(NODE_ID, store, Cluster([1, 2, 3]))
 
 
+async def test_an_election_no_longer_due_once_the_lock_is_held_changes_nothing(db_path):
+    # The caller's own check runs under the lock, before anything is decided or written.
+    async with RecordingStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+
+        assert await durable.start_election(still_due=lambda: False) is None
+
+        assert (durable.role, durable.current_term, durable.voted_for) == (Role.FOLLOWER, 0, None)
+        assert store.writes == []
+
+
 # --- The Candidate's side: counting answers (ELECT-11, REPL-14, REPL-15) --------------
 
 
 async def test_winning_starts_a_fresh_leadership_for_every_peer(db_path):
     await seed_log(db_path, [1, 1, 2])
+    await seed_term_and_vote(db_path, 2)
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
         request = await durable.start_election()
@@ -257,15 +272,15 @@ async def test_the_answer_does_not_exist_until_the_vote_is_on_disk(db_path):
 async def test_answers_that_change_nothing_write_nothing(db_path):
     async with RecordingStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
-        await durable.handle_vote_request(vote_request(term=1, candidate=8))
+        await durable.handle_vote_request(vote_request(term=2, candidate=8))
         writes_before = list(store.writes)
 
-        repeat = vote_request(term=1, candidate=8)
-        rival = vote_request(term=1, candidate=9)
-        stale = vote_request(term=0, candidate=9)
-        assert await durable.handle_vote_request(repeat) == granted(term=1)
-        assert await durable.handle_vote_request(rival) == refused(term=1)
-        assert await durable.handle_vote_request(stale) == refused(term=1)
+        repeat = vote_request(term=2, candidate=8)
+        rival = vote_request(term=2, candidate=9)
+        stale = vote_request(term=1, candidate=9)
+        assert await durable.handle_vote_request(repeat) == granted(term=2)
+        assert await durable.handle_vote_request(rival) == refused(term=2)
+        assert await durable.handle_vote_request(stale) == refused(term=2)
         assert store.writes == writes_before
 
 

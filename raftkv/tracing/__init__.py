@@ -3,7 +3,7 @@
 `traced` wraps node methods from outside, so the logic holds no tracing
 code; `NodeTracer` derives what to report from the state before and after
 each call and emits it through `logging`. Nothing is emitted unless those
-loggers are enabled. Import from `raftkv.tracing`, never its submodules.
+loggers are enabled. Import from `raftkv.tracing`, never from its submodules.
 """
 
 from raftkv.tracing.node_snapshot import NodeSnapshot

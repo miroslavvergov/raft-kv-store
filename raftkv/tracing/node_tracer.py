@@ -1,11 +1,13 @@
 """How a node reports itself: etcd-format log lines and trace events derived from its state."""
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from raftkv.consensus import (
     AppendEntriesRequest,
     AppendEntriesResponse,
+    LogPosition,
     RequestVoteRequest,
     RequestVoteResponse,
     Role,
@@ -54,7 +56,7 @@ class NodeTracer:
         """Whether either log lines or trace events would be emitted."""
         return _line_logger.isEnabledFor(logging.INFO) or _event_logger.isEnabledFor(logging.DEBUG)
 
-    # --- Reports: one per traced DurableNodeState method -------------------------
+    # --- Reports: one per traced DurableNodeState method ------------------------------
 
     def report_started(self, after: NodeSnapshot) -> None:
         """Report a node just built from its persisted state: etcd's InitState."""
@@ -72,6 +74,7 @@ class NodeTracer:
         self,
         before: NodeSnapshot,
         after: NodeSnapshot,
+        still_due: Callable[[], bool] | None,
         *,
         result: RequestVoteRequest | None,
         error: BaseException | None,
@@ -338,7 +341,7 @@ class NodeTracer:
         after: NodeSnapshot,
         command: str,
         *,
-        result: int | None,
+        result: LogPosition | None,
         error: BaseException | None,
     ) -> None:
         """Report `append_command`: the entry the Leader appended, and a commit it made.
@@ -435,10 +438,11 @@ class NodeTracer:
                 )
         self._emit_commit(before, after)
 
-    def report_apply(
+    def report_apply_committed(
         self,
         before: NodeSnapshot,
         after: NodeSnapshot,
+        max_entries: int | None,
         *,
         result: int | None,
         error: BaseException | None,

@@ -74,6 +74,6 @@ def repair(leader_log: Log, follower_log: Log) -> Repair:
             progress.record_success(prev_log_index, len(entries))
             repaired_log = follower_log.after_append_entries(prev_log_index, entries)
             return Repair(progress, rejections, prev_log_index, repaired_log)
-        progress.record_rejection()
+        progress.record_rejection(prev_log_index)
         rejections += 1
         assert rejections <= leader_log.last_index, "never reached an index where the logs agree"

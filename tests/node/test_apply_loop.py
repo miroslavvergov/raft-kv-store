@@ -2,7 +2,8 @@
 
 APPLY-4 (strictly in log order), APPLY-5 (never past what is committed), DD-12 (the KV Store
 layer is reached only through the callback), DD-26 (a Leader's empty entry is not a command),
-CLIENT-10 (a Leader must have committed an entry of its own term before it may answer a read).
+DD-28 (applying is volatile, synchronous, and rebuilt by replay), CLIENT-10 (a Leader must have
+committed an entry of its own term before it may answer a read).
 """
 
 import pytest
@@ -72,6 +73,20 @@ async def test_nothing_past_the_commit_index_is_applied(db_path):
 
         assert recorder.applied == ["a", "b"]
         assert (durable.last_applied, durable.commit_index) == (2, 2)
+
+
+async def test_a_limited_call_applies_at_most_that_many_entries(db_path):
+    recorder = RecordingStateMachine()
+    async with SqliteStore(db_path) as store:
+        durable = await follower_with(store, recorder)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=command_entries("a", "b", "c"), leader_commit=3)
+        )
+
+        assert await durable.apply_committed(max_entries=2) == 2
+        assert recorder.applied == ["a", "b"]
+        assert await durable.apply_committed(max_entries=2) == 1
+        assert recorder.applied == ["a", "b", "c"]
 
 
 async def test_a_later_commit_applies_only_what_is_newly_committed(db_path):

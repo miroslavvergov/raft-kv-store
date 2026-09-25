@@ -38,8 +38,8 @@ def commit_indexes(cluster):
 
 
 async def test_a_command_is_replicated_to_every_node_and_committed(three_nodes):
-    index = await three_nodes.append_command(1, "x=5")
-    assert index == 2  # after node 1's empty entry
+    position = await three_nodes.append_command(1, "x=5")
+    assert position.index == 2  # after node 1's empty entry
 
     await three_nodes.replicate_to_all(1)
 
@@ -66,7 +66,7 @@ async def test_commands_are_committed_on_every_node_in_the_order_they_were_appen
 async def test_a_single_node_cluster_commits_each_command_at_once(start_cluster):
     cluster = await start_cluster([1])
     await cluster.fire_election_timeout(1)
-    assert await cluster.append_command(1, "x=5") == 2
+    assert (await cluster.append_command(1, "x=5")).index == 2
     assert cluster.nodes[1].commit_index == 2
 
 

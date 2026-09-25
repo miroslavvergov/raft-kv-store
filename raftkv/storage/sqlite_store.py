@@ -61,7 +61,8 @@ class SqliteStore:
         """Open the file with `synchronous = FULL` and create the schema if missing.
 
         A new file gets its `node_state` row at term 0 with no vote, where a
-        brand-new node starts (STATE-2); an existing row is left untouched.
+        brand-new node starts (PERSIST-4, PERSIST-5); an existing row is left
+        untouched.
 
         Returns:
             This store, ready for reads and writes.
@@ -90,9 +91,9 @@ class SqliteStore:
 
         One atomic update of the `node_state` row (PERSIST-1, PERSIST-2), returning
         only after the commit, so awaiting it before answering an RPC persists
-        before responding. Used for every term or vote change: becoming Candidate
-        (ELECT-3, ELECT-4), catching up to a higher term (STATE-5, STATE-6), and
-        granting a vote.
+        before responding. Used when only the term or vote changes: becoming
+        Candidate (ELECT-3, ELECT-4), catching up to a higher term (STATE-5,
+        STATE-6), or granting a vote.
 
         Args:
             current_term: The term to persist.

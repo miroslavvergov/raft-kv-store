@@ -21,7 +21,7 @@ class Leadership:
     because a delayed request can come back rejected with the current term on
     it. The Follower records are private, and only `record_success` and
     `record_rejection` change them, after that check, so no caller can count a
-    stale reply. The caller handles a higher term in a reply with
+    stale reply or back off twice for one probe. The caller handles a higher term in a reply with
     `NodeState.handle_observed_term`.
 
     Attributes:
@@ -100,20 +100,23 @@ class Leadership:
         self._progress[follower].record_success(prev_log_index, entry_count)
         return True
 
-    def record_rejection(self, follower: int, sent_in_term: int) -> bool:
+    def record_rejection(self, follower: int, sent_in_term: int, prev_log_index: int) -> bool:
         """Record a Follower's AppendEntries rejection, if the RPC was sent in this term.
 
         A reply to an RPC from any other term is ignored before the Follower is
-        looked up (DD-25). Otherwise only that Follower changes: its `next_index`
-        drops by one (REPL-6), never to `match_index` or below. Resending from the
-        lower `next_index` (REPL-7) is the caller's job.
+        looked up (DD-25). Otherwise only that Follower changes, and only if the
+        rejection answers the probe now outstanding: its `next_index` drops by one
+        (REPL-6, DD-27), never to `match_index` or below. Resending from the lower
+        `next_index` (REPL-7) is the caller's job.
 
         Args:
             follower: The ID of the Follower that replied.
             sent_in_term: The term the rejected RPC was sent in.
+            prev_log_index: The rejected RPC's `prev_log_index`.
 
         Returns:
-            True if counted; False if ignored as sent in another term.
+            True if the Follower's `next_index` was lowered; False if the reply was
+            ignored or `next_index` is already at its floor.
 
         Raises:
             KeyError: If `sent_in_term` is this term but `follower` is not one of
@@ -121,8 +124,7 @@ class Leadership:
         """
         if sent_in_term != self._term:
             return False
-        self._progress[follower].record_rejection()
-        return True
+        return self._progress[follower].record_rejection(prev_log_index)
 
     def append_entries_request_for(
         self, follower: int, log: Log, leader_id: int, commit_index: int

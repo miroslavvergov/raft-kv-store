@@ -36,7 +36,7 @@ def traced(report: Callable[..., None]) -> Callable[[Callable[..., Any]], Callab
         The decorator.
 
     Raises:
-        TypeError: When the decorator is applied to a synchronous method other
+        TypeError: If the decorator is applied to a synchronous method other
             than `__init__`.
     """
 

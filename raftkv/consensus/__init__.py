@@ -1,7 +1,6 @@
 """Public API of the pure Raft consensus core: no I/O, asyncio, or persistence.
 
-Import from `raftkv.consensus`, never from its submodules, so their layout
-can change without breaking other layers.
+Import from `raftkv.consensus`, never from its submodules.
 """
 
 from raftkv.consensus.append_entries import AppendEntriesRequest, AppendEntriesResponse

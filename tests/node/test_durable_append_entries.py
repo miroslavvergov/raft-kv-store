@@ -2,7 +2,7 @@
 
 The term decision and the log change happen in one lock hold, and whatever they change is on
 disk before the answer exists. REPL-5, REPL-8, REPL-13, STATE-4, STATE-5, STATE-6, STATE-7,
-PERSIST-1, PERSIST-2, PERSIST-3, DD-7, DD-8.
+PERSIST-1, PERSIST-2, PERSIST-3, DD-7, DD-8, DD-22, DD-28, DD-29.
 """
 
 import asyncio

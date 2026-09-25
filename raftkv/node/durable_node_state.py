@@ -16,6 +16,7 @@ from raftkv.consensus import (
     Leadership,
     Log,
     LogEntry,
+    LogPosition,
     NodeState,
     NotLeaderError,
     RequestVoteRequest,
@@ -86,8 +87,9 @@ class DurableNodeState:
             None.
         log: The log, as last persisted.
         commit_index: The highest log index known to be committed; 0 after a
-            restart, since it is never persisted and a Leader's next AppendEntries
-            restores it (REPL-13).
+            restart, since it is never persisted (DD-28): a Follower relearns it
+            from the Leader's next AppendEntries (REPL-13), and a new Leader by
+            committing its empty entry.
         last_applied: The highest log index applied; 0 after a restart, since the
             state machine is rebuilt by applying the log again. An empty entry
             advances it without reaching the state machine (DD-26).
@@ -124,10 +126,9 @@ class DurableNodeState:
 
         Raises:
             ValueError: If this node is not a member of `cluster`.
-            TypeError: If `apply` is a coroutine function. It would be called and
-                its coroutine dropped unawaited, advancing `last_applied` past
-                entries the state machine never saw; and awaiting it under the
-                node's lock could only deadlock.
+            TypeError: If `apply` is a coroutine function: its coroutine would never
+                be awaited, and `last_applied` would pass entries the state machine
+                never saw (DD-28).
         """
         if inspect.iscoroutinefunction(apply):
             raise TypeError("the apply callback must be synchronous, not a coroutine function")
@@ -232,7 +233,9 @@ class DurableNodeState:
 
     @_holding_the_lock
     @traced(NodeTracer.report_start_election)
-    async def start_election(self) -> RequestVoteRequest:
+    async def start_election(
+        self, still_due: Callable[[], bool] | None = None
+    ) -> RequestVoteRequest | None:
         """Become Candidate in a new term, persist it, and return the RequestVote to send.
 
         Applies `NodeState.become_candidate` (STATE-3, ELECT-3, ELECT-4), persists
@@ -244,8 +247,15 @@ class DurableNodeState:
         install, even if the caller is cancelled, then appends its empty entry,
         which commits at once; the request has no one to go to.
 
+        Args:
+            still_due: Asked once the lock is held, before anything changes; if it
+                returns False, no election starts. It lets a caller whose timeout
+                fired while another call held the lock skip an election that call
+                made unnecessary, such as hearing from the Leader (ELECT-2).
+
         Returns:
-            The RequestVote to send to every peer (ELECT-6).
+            The RequestVote to send to every peer (ELECT-6), or None if `still_due`
+            returned False.
 
         Raises:
             IllegalTransitionError: If the node is Leader. Nothing changes.
@@ -259,6 +269,8 @@ class DurableNodeState:
                 Leader is left without its empty entry; cancelled during the empty
                 entry's write, the entry is installed but not committed.
         """
+        if still_due is not None and not still_due():
+            return None
         next_state = copy.copy(self._state)
         next_state.become_candidate()
         # NOTE: in a one-node cluster the self-vote is already a majority and no answer will
@@ -409,9 +421,10 @@ class DurableNodeState:
 
         Whatever changed among term, vote, and log is persisted before the answer
         exists (PERSIST-1, PERSIST-2, PERSIST-3), both together in one transaction.
-        The term check and the log change share this one lock hold on purpose:
-        between two separate hooks a newer term could arrive, and the entries of a
-        deposed Leader would still be written under it.
+        The term check and the log change share one lock hold, so no newer term
+        can arrive between them and have a deposed Leader's entries written under
+        it. An RPC that would change an entry at or below `commit_index` is
+        refused before anything is written (DD-29).
 
         Args:
             request: The Leader's AppendEntries.
@@ -464,18 +477,20 @@ class DurableNodeState:
 
     @_holding_the_lock
     @traced(NodeTracer.report_append_command)
-    async def append_command(self, command: str) -> int:
+    async def append_command(self, command: str) -> LogPosition:
         """Append a client command to this Leader's log, persisted before returning (REPL-1).
 
         The entry takes the current term. Returns once it is on disk, not once it
-        is committed; waiting for that is the caller's. In a single-node cluster
-        the Leader alone is a majority, so the entry commits at once (APPLY-1).
+        is committed; waiting for that is the caller's, and the position returned
+        tells it apart from any other entry a later Leader puts at the same index.
+        In a single-node cluster the Leader alone is a majority, so the entry
+        commits at once (APPLY-1).
 
         Args:
             command: The command, serialized once by the KV Store layer (DD-21).
 
         Returns:
-            The entry's 1-based log index.
+            The entry's term and 1-based index.
 
         Raises:
             NotLeaderError: If the node is not Leader (CLIENT-6). Nothing changes.
@@ -483,8 +498,8 @@ class DurableNodeState:
             ValueError: If `command` is empty, which marks a new Leader's empty entry.
             sqlite3.Error: If the write fails. Nothing changes.
             asyncio.CancelledError: If the caller was cancelled during the write;
-                raised after the entry is persisted and installed, with
-                `commit_index` not advanced.
+                raised after the entry is persisted and installed and the commit
+                index advanced.
         """
         # NOTE: checked before the entry is built: a node that never led may be at term 0,
         # which no entry can carry.
@@ -535,8 +550,8 @@ class DurableNodeState:
         3. A success raises the Follower's `match_index` to the last entry `request`
            carried (REPL-16, REPL-17), then advances `commit_index` (APPLY-1,
            APPLY-2, APPLY-3). A rejection of the probe now outstanding lowers its
-           `next_index` (REPL-6); a duplicate or a late rejection of an earlier
-           probe changes nothing (FAIL-1).
+           `next_index` (REPL-6, DD-27); a duplicate or a late rejection of an
+           earlier probe changes nothing (FAIL-1).
 
         Args:
             follower: The Follower that answered.
@@ -544,10 +559,9 @@ class DurableNodeState:
             response: Its answer.
 
         Returns:
-            True if a rejection lowered the Follower's `next_index` to at or below
-            `request.prev_log_index`, so a resend reaches further back (REPL-7);
-            False otherwise, including a rejection of a request with
-            `prev_log_index` 0, where nothing earlier is left to send.
+            True if a rejection lowered the Follower's `next_index`, so a resend
+            reaches further back (REPL-7); False otherwise, including at the floor,
+            `match_index + 1`, where a resend would repeat the rejected request.
 
         Raises:
             KeyError: If the node is Leader, `request` was sent in its term, and
@@ -563,19 +577,7 @@ class DurableNodeState:
         if self._leadership is None:
             return False
         if not response.success:
-            # NOTE: kept although `record_rejection` re-checks the term: it guards the
-            # `next_index` lookup below, which has none, so an answer from a non-member is a
-            # KeyError only when it answers this term's request.
-            if request.term != self._leadership.term:
-                return False
-            # NOTE: only the probe now outstanding is backed off from, so a duplicate or a
-            # late rejection of an earlier probe leaves `next_index` where it is (FAIL-1).
-            if self._leadership.next_index(follower) != request.prev_log_index + 1:
-                return False
-            self._leadership.record_rejection(follower, request.term)
-            # NOTE: the back-off stops at the floor, `match_index + 1`, where a resend would
-            # repeat the rejected request; a correct Follower never rejects prev_log_index 0.
-            return self._leadership.next_index(follower) <= request.prev_log_index
+            return self._leadership.record_rejection(follower, request.term, request.prev_log_index)
         counted = self._leadership.record_success(
             follower, request.term, request.prev_log_index, len(request.entries)
         )
@@ -584,15 +586,22 @@ class DurableNodeState:
         return False
 
     @_holding_the_lock
-    @traced(NodeTracer.report_apply)
-    async def apply_committed(self) -> int:
-        """Apply every committed entry not yet applied, in order; return how many carried a command.
+    @traced(NodeTracer.report_apply_committed)
+    async def apply_committed(self, max_entries: int | None = None) -> int:
+        """Apply committed entries not yet applied, in order; return how many carried a command.
 
-        Walks from `last_applied + 1` to `commit_index` and applies each entry
-        exactly once, in log order (APPLY-4), never reaching past what is committed
-        (APPLY-5). A new Leader's empty entry carries no command, so it advances
-        `last_applied` without reaching the state machine (DD-26). Applying changes
-        nothing on disk: the state machine is rebuilt from the log after a restart.
+        Walks from `last_applied + 1` to `commit_index`, or `max_entries` entries if
+        fewer, and applies each entry exactly once, in log order (APPLY-4), never
+        reaching past what is committed (APPLY-5, DD-28). A new Leader's empty entry
+        carries no command, so it advances `last_applied` without reaching the state
+        machine (DD-26). Applying changes nothing on disk: the state machine is
+        rebuilt from the log after a restart.
+
+        Args:
+            max_entries: The most entries to apply in this call, empty ones included;
+                all that are committed if None. The callback runs without yielding
+                to the event loop, so a caller with a long backlog applies it in
+                batches.
 
         Returns:
             How many commands were handed to the state machine; empty entries are
@@ -605,7 +614,10 @@ class DurableNodeState:
                 entry before the one that failed, so the same entry is retried.
         """
         applied = 0
-        while self._last_applied < self._commit_index:
+        last = self._commit_index
+        if max_entries is not None:
+            last = min(last, self._last_applied + max_entries)
+        while self._last_applied < last:
             entry = self._log.entry_at(self._last_applied + 1)
             if not entry.is_empty:
                 if self._apply is None:
@@ -740,32 +752,38 @@ class DurableNodeState:
 
         Applies `NodeState.become_leader` (STATE-3's Candidate-to-Leader edge)
         once the Candidacy has a majority (ELECT-11). Role is not persisted; the
-        empty entry is.
+        empty entry is (DD-26).
         """
+        # NOTE: role is not persisted, so this change needs no write and is made in place.
         self._state.become_leader()
         self._align_role_records()
         await self._append_empty_entry()
 
     async def _append_empty_entry(self) -> None:
-        """Append this Leader's empty entry, so earlier entries can commit (APPLY-3)."""
+        """Append this Leader's empty entry, so earlier entries can commit (APPLY-3, DD-26)."""
         # NOTE: appended after the Leadership is built, so each Follower's next_index is this
         # entry's index and the first AppendEntries carries it.
         await self._append_to_own_log(LogEntry.empty(self._state.current_term))
 
-    async def _append_to_own_log(self, entry: LogEntry) -> int:
+    async def _append_to_own_log(self, entry: LogEntry) -> LogPosition:
         """Persist `entry` at the end of this Leader's log, install it, advance commitment.
 
         Returns:
-            The entry's 1-based log index.
+            The entry's term and 1-based index.
         """
         next_log = self._log.after_append_entries(self._log.last_index, [entry])
-        await self._persist_then_install(
-            self._store.replace_log_from(next_log.last_index, [entry]),
-            next_state=self._state,
-            next_log=next_log,
-        )
-        self._advance_commit_index()
-        return next_log.last_index
+        try:
+            await self._persist_then_install(
+                self._store.replace_log_from(next_log.last_index, [entry]),
+                next_state=self._state,
+                next_log=next_log,
+            )
+        finally:
+            # NOTE: a cancelled caller still installed the entry; committing it here keeps a
+            # one-node cluster from leaving it uncommitted until its next command.
+            if self._log is next_log:
+                self._advance_commit_index()
+        return next_log.last_position
 
     def _advance_commit_index(self) -> None:
         """Raise this Leader's commit index as `Leadership.commit_index_after` allows."""

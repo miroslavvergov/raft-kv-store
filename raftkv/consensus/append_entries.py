@@ -26,9 +26,12 @@ class AppendEntriesRequest:
         leader_commit: The Leader's `commit_index` when it sent this RPC.
 
     Raises:
-        ValueError: If `term` is below 1, or any index or term is negative. A
-            negative `prev_log_index` would otherwise be read as an offset from
-            the log's end.
+        ValueError: If `term` is below 1; any index or term is negative; exactly
+            one of `prev_log_index` and `prev_log_term` is 0; or the entries'
+            terms fall, start below `prev_log_term`, or exceed `term`. A negative
+            `prev_log_index` would otherwise be read as an offset from the log's
+            end, and falling terms would break every check that reads a log's
+            highest term from one index.
     """
 
     term: int
@@ -49,8 +52,18 @@ class AppendEntriesRequest:
                 f"prev_log_index and prev_log_term cannot be negative, got "
                 f"{self.prev_log_index} and {self.prev_log_term}"
             )
+        if (self.prev_log_index == 0) != (self.prev_log_term == 0):
+            raise ValueError(
+                f"prev_log_term is 0 exactly when prev_log_index is, got "
+                f"{self.prev_log_index} and {self.prev_log_term}"
+            )
         if self.leader_commit < 0:
             raise ValueError(f"leader_commit cannot be negative, got {self.leader_commit}")
+        terms = [self.prev_log_term, *(entry.term for entry in self.entries), self.term]
+        if terms != sorted(terms):
+            raise ValueError(
+                f"entry terms must not fall and must lie from prev_log_term to term, got {terms}"
+            )
 
     @property
     def last_new_index(self) -> int:
@@ -81,9 +94,10 @@ class AppendEntriesResponse:
     Attributes:
         term: The Follower's `current_term` after handling the RPC. A Leader that
             sees a higher term catches up and steps down (STATE-4, STATE-5).
-        success: Whether the Follower stored the entries. False means either its
-            log failed REPL-5's check at `prev_log_index`, or the RPC's term was
-            behind its own.
+        success: Whether the Follower stored the entries. False means its log
+            failed REPL-5's check at `prev_log_index`, the RPC's term was behind
+            its own, or it is itself Leader of that term, which a correct cluster
+            never produces.
     """
 
     term: int

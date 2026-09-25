@@ -1,18 +1,22 @@
-"""A log's last entry, reduced to what ELECT-10's comparison needs."""
+"""One log entry's position: the term it carries and its index."""
 
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class LogPosition:
-    """The (term, index) of a log's last entry: all that ELECT-9/ELECT-10 compare.
+    """The (term, index) of one log entry, which identifies it across every log.
 
-    Comes from `Log.last_position` for a node's own log and from
-    `RequestVoteRequest.last_log_position` for a Candidate's (ELECT-7).
+    Two logs holding an entry with the same term at the same index hold the same
+    entry (REPL-5). A log's last position is all ELECT-9 and ELECT-10 compare: it
+    comes from `Log.last_position` for a node's own log and from
+    `RequestVoteRequest.last_log_position` for a Candidate's (ELECT-7). A newly
+    appended entry's position lets its caller tell later whether that entry, and
+    not another in its place, was committed.
 
     Attributes:
-        term: The last entry's term; 0 for an empty log.
-        index: The last entry's 1-based index; 0 for an empty log.
+        term: The entry's term; 0 for the position before an empty log's first entry.
+        index: The entry's 1-based index; 0 for that same position.
     """
 
     term: int

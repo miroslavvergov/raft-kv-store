@@ -19,6 +19,11 @@ def fresh_leadership(log):
     return Leadership(TERM, FOLLOWERS, log.last_index)
 
 
+def back_off(lead, follower):
+    """Record `follower`'s rejection of the probe now outstanding to it."""
+    lead.record_rejection(follower, TERM, prev_log_index=lead.next_index(follower) - 1)
+
+
 # --- What the request carries ----------------------------------------------------------
 
 
@@ -39,8 +44,8 @@ def test_the_request_carries_the_leaders_term_id_and_commit_index():
 def test_after_a_rejection_it_carries_everything_from_the_lowered_next_index():
     log = make_log([1, 1, 4, 4])
     lead = fresh_leadership(log)
-    lead.record_rejection(2, TERM)  # next_index 5 -> 4
-    lead.record_rejection(2, TERM)  # next_index 4 -> 3
+    back_off(lead, 2)  # next_index 5 -> 4
+    back_off(lead, 2)  # next_index 4 -> 3
 
     request = lead.append_entries_request_for(2, log, LEADER_ID, 0)
 
@@ -51,8 +56,8 @@ def test_after_a_rejection_it_carries_everything_from_the_lowered_next_index():
 def test_backed_all_the_way_to_the_start_the_request_carries_the_whole_log():
     log = make_log([1, 1])
     lead = fresh_leadership(log)
-    lead.record_rejection(2, TERM)
-    lead.record_rejection(2, TERM)
+    back_off(lead, 2)
+    back_off(lead, 2)
 
     request = lead.append_entries_request_for(2, log, LEADER_ID, 0)
 
@@ -82,7 +87,7 @@ def test_a_caught_up_follower_gets_a_heartbeat():
 def test_each_follower_gets_a_request_from_its_own_next_index():
     log = make_log([1, 1, 4])
     lead = fresh_leadership(log)
-    lead.record_rejection(3, TERM)  # only Follower 3 backs off
+    back_off(lead, 3)  # only Follower 3 backs off
     two = lead.append_entries_request_for(2, log, LEADER_ID, 0)
     three = lead.append_entries_request_for(3, log, LEADER_ID, 0)
     assert (two.prev_log_index, three.prev_log_index) == (3, 2)
@@ -119,7 +124,7 @@ def repair_with_requests(leader_log, follower_log):
             )
             lead.record_success(2, TERM, request.prev_log_index, len(request.entries))
             return follower_log, lead
-        lead.record_rejection(2, TERM)
+        back_off(lead, 2)
     raise AssertionError("never reached an index where the logs agree")
 
 

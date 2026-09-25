@@ -13,10 +13,27 @@ import re
 import shutil
 from typing import NamedTuple
 
+import pytest
+
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER
 from tests.traces.checker import TraceVerdict, check_election_trace
 
 HARNESS = "tests.cluster"
+
+_harness = logging.getLogger(HARNESS)
+
+
+def trace_step(source, message, *args, event=None):
+    """Report one harness step to the election trace, if one is being recorded.
+
+    Args:
+        source: "net", "clock", "cmd", "apply", "crash", "disk", or "state".
+        message: A %-style format string, filled from `args`.
+        event: The step as a structured event, for the `.jsonl` trace.
+    """
+    if _harness.isEnabledFor(logging.INFO):
+        _harness.info(message, *args, extra={"trace_source": source, "trace_event": event})
+
 
 _LEGEND = """\
 # Lines marked "raft" are a node's own log, in etcd's raft log format; each
@@ -168,6 +185,30 @@ def collecting_trace_records():
         for logger, level in zip(loggers, levels, strict=True):
             logger.removeHandler(handler)
             logger.setLevel(level)
+
+
+@contextlib.contextmanager
+def failing_on_broken_rules(test_item):
+    """Record the trace while the block runs, then fail the test if it breaks a rule.
+
+    Nothing is checked if the block raised, and a test marked `negative_control`, which breaks
+    a rule on purpose, is never failed. Checks every test that uses it, with or without
+    --trace-elections.
+
+    Args:
+        test_item: The running test's pytest item, `request.node`.
+    """
+    with collecting_trace_records() as records:
+        yield
+    if test_item.get_closest_marker("negative_control") is not None:
+        return
+    _, entries = render(records)
+    problems = check_election_trace(entries).problems
+    if problems:
+        pytest.fail(
+            "the election trace breaks a safety rule:\n  - " + "\n  - ".join(problems),
+            pytrace=False,
+        )
 
 
 class _RecordList(logging.Handler):

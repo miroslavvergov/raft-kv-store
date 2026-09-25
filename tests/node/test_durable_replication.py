@@ -3,7 +3,8 @@
 A Leader appends commands (append_command), builds each Follower's AppendEntries
 (append_entries_request_for), records the answers (handle_append_entries_response), and commits
 what a majority holds from its own term. A new Leader appends an empty entry first. REPL-1,
-REPL-2, REPL-4, REPL-6, REPL-7, REPL-16, REPL-17, APPLY-1, APPLY-2, APPLY-3, CLIENT-6, PERSIST-3.
+REPL-2, REPL-4, REPL-6, REPL-7, REPL-16, REPL-17, APPLY-1, APPLY-2, APPLY-3, CLIENT-6, PERSIST-3,
+DD-26, DD-27.
 """
 
 import asyncio
@@ -16,6 +17,7 @@ from raftkv.consensus import (
     Cluster,
     Log,
     LogEntry,
+    LogPosition,
     NotLeaderError,
     Role,
 )
@@ -137,7 +139,8 @@ async def test_a_leader_whose_empty_entry_write_fails_stays_leader_without_it(db
         assert durable.commit_index == 0
 
         store.fail_log_writes = False
-        assert await durable.append_command("x=5") == 1  # the index the empty entry would have had
+        position = await durable.append_command("x=5")
+        assert position.index == 1  # the index the empty entry would have had
     assert [e.command for e in (await reload(db_path)).log] == ["x=5"]
 
 
@@ -167,9 +170,9 @@ async def test_a_command_is_appended_in_the_leaders_term_and_persisted_before_re
         leader = await elected_leader(store)
         writes_before = list(store.writes)
 
-        index = await leader.append_command("x=5")
+        position = await leader.append_command("x=5")
 
-        assert index == 2
+        assert position == LogPosition(term=1, index=2)
         assert leader.log.entry_at(2) == LogEntry(term=1, command="x=5")
         assert store.writes == [*writes_before, ("replace_log_from", 2, [1])]
     assert (await reload(db_path)).log.entry_at(2) == LogEntry(term=1, command="x=5")
@@ -178,8 +181,8 @@ async def test_a_command_is_appended_in_the_leaders_term_and_persisted_before_re
 async def test_consecutive_commands_get_consecutive_indexes(db_path):
     async with SqliteStore(db_path) as store:
         leader = await elected_leader(store)
-        indexes = [await leader.append_command(c) for c in ("a=1", "b=2", "c=3")]
-        assert indexes == [2, 3, 4]
+        positions = [await leader.append_command(c) for c in ("a=1", "b=2", "c=3")]
+        assert [position.index for position in positions] == [2, 3, 4]
         assert [e.command for e in leader.log] == ["", "a=1", "b=2", "c=3"]
 
 
@@ -194,7 +197,7 @@ async def test_a_single_node_leaders_command_is_committed_at_once(db_path):
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, Cluster([NODE_ID]))
         await durable.start_election()
-        assert await durable.append_command("x=5") == 2
+        assert await durable.append_command("x=5") == LogPosition(term=1, index=2)
         assert durable.commit_index == 2
 
 
@@ -240,13 +243,13 @@ async def test_a_failed_write_appends_nothing_and_the_next_command_takes_the_sam
         assert leader.log == Log([EMPTY_1])
 
         store.fail_log_writes = False
-        assert await leader.append_command("kept") == 2
+        assert (await leader.append_command("kept")).index == 2
     assert [e.command for e in (await reload(db_path)).log] == ["", "kept"]
 
 
-async def test_a_cancelled_caller_still_installs_the_command_but_commits_nothing(db_path):
-    # A single node would commit the command at once; cancelled, the entry is installed, since
-    # it is on disk, but the commit waits for the next command.
+async def test_a_cancelled_caller_still_installs_and_commits_the_command(db_path):
+    # A single node commits a command at once. Cancelled during the write, the entry is still
+    # installed, since it is on disk, and committed, or it would wait for the next command.
     async with GatedStore(db_path) as store:
         store.release.set()
         durable = await DurableNodeState.load(NODE_ID, store, Cluster([NODE_ID]))
@@ -261,7 +264,7 @@ async def test_a_cancelled_caller_still_installs_the_command_but_commits_nothing
             await caller
 
         assert durable.log.entry_at(2).command == "x=5"
-        assert durable.commit_index == 1
+        assert durable.commit_index == 2
     assert (await reload(db_path)).log.entry_at(2).command == "x=5"
 
 
@@ -282,7 +285,8 @@ async def test_commands_racing_each_other_are_appended_one_after_the_other(db_pa
         assert store.writes[writes_before:] == [("replace_log_from", 2, [1])]
 
         store.release.set()
-        assert await asyncio.gather(first, second) == [2, 3]
+        positions = await asyncio.gather(first, second)
+        assert [position.index for position in positions] == [2, 3]
         assert [e.command for e in leader.log] == ["", "first", "second"]
 
 
@@ -466,8 +470,7 @@ async def test_a_stale_term_rejection_from_a_node_that_is_not_a_follower_is_igno
     await seed_term_and_vote(db_path, 1)
     async with SqliteStore(db_path) as store:
         leader = await win_term_2(store)
-        request = await leader.append_entries_request_for(9)
-        stale = dataclasses.replace(request, term=1)
+        stale = append_entries(term=1, leader=NODE_ID, prev_log_index=2, prev_log_term=1)
 
         assert await leader.handle_append_entries_response(42, stale, rejected(term=1)) is False
 

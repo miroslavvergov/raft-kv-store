@@ -47,7 +47,9 @@ def repair_all(leadership, leader_log, follower_logs):
                 )
                 pending.discard(follower)
             else:
-                leadership.record_rejection(follower, sent_in_term=leadership.term)
+                leadership.record_rejection(
+                    follower, sent_in_term=leadership.term, prev_log_index=prev_log_index
+                )
                 rejections[follower] += 1
                 assert rejections[follower] <= leader_log.last_index, (
                     f"follower {follower} never reached an index where the logs agree"
@@ -139,7 +141,7 @@ def test_success_from_this_term_is_counted_for_that_follower_only():
 def test_rejection_from_this_term_is_counted_for_that_follower_only():
     leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
     before = snapshot(leadership)
-    assert leadership.record_rejection(4, sent_in_term=TERM) is True
+    assert leadership.record_rejection(4, sent_in_term=TERM, prev_log_index=11) is True
     after = snapshot(leadership)
     assert after[4] == (11, 0)
     assert others(after, 4) == others(before, 4)
@@ -155,7 +157,7 @@ def test_success_sent_in_an_earlier_term_is_ignored():
 def test_rejection_sent_in_an_earlier_term_is_ignored():
     leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
     before = snapshot(leadership)
-    assert leadership.record_rejection(2, sent_in_term=5) is False
+    assert leadership.record_rejection(2, sent_in_term=5, prev_log_index=11) is False
     assert snapshot(leadership) == before
 
 
@@ -164,18 +166,18 @@ def test_reply_from_any_other_term_is_ignored_not_only_an_earlier_one():
     before = snapshot(leadership)
     success = leadership.record_success(2, sent_in_term=TERM + 1, prev_log_index=11, entry_count=0)
     assert success is False
-    assert leadership.record_rejection(2, sent_in_term=TERM + 1) is False
+    assert leadership.record_rejection(2, sent_in_term=TERM + 1, prev_log_index=11) is False
     assert snapshot(leadership) == before
 
 
 def test_a_stale_reply_is_ignored_before_the_follower_is_even_looked_up():
     leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
     assert leadership.record_success(99, sent_in_term=5, prev_log_index=9, entry_count=3) is False
-    assert leadership.record_rejection(99, sent_in_term=5) is False
+    assert leadership.record_rejection(99, sent_in_term=5, prev_log_index=11) is False
     with pytest.raises(KeyError):
         leadership.record_success(99, sent_in_term=TERM, prev_log_index=9, entry_count=3)
     with pytest.raises(KeyError):
-        leadership.record_rejection(99, sent_in_term=TERM)
+        leadership.record_rejection(99, sent_in_term=TERM, prev_log_index=11)
 
 
 def test_late_reply_from_an_earlier_leadership_is_not_counted():
@@ -225,11 +227,15 @@ def test_invariants_hold_across_any_sequence_of_replies(seed):
                 prev_log_index=rng.randint(0, 25),
                 entry_count=rng.randint(0, 5),
             )
+            assert counted == (sent_in_term == TERM)
         else:
-            counted = leadership.record_rejection(follower, sent_in_term)
+            # Mostly the outstanding probe, sometimes a duplicate or a late reply.
+            outstanding = leadership.next_index(follower) - 1
+            prev_log_index = outstanding if rng.random() < 0.7 else rng.randint(0, 25)
+            counted = leadership.record_rejection(follower, sent_in_term, prev_log_index)
+            assert not counted or (sent_in_term == TERM and prev_log_index == outstanding)
         after = snapshot(leadership)
 
-        assert counted == (sent_in_term == TERM)
         for f, (next_index, match_index) in after.items():
             assert match_index < next_index
             assert match_index >= before[f][1]

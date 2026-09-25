@@ -15,6 +15,9 @@ from raftkv.consensus.role import Role
 class NodeState:
     """One node's Raft role, current term, and vote.
 
+    All three change only through the methods below, each one event with all its
+    effects, so no caller can reach a role by a transition STATE-3 forbids.
+
     Attributes:
         node_id: The node's permanent positive-integer identity, distinct from
             its network address (NODE-8, DD-20).
@@ -31,10 +34,26 @@ class NodeState:
         Args:
             node_id: The node's permanent positive-integer identity.
         """
-        self.node_id = node_id
-        self.role = Role.FOLLOWER
-        self.current_term = 0
-        self.voted_for: int | None = None
+        self._node_id = node_id
+        self._role = Role.FOLLOWER
+        self._current_term = 0
+        self._voted_for: int | None = None
+
+    @property
+    def node_id(self) -> int:
+        return self._node_id
+
+    @property
+    def role(self) -> Role:
+        return self._role
+
+    @property
+    def current_term(self) -> int:
+        return self._current_term
+
+    @property
+    def voted_for(self) -> int | None:
+        return self._voted_for
 
     @classmethod
     def reloaded(cls, node_id: int, current_term: int, voted_for: int | None) -> "NodeState":
@@ -55,8 +74,8 @@ class NodeState:
             A Follower carrying the reloaded term and vote.
         """
         state = cls(node_id)
-        state.current_term = current_term
-        state.voted_for = voted_for
+        state._current_term = current_term
+        state._voted_for = voted_for
         return state
 
     def become_candidate(self) -> None:
@@ -69,13 +88,13 @@ class NodeState:
             IllegalTransitionError: If the node is Leader, which must step down to
                 Follower first (STATE-4). Nothing changes.
         """
-        if self.role not in (Role.FOLLOWER, Role.CANDIDATE):
+        if self._role not in (Role.FOLLOWER, Role.CANDIDATE):
             raise IllegalTransitionError(
-                f"{self.role.value} -> candidate is not a legal STATE-3 edge"
+                f"{self._role.value} -> candidate is not a legal STATE-3 edge"
             )
-        self.role = Role.CANDIDATE
-        self.current_term += 1
-        self.voted_for = self.node_id
+        self._role = Role.CANDIDATE
+        self._current_term += 1
+        self._voted_for = self._node_id
 
     def become_leader(self) -> None:
         """Transition to Leader: STATE-3's Candidate-to-Leader edge.
@@ -85,9 +104,11 @@ class NodeState:
         Raises:
             IllegalTransitionError: If the node is not a Candidate. Nothing changes.
         """
-        if self.role is not Role.CANDIDATE:
-            raise IllegalTransitionError(f"{self.role.value} -> leader is not a legal STATE-3 edge")
-        self.role = Role.LEADER
+        if self._role is not Role.CANDIDATE:
+            raise IllegalTransitionError(
+                f"{self._role.value} -> leader is not a legal STATE-3 edge"
+            )
+        self._role = Role.LEADER
 
     def handle_observed_term(self, term: int) -> bool:
         """Catch up to `term` if it is higher than `current_term`.
@@ -104,12 +125,12 @@ class NodeState:
         Returns:
             True if `term` was higher and the catch-up was applied, False otherwise.
         """
-        if term <= self.current_term:
+        if term <= self._current_term:
             return False
-        self.current_term = term
-        self.voted_for = None
-        if self.role in (Role.CANDIDATE, Role.LEADER):
-            self.role = Role.FOLLOWER
+        self._current_term = term
+        self._voted_for = None
+        if self._role in (Role.CANDIDATE, Role.LEADER):
+            self._role = Role.FOLLOWER
         return True
 
     def handle_vote_request(
@@ -146,15 +167,15 @@ class NodeState:
         """
         self.handle_observed_term(request.term)
         granted = (
-            request.term == self.current_term
-            and self.voted_for in (None, request.candidate_id)
+            request.term == self._current_term
+            and self._voted_for in (None, request.candidate_id)
             and request.last_log_position.is_at_least_as_up_to_date_as(own_last_log_position)
         )
         # NOTE: a refusal records no vote, so this term's vote stays free for a Candidate with
         # a complete log (ELECT-9).
         if granted:
-            self.voted_for = request.candidate_id
-        return RequestVoteResponse(term=self.current_term, vote_granted=granted)
+            self._voted_for = request.candidate_id
+        return RequestVoteResponse(term=self._current_term, vote_granted=granted)
 
     def recognize_leader(self, term: int) -> bool:
         """Recognize an AppendEntries sender as Leader of `term`, if the term allows it.
@@ -183,7 +204,7 @@ class NodeState:
         self.handle_observed_term(term)
         # NOTE: the role check decides only at an equal term, a lower one being refused
         # already: no rival Leader can hold this Leader's term.
-        if term < self.current_term or self.role is Role.LEADER:
+        if term < self._current_term or self._role is Role.LEADER:
             return False
-        self.role = Role.FOLLOWER
+        self._role = Role.FOLLOWER
         return True

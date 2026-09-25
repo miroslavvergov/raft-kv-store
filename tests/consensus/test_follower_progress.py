@@ -1,6 +1,7 @@
 """Tier 1 tests for FollowerProgress, a Leader's nextIndex and matchIndex for one follower.
 
-DD-25, REPL-6, REPL-7, REPL-15, REPL-16, REPL-17. Leadership decides which replies reach it.
+DD-25, DD-27, REPL-6, REPL-7, REPL-15, REPL-16, REPL-17, FAIL-1. Leadership decides which replies
+reach it.
 """
 
 import random
@@ -9,6 +10,12 @@ import pytest
 
 from raftkv.consensus import FollowerProgress
 from tests.support.divergent_logs import FOLLOWER_TERMS, LEADER_TERMS, make_log, repair
+
+
+def back_off(progress):
+    """Record a rejection of the probe now outstanding; return whether `next_index` dropped."""
+    return progress.record_rejection(prev_log_index=progress.next_index - 1)
+
 
 # --- Starting state -------------------------------------------------------------------
 
@@ -30,7 +37,7 @@ def test_next_and_match_index_cannot_be_assigned_directly():
 def test_match_index_stays_zero_until_a_success_is_recorded():
     progress = FollowerProgress(next_index=11)
     for _ in range(5):
-        progress.record_rejection()
+        back_off(progress)
     assert progress.match_index == 0
 
 
@@ -71,33 +78,49 @@ def test_success_never_lowers_next_index():
     assert (progress.match_index, progress.next_index) == (5, 11)
 
 
-# --- record_rejection: back off, floored at match_index + 1 (REPL-6) ------------------
+# --- record_rejection: back off from the outstanding probe only (REPL-6, DD-27) --------
 
 
-def test_rejection_lowers_next_index_by_one():
+def test_rejection_of_the_outstanding_probe_lowers_next_index_by_one():
     progress = FollowerProgress(next_index=5)
-    progress.record_rejection()
+    assert progress.record_rejection(prev_log_index=4) is True
+    assert progress.next_index == 4
+
+
+def test_a_duplicated_rejection_lowers_next_index_only_once():
+    # FAIL-1: the second copy answers a probe no longer outstanding.
+    progress = FollowerProgress(next_index=5)
+    assert progress.record_rejection(prev_log_index=4) is True
+    assert progress.record_rejection(prev_log_index=4) is False
+    assert progress.next_index == 4
+
+
+def test_a_late_rejection_of_an_older_probe_changes_nothing():
+    progress = FollowerProgress(next_index=5)
+    back_off(progress)  # the probe from 5 was rejected; the one from 4 is outstanding
+    assert progress.record_rejection(prev_log_index=4) is False
+    assert progress.record_rejection(prev_log_index=9) is False
     assert progress.next_index == 4
 
 
 def test_rejection_floors_at_one_when_nothing_is_matched():
     progress = FollowerProgress(next_index=1)
-    progress.record_rejection()
+    assert back_off(progress) is False
     assert progress.next_index == 1
 
 
-def test_late_rejection_never_goes_below_match_index_plus_one():
+def test_rejection_never_goes_below_match_index_plus_one():
     progress = FollowerProgress(next_index=4)
     progress.record_success(prev_log_index=3, entry_count=2)  # confirmed through 5
     assert progress.next_index == 6
-    progress.record_rejection()  # a late reply to an older probe
+    assert back_off(progress) is False
     assert (progress.match_index, progress.next_index) == (5, 6)
 
 
 def test_backoff_then_success_resumes_just_past_the_confirmed_index():
     progress = FollowerProgress(next_index=11)
-    progress.record_rejection()
-    progress.record_rejection()
+    back_off(progress)
+    back_off(progress)
     assert progress.next_index == 9
     progress.record_success(prev_log_index=8, entry_count=2)
     assert (progress.match_index, progress.next_index) == (10, 11)
@@ -120,9 +143,12 @@ def test_invariants_hold_across_any_sequence_of_replies(seed):
             assert progress.match_index == max(match_before, prev_log_index + entry_count)
             assert progress.next_index >= next_before
         else:
-            progress.record_rejection()
+            # Mostly the outstanding probe, sometimes a duplicate or a late reply.
+            prev_log_index = next_before - 1 if rng.random() < 0.7 else rng.randint(0, 20)
+            lowered = progress.record_rejection(prev_log_index)
             assert progress.match_index == match_before
-            assert progress.next_index in (next_before - 1, next_before)
+            assert progress.next_index == (next_before - 1 if lowered else next_before)
+            assert not lowered or prev_log_index == next_before - 1
         assert progress.match_index >= match_before
         assert progress.match_index < progress.next_index
 

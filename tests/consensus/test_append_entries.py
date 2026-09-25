@@ -45,6 +45,22 @@ def test_a_request_with_an_impossible_index_or_term_is_refused(field, value):
         append_entries(**{field: value})
 
 
+@pytest.mark.parametrize(
+    ("options", "why"),
+    [
+        ({"prev_log_index": 0, "prev_log_term": 3}, "no entry precedes the first, so no term"),
+        ({"prev_log_index": 3, "prev_log_term": 0}, "every real entry has a term of at least 1"),
+        ({"prev_log_index": 1, "prev_log_term": 2, "entries": entries(1)}, "terms never fall"),
+        ({"term": 2, "entries": [LogEntry(3, "x")]}, "no entry is newer than its Leader"),
+        ({"entries": [LogEntry(2, "a"), LogEntry(1, "b")]}, "terms never fall within the entries"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else "",
+)
+def test_a_request_no_correct_leader_could_send_is_refused(options, why):
+    with pytest.raises(ValueError):
+        append_entries(**options)
+
+
 def test_zero_is_legal_for_the_previous_entry_because_no_entry_precedes_the_first():
     request = append_entries(prev_log_index=0, prev_log_term=0, entries=entries(1))
     assert (request.prev_log_index, request.prev_log_term) == (0, 0)

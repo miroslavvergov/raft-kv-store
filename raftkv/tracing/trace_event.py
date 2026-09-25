@@ -124,8 +124,9 @@ class TraceEvent:
     `SendAppendEntriesRequest`, `ReceiveAppendEntriesRequest`,
     `SendAppendEntriesResponse`, `ReceiveAppendEntriesResponse`, `Replicate` (a
     Leader appended entries to its own log), and `Commit` (the commit index
-    rose, with every entry it newly commits); plus `PersistVote`,
-    for a vote a cancelled call installed without answering. Receive events
+    rose, with every entry it newly commits); plus `PersistVote`, for a vote a
+    cancelled call installed without answering, and `Apply`, for the entries a
+    node applied, empty ones included. Receive events
     carry the state the message arrived to; all others, the state after the
     step. A change appears only once persisted and installed, so a trace never
     shows a term or vote the node did not hold.

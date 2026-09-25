@@ -11,8 +11,7 @@ import pytest
 
 from raftkv.tracing import LOG_LINES_LOGGER, TRACE_EVENTS_LOGGER
 from tests.cluster.in_process_cluster import InProcessCluster
-from tests.traces.checker import check_election_trace
-from tests.traces.recorder import ElectionTraceRecorder, collecting_trace_records, render
+from tests.traces.recorder import ElectionTraceRecorder, failing_on_broken_rules
 
 _RECORDER = pytest.StashKey[ElectionTraceRecorder]()
 _OUTCOME = pytest.StashKey[str]()
@@ -45,21 +44,10 @@ async def start_cluster(tmp_path, request):
                 await cluster.start(node_id)
         return cluster
 
-    # NOTE: the trace is collected and re-checked here too, so every cluster test is checked
-    # without --trace-elections.
-    with collecting_trace_records() as records:
+    with failing_on_broken_rules(request.node):
         yield start
         for cluster in clusters:
             await cluster.stop_all()
-    if request.node.get_closest_marker("negative_control") is not None:
-        return
-    _, entries = render(records)
-    problems = check_election_trace(entries).problems
-    if problems:
-        pytest.fail(
-            "the election trace breaks a safety rule:\n  - " + "\n  - ".join(problems),
-            pytrace=False,
-        )
 
 
 def _set_tracing_level(caplog, level):

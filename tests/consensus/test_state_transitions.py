@@ -10,6 +10,14 @@ from raftkv.consensus import IllegalTransitionError, NodeState, Role
 # --- A new node and the STATE-3 edges -------------------------------------------------
 
 
+def test_role_term_and_vote_cannot_be_assigned_directly():
+    # Only the transition methods change them, so no caller can skip STATE-3's rules.
+    state = NodeState(node_id=1)
+    for field, value in (("role", Role.LEADER), ("current_term", 9), ("voted_for", 2)):
+        with pytest.raises(AttributeError):
+            setattr(state, field, value)
+
+
 def test_starts_as_follower_with_term_zero_and_no_vote():
     # STATE-1, STATE-2
     node = NodeState(node_id=1)

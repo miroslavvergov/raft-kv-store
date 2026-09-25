@@ -169,7 +169,8 @@ def test_no_term_ever_has_two_candidates_granted_a_vote(seed):
     # with the node's own state.
     rng = random.Random(seed)
     node = NodeState.reloaded(node_id=1, current_term=rng.randint(0, 3), voted_for=None)
-    own_log = LogPosition(term=rng.randint(0, 3), index=rng.randint(0, 6))
+    own_term = rng.randint(0, node.current_term)
+    own_log = LogPosition(term=own_term, index=rng.randint(1, 6) if own_term else 0)
     granted_to = defaultdict(set)
 
     for _ in range(300):
@@ -178,11 +179,13 @@ def test_no_term_ever_has_two_candidates_granted_a_vote(seed):
             granted_to[node.current_term].add(node.node_id)
             continue
         term_before = node.current_term
+        term = max(1, term_before + rng.choice([-2, -1, 0, 0, 0, 1, 2]))
+        last_log_term = rng.randint(0, min(term, 4))
         request = vote_request(
-            term=max(0, term_before + rng.choice([-2, -1, 0, 0, 0, 1, 2])),
+            term=term,
             candidate=rng.choice([2, 3, 4]),
-            last_log_term=rng.randint(0, 4),
-            last_log_index=rng.randint(0, 8),
+            last_log_term=last_log_term,
+            last_log_index=rng.randint(1, 8) if last_log_term else 0,
         )
         response = node.handle_vote_request(request, own_log)
 
@@ -194,3 +197,22 @@ def test_no_term_ever_has_two_candidates_granted_a_vote(seed):
             assert request.last_log_position.is_at_least_as_up_to_date_as(own_log)
             granted_to[request.term].add(request.candidate_id)
         assert all(len(candidates) == 1 for candidates in granted_to.values())
+
+
+# --- A RequestVote no correct Candidate could send ------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("options", "why"),
+    [
+        ({"term": 0}, "terms start at 1"),
+        ({"last_log_index": -1}, "no index is negative"),
+        ({"last_log_index": 0, "last_log_term": 2}, "an empty log has no last term"),
+        ({"last_log_index": 3, "last_log_term": 0}, "every real entry has a term of at least 1"),
+        ({"term": 2, "last_log_index": 1, "last_log_term": 3}, "no entry is newer than its term"),
+    ],
+    ids=lambda value: value if isinstance(value, str) else "",
+)
+def test_a_request_no_correct_candidate_could_send_is_refused(options, why):
+    with pytest.raises(ValueError):
+        vote_request(**{"term": 3, "candidate": 2, **options})

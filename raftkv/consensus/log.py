@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 from raftkv.consensus.log_position import LogPosition
 
-# NOTE: reserved for a new Leader's empty entry; `DurableNodeState.append_command` refuses a
-# client command equal to it. Distinct from an AppendEntries carrying no entries (REPL-9).
+# NOTE: reserved for a new Leader's empty entry (DD-26); a node refuses a client command equal
+# to it. Distinct from an AppendEntries carrying no entries (REPL-9).
 EMPTY_COMMAND = ""
 
 
@@ -46,7 +46,7 @@ class LogEntry:
 
     @classmethod
     def empty(cls, term: int) -> "LogEntry":
-        """Return the entry a new Leader appends in its term, carrying no command.
+        """Return the entry a new Leader appends in its term, carrying no command (DD-26).
 
         A Leader commits only entries of its own term (APPLY-2, APPLY-3); this
         gives it one at once, so the entries before it commit with it even while
