@@ -440,7 +440,13 @@ class DurableNodeState:
             if accepted
             else None
         )
-        changed_from = None if next_log is None else self._log.first_differing_index(next_log)
+        # NOTE: accepting entries never changes one before prev_log_index + 1, so the comparison
+        # starts there: a heartbeat costs nothing however long the log is.
+        changed_from = (
+            None
+            if next_log is None
+            else self._log.first_differing_index(next_log, start=request.prev_log_index + 1)
+        )
         # NOTE: the election and commit rules already rule this out; checking it here turns a
         # broken rule into a named failure before anything is written, not a lost entry later.
         if changed_from is not None and changed_from <= self._commit_index:

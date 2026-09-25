@@ -291,6 +291,34 @@ async def test_a_heartbeat_that_changes_nothing_writes_nothing_but_still_commits
         assert durable.commit_index == 2
 
 
+@pytest.mark.parametrize(
+    "request_",
+    [
+        heartbeat(term=4, prev_log_index=50, prev_log_term=1, commit=50),
+        append_entries(term=4, prev_log_index=50, prev_log_term=1, entries=[LogEntry(4, "x")]),
+    ],
+    ids=["heartbeat", "one new entry"],
+)
+async def test_an_rpc_compares_only_the_entries_it_carried_not_the_whole_log(
+    db_path, monkeypatch, request_
+):
+    # A heartbeat arrives many times a second: comparing every held entry each time would
+    # make its cost grow with the log.
+    await seed_log(db_path, [1] * 50)
+    async with SqliteStore(db_path) as store:
+        durable = await follower(store, at_term=4)
+        compared = []
+        entry_equality = LogEntry.__eq__
+        monkeypatch.setattr(
+            LogEntry, "__eq__", lambda a, b: compared.append(a) or entry_equality(a, b)
+        )
+
+        answer = await durable.handle_append_entries(request_)
+
+    assert answer.success is True
+    assert compared == []
+
+
 async def test_commitment_is_forgotten_across_a_restart_and_relearned(db_path):
     await seed_log(db_path, [1, 1])
     async with SqliteStore(db_path) as store:

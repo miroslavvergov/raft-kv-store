@@ -197,24 +197,30 @@ class Log:
                 new_entries.append(entry)
         return Log(new_entries)
 
-    def first_differing_index(self, other: "Log") -> int | None:
+    def first_differing_index(self, other: "Log", start: int = 1) -> int | None:
         """Return the 1-based index of the first entry that differs from `other`'s.
 
         If one log is a prefix of the other, that is the index just past the
         shorter one. Every entry before it is identical in both logs, so a durable
         copy is brought in line by rewriting only from that index on.
 
+        Entries are compared from `start` on, so the cost is the entries after it,
+        not the whole log. A caller passes a later `start` only when it knows every
+        entry before it is identical in both logs.
+
         Args:
             other: The log to compare against.
+            start: The first 1-based index to compare; 1 compares everything.
 
         Returns:
-            The first differing index, or None if the logs are identical.
+            The first differing index, or None if the logs are identical from `start` on.
         """
-        # NOTE: comparing against a shorter or longer log is normal, so the pairs stop at the
-        # shorter one and the length check below reports where it ends.
-        for position, (mine, theirs) in enumerate(zip(self._entries, other._entries, strict=False)):
-            if mine != theirs:
+        shorter = min(len(self._entries), len(other._entries))
+        for position in range(start - 1, shorter):
+            if self._entries[position] != other._entries[position]:
                 return position + 1
+        # NOTE: comparing against a shorter or longer log is normal: past the shorter one's
+        # end, the first missing entry is the first difference.
         if len(self._entries) != len(other._entries):
-            return min(len(self._entries), len(other._entries)) + 1
+            return shorter + 1
         return None

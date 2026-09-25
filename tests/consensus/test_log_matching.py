@@ -178,6 +178,15 @@ def test_first_differing_index_compares_commands_not_just_terms():
     assert ours.first_differing_index(theirs) == 1
 
 
+def test_first_differing_index_skips_the_entries_before_start():
+    assert make_log([1, 1, 2]).first_differing_index(make_log([9, 1, 2]), start=2) is None
+    assert make_log([1, 1, 2]).first_differing_index(make_log([9, 1, 3]), start=2) == 3
+
+
+def test_first_differing_index_reports_a_shorter_log_even_when_it_ends_before_start():
+    assert make_log([1, 1, 2]).first_differing_index(make_log([1]), start=3) == 2
+
+
 def test_first_differing_index_is_none_after_a_heartbeat_keeps_a_stale_entry():
     # A stale entry kept through a heartbeat is not a change, so nothing needs rewriting.
     follower_log = make_log(FOLLOWER_TERMS["one_extra_stale_entry"])
