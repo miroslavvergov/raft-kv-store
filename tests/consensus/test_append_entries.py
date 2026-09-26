@@ -53,12 +53,19 @@ def test_a_request_with_an_impossible_index_or_term_is_refused(field, value):
         ({"prev_log_index": 1, "prev_log_term": 2, "entries": entries(1)}, "terms never fall"),
         ({"term": 2, "entries": [LogEntry(3, "x")]}, "no entry is newer than its Leader"),
         ({"entries": [LogEntry(2, "a"), LogEntry(1, "b")]}, "terms never fall within the entries"),
+        ({"entries": [LogEntry(1, "a", 5), LogEntry(1, "b", 4)]}, "cluster time never falls"),
     ],
     ids=lambda value: value if isinstance(value, str) else "",
 )
 def test_a_request_no_correct_leader_could_send_is_refused(options, why):
     with pytest.raises(ValueError):
         append_entries(**options)
+
+
+def test_entries_may_share_a_cluster_time():
+    # Entries appended within one tick carry the same time: it never falls, but need not rise.
+    request = append_entries(entries=[LogEntry(1, "a", 5), LogEntry(1, "b", 5)])
+    assert [entry.cluster_time for entry in request.entries] == [5, 5]
 
 
 def test_zero_is_legal_for_the_previous_entry_because_no_entry_precedes_the_first():

@@ -23,14 +23,15 @@ strategy this project implements against.
       node/        DurableNodeState: runs those rules and persists before acting
       storage/     SQLite storage of term, vote, and log
       runtime/     RaftNode: the clock, the RPCs a node sends, and applying
-      kvstore/     the key-value state machine committed entries are applied to
+      kvstore/     the key-value state machine, its commands, and its client sessions
       tracing/     log lines and trace events for every node decision
     tests/
       consensus/ node/ storage/ kvstore/ tracing/   one folder per package
       cluster/     several nodes, every message delivered by the test, with safety checks
       runtime/     RaftNode alone, and clusters that run themselves on a ticked clock
       traces/      the trace recorder and checker behind --trace-elections
-      support/     message builders, log fixtures, store doubles, in-memory network
+      support/     message builders, log fixtures, store doubles, in-memory network,
+                   a test KV client
 
 ## Tracing elections
 
@@ -45,7 +46,7 @@ to see *why* a test passed or failed, not just *that* it did.
   raft uses (`2 [logterm: 0, index: 0, vote: 0] cast RequestVote for 1 ...`;
   `vote: 0` means no vote cast yet), interleaved with what the harness did:
   `net` (a message delivered, dropped, or duplicated), `clock` (an election
-  timeout fires), `cmd` (a client command reaches a node), `apply` (a node
+  timeout fires, or cluster ticks pass on a Leader), `cmd` (a client command reaches a node), `apply` (a node
   applies committed entries to its state machine), `crash` (a node
   restarts from its file), `disk` (a vote read back from a node's file),
   `state` (every node after the step: role, term, vote, last log index, and
@@ -110,7 +111,12 @@ has committed in its own term, one of the three conditions a linearizable read
 waits on (CLIENT-8, CLIENT-9, CLIENT-10). A `RaftNode` runs each node by itself
 on a clock counted in ticks: election timeouts, heartbeats, sending and
 resending RPCs, and applying what commits, over any `Transport`; the tests run
-whole clusters of them over an in-memory network. Not yet built: a `propose()`
-that waits for commit and apply, a `read_barrier()` for linearizable reads,
-request-ID deduplication, the HTTP transport, the client API, a node entry
-point configured from environment variables, and the Docker packaging.
+whole clusters of them over an in-memory network. Every entry carries the
+cluster time, counted in Leader ticks, at which its Leader appended it. Clients
+open sessions through the log and number their requests, so a retried put takes
+effect once on every node; a session idle for more than 36,000 ticks (an hour
+at the default tick) is forgotten when the next command is applied, at the same
+entry on every node. Not yet built: a `propose()` that
+waits for commit and apply, a `read_barrier()` for linearizable reads, the HTTP
+transport, the client API and its retry loop, a node entry point configured from
+environment variables, and the Docker packaging.

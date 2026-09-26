@@ -406,7 +406,10 @@ def test_rechecking_a_directory_fails_only_on_unexpected_problems(tmp_path, caps
 
 
 def commit_event(node, *, term, commit, entries, role="follower"):
-    """Return a node's Commit entry; `entries` are the newly committed `[index, term, command]`."""
+    """Return a node's Commit entry.
+
+    `entries` are the newly committed `[index, term, cluster time, command]`.
+    """
     return node_event(
         "Commit",
         node=node,
@@ -418,7 +421,10 @@ def commit_event(node, *, term, commit, entries, role="follower"):
 
 
 def leader_starts_and_wins(node, *, term, log, peers=(2, 3)):
-    """Return a node's InitState and its BecomeLeader for `term`; `log` is [term, command] pairs."""
+    """Return a node's InitState and its BecomeLeader for `term`.
+
+    `log` holds one `[term, cluster time, command]` per entry.
+    """
     return [
         node_starts(node, peers=list(peers)),
         node_event(
@@ -434,48 +440,66 @@ def leader_starts_and_wins(node, *, term, log, peers=(2, 3)):
 
 def test_nodes_committing_the_same_entries_break_no_rule():
     entries = [
-        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        commit_event(2, term=1, commit=1, entries=[[1, 1, ""]]),
-        commit_event(2, term=1, commit=2, entries=[[2, 1, "x=5"]]),
+        commit_event(1, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        commit_event(2, term=1, commit=1, entries=[[1, 1, 0, ""]]),
+        commit_event(2, term=1, commit=2, entries=[[2, 1, 0, "x=5"]]),
     ]
     assert check_election_trace(entries).problems == []
 
 
 def test_two_nodes_committing_different_commands_at_one_index_is_flagged():
     entries = [
-        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        commit_event(2, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=6"]]),
+        commit_event(1, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        commit_event(2, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=6"]]),
     ]
     assert check_election_trace(entries).problems == [
-        "node 2 committed (term 1, 'x=6') at index 2, but node 1 committed (term 1, 'x=5') there"
+        "node 2 committed (term 1, time 0, 'x=6') at index 2, but node 1 committed "
+        "(term 1, time 0, 'x=5') there"
     ]
 
 
 def test_two_nodes_committing_entries_of_different_terms_at_one_index_is_flagged():
     entries = [
-        commit_event(1, term=2, commit=1, entries=[[1, 2, "x=5"]], role="leader"),
-        commit_event(3, term=3, commit=1, entries=[[1, 3, "x=5"]]),
+        commit_event(1, term=2, commit=1, entries=[[1, 2, 0, "x=5"]], role="leader"),
+        commit_event(3, term=3, commit=1, entries=[[1, 3, 0, "x=5"]]),
     ]
     assert check_election_trace(entries).problems == [
-        "node 3 committed (term 3, 'x=5') at index 1, but node 1 committed (term 2, 'x=5') there"
+        "node 3 committed (term 3, time 0, 'x=5') at index 1, but node 1 committed "
+        "(term 2, time 0, 'x=5') there"
+    ]
+
+
+def test_two_nodes_committing_one_command_at_different_cluster_times_is_flagged():
+    entries = [
+        commit_event(1, term=1, commit=1, entries=[[1, 1, 4, "x=5"]], role="leader"),
+        commit_event(2, term=1, commit=1, entries=[[1, 1, 5, "x=5"]]),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 2 committed (term 1, time 5, 'x=5') at index 1, but node 1 committed "
+        "(term 1, time 4, 'x=5') there"
     ]
 
 
 def test_a_conflict_in_an_earlier_entry_of_a_multi_entry_commit_is_flagged():
     # The conflict is at index 2, not at the newest entry the Commit event reports.
     entries = [
-        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        commit_event(2, term=1, commit=3, entries=[[1, 1, ""], [2, 1, "x=6"], [3, 1, "y=7"]]),
+        commit_event(1, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        commit_event(
+            2, term=1, commit=3, entries=[[1, 1, 0, ""], [2, 1, 0, "x=6"], [3, 1, 0, "y=7"]]
+        ),
     ]
     assert check_election_trace(entries).problems == [
-        "node 2 committed (term 1, 'x=6') at index 2, but node 1 committed (term 1, 'x=5') there"
+        "node 2 committed (term 1, time 0, 'x=6') at index 2, but node 1 committed "
+        "(term 1, time 0, 'x=5') there"
     ]
 
 
 def test_a_new_leader_holding_every_committed_entry_breaks_no_rule():
     entries = [
-        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        *leader_starts_and_wins(2, term=2, log=[[1, ""], [1, "x=5"], [2, ""]], peers=(1, 3)),
+        commit_event(1, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        *leader_starts_and_wins(
+            2, term=2, log=[[1, 0, ""], [1, 0, "x=5"], [2, 0, ""]], peers=(1, 3)
+        ),
     ]
     problems = check_election_trace(entries).problems
     # The win itself breaks rule 4 here (no votes in this short trace), so check only rule 8.
@@ -484,22 +508,24 @@ def test_a_new_leader_holding_every_committed_entry_breaks_no_rule():
 
 def test_a_new_leader_missing_a_committed_entry_is_flagged():
     entries = [
-        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        *leader_starts_and_wins(2, term=2, log=[[1, ""], [2, ""]], peers=(1, 3)),
+        commit_event(1, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        *leader_starts_and_wins(2, term=2, log=[[1, 0, ""], [2, 0, ""]], peers=(1, 3)),
     ]
     assert (
-        "node 2 became leader of term 2 holding [2, ''] at index 2, where (term 1, 'x=5') was "
+        "node 2 became leader of term 2 holding [2, 0, ''] at index 2, where "
+        "(term 1, time 0, 'x=5') was "
         "committed in term 1" in check_election_trace(entries).problems
     )
 
 
 def test_a_new_leader_whose_log_is_too_short_for_a_committed_entry_is_flagged():
     entries = [
-        commit_event(1, term=1, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        *leader_starts_and_wins(2, term=2, log=[[1, ""]], peers=(1, 3)),
+        commit_event(1, term=1, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        *leader_starts_and_wins(2, term=2, log=[[1, 0, ""]], peers=(1, 3)),
     ]
     assert (
-        "node 2 became leader of term 2 holding None at index 2, where (term 1, 'x=5') was "
+        "node 2 became leader of term 2 holding None at index 2, where (term 1, time 0, "
+        "'x=5') was "
         "committed in term 1" in check_election_trace(entries).problems
     )
 
@@ -507,7 +533,7 @@ def test_a_new_leader_whose_log_is_too_short_for_a_committed_entry_is_flagged():
 def test_a_commit_index_that_goes_down_while_running_is_flagged():
     entries = [
         node_starts(2, peers=[1, 3]),
-        commit_event(2, term=1, commit=3, entries=[[1, 1, ""], [2, 1, "a"], [3, 1, "b"]]),
+        commit_event(2, term=1, commit=3, entries=[[1, 1, 0, ""], [2, 1, 0, "a"], [3, 1, 0, "b"]]),
         commit_event(2, term=1, commit=2, entries=[]),
     ]
     assert check_election_trace(entries).problems == ["node 2's commit index went down from 3 to 2"]
@@ -516,9 +542,9 @@ def test_a_commit_index_that_goes_down_while_running_is_flagged():
 def test_a_commit_index_relearned_from_zero_after_a_restart_is_not_flagged():
     entries = [
         node_starts(2, peers=[1, 3]),
-        commit_event(2, term=1, commit=3, entries=[[1, 1, ""], [2, 1, "a"], [3, 1, "b"]]),
+        commit_event(2, term=1, commit=3, entries=[[1, 1, 0, ""], [2, 1, 0, "a"], [3, 1, 0, "b"]]),
         node_starts(2, peers=[1, 3], term=1),
-        commit_event(2, term=1, commit=1, entries=[[1, 1, ""]]),
+        commit_event(2, term=1, commit=1, entries=[[1, 1, 0, ""]]),
     ]
     assert check_election_trace(entries).problems == []
 
@@ -528,7 +554,7 @@ def test_a_leader_of_an_earlier_term_missing_a_later_terms_commit_is_not_flagged
     # won term 2 and committed. The grant then arrives and node 1 becomes a legitimate term-1
     # Leader without node 3's entry: rule 8 says nothing about a Leader of an earlier term.
     entries = [
-        commit_event(3, term=2, commit=1, entries=[[1, 2, ""]], role="leader"),
+        commit_event(3, term=2, commit=1, entries=[[1, 2, 0, ""]], role="leader"),
         *leader_starts_and_wins(1, term=1, log=[], peers=(2, 3)),
     ]
     assert not [p for p in check_election_trace(entries).problems if "holding" in p]
@@ -536,11 +562,12 @@ def test_a_leader_of_an_earlier_term_missing_a_later_terms_commit_is_not_flagged
 
 def test_a_leader_of_the_same_term_as_the_commit_must_still_hold_it():
     entries = [
-        commit_event(3, term=2, commit=1, entries=[[1, 2, "x=5"]], role="leader"),
-        *leader_starts_and_wins(1, term=2, log=[[2, "other"]], peers=(2, 3)),
+        commit_event(3, term=2, commit=1, entries=[[1, 2, 0, "x=5"]], role="leader"),
+        *leader_starts_and_wins(1, term=2, log=[[2, 0, "other"]], peers=(2, 3)),
     ]
     assert (
-        "node 1 became leader of term 2 holding [2, 'other'] at index 1, where (term 2, 'x=5') "
+        "node 1 became leader of term 2 holding [2, 0, 'other'] at index 1, where "
+        "(term 2, time 0, 'x=5') "
         "was committed in term 2" in check_election_trace(entries).problems
     )
 
@@ -550,7 +577,7 @@ def test_a_leader_of_an_earlier_term_missing_an_old_entry_committed_later_is_not
     # compares is the term they were committed in, not the term they were written in, so a
     # term-2 Leader that lacks them is not flagged.
     entries = [
-        commit_event(3, term=3, commit=2, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
+        commit_event(3, term=3, commit=2, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
         *leader_starts_and_wins(1, term=2, log=[], peers=(2, 3)),
     ]
     assert not [p for p in check_election_trace(entries).problems if "holding" in p]
@@ -560,7 +587,10 @@ def test_a_leader_of_an_earlier_term_missing_an_old_entry_committed_later_is_not
 
 
 def apply_event(node, *, term, entries, role="follower"):
-    """Return a node's Apply entry; `entries` are the newly applied `[index, term, command]`."""
+    """Return a node's Apply entry.
+
+    `entries` are the newly applied `[index, term, cluster time, command]`.
+    """
     return node_event(
         "Apply",
         node=node,
@@ -575,9 +605,9 @@ def test_nodes_applying_the_same_commands_in_the_same_order_break_no_rule():
     entries = [
         node_starts(1, peers=[2, 3]),
         node_starts(2, peers=[1, 3]),
-        apply_event(1, term=1, entries=[[1, 1, ""], [2, 1, "x=5"]], role="leader"),
-        apply_event(2, term=1, entries=[[1, 1, ""]]),
-        apply_event(2, term=1, entries=[[2, 1, "x=5"]]),
+        apply_event(1, term=1, entries=[[1, 1, 0, ""], [2, 1, 0, "x=5"]], role="leader"),
+        apply_event(2, term=1, entries=[[1, 1, 0, ""]]),
+        apply_event(2, term=1, entries=[[2, 1, 0, "x=5"]]),
     ]
     assert check_election_trace(entries).problems == []
 
@@ -586,18 +616,31 @@ def test_two_nodes_applying_different_commands_at_one_index_is_flagged():
     entries = [
         node_starts(1, peers=[2, 3]),
         node_starts(2, peers=[1, 3]),
-        apply_event(1, term=1, entries=[[1, 1, "x=5"]], role="leader"),
-        apply_event(2, term=1, entries=[[1, 1, "x=6"]]),
+        apply_event(1, term=1, entries=[[1, 1, 0, "x=5"]], role="leader"),
+        apply_event(2, term=1, entries=[[1, 1, 0, "x=6"]]),
     ]
     assert check_election_trace(entries).problems == [
-        "node 2 applied 'x=6' at index 1, but node 1 applied 'x=5' there"
+        "node 2 applied (time 0, 'x=6') at index 1, but node 1 applied (time 0, 'x=5') there"
+    ]
+
+
+def test_two_nodes_applying_one_command_at_different_cluster_times_is_flagged():
+    # A session's expiry is judged by the time applied with each command, so it must match.
+    entries = [
+        node_starts(1, peers=[2, 3]),
+        node_starts(2, peers=[1, 3]),
+        apply_event(1, term=1, entries=[[1, 1, 4, "x=5"]], role="leader"),
+        apply_event(2, term=1, entries=[[1, 1, 5, "x=5"]]),
+    ]
+    assert check_election_trace(entries).problems == [
+        "node 2 applied (time 5, 'x=5') at index 1, but node 1 applied (time 4, 'x=5') there"
     ]
 
 
 def test_skipping_an_index_when_applying_is_flagged():
     entries = [
         node_starts(1, peers=[2, 3]),
-        apply_event(1, term=1, entries=[[1, 1, "a"], [3, 1, "c"]], role="leader"),
+        apply_event(1, term=1, entries=[[1, 1, 0, "a"], [3, 1, 0, "c"]], role="leader"),
     ]
     assert "node 1 applied index 3 when it should have applied 2 next" in (
         check_election_trace(entries).problems
@@ -607,8 +650,8 @@ def test_skipping_an_index_when_applying_is_flagged():
 def test_applying_an_index_twice_is_flagged():
     entries = [
         node_starts(1, peers=[2, 3]),
-        apply_event(1, term=1, entries=[[1, 1, "a"]], role="leader"),
-        apply_event(1, term=1, entries=[[1, 1, "a"]], role="leader"),
+        apply_event(1, term=1, entries=[[1, 1, 0, "a"]], role="leader"),
+        apply_event(1, term=1, entries=[[1, 1, 0, "a"]], role="leader"),
     ]
     assert "node 1 applied index 1 when it should have applied 2 next" in (
         check_election_trace(entries).problems
@@ -619,9 +662,9 @@ def test_a_restarted_node_applying_from_index_one_again_is_not_flagged():
     # The state machine is not persisted, so a restart replays the whole log.
     entries = [
         node_starts(1, peers=[2, 3]),
-        apply_event(1, term=1, entries=[[1, 1, "a"], [2, 1, "b"]], role="leader"),
+        apply_event(1, term=1, entries=[[1, 1, 0, "a"], [2, 1, 0, "b"]], role="leader"),
         node_starts(1, peers=[2, 3], term=1),
-        apply_event(1, term=1, entries=[[1, 1, "a"], [2, 1, "b"]]),
+        apply_event(1, term=1, entries=[[1, 1, 0, "a"], [2, 1, 0, "b"]]),
     ]
     assert check_election_trace(entries).problems == []
 
@@ -631,9 +674,11 @@ def test_replaying_an_old_index_does_not_lower_what_the_checker_expects_next():
     # quietly resyncing to the replayed index and missing it.
     entries = [
         node_starts(1, peers=[2, 3]),
-        apply_event(1, term=1, entries=[[1, 1, "a"], [2, 1, "b"], [3, 1, "c"]], role="leader"),
-        apply_event(1, term=1, entries=[[2, 1, "b"]], role="leader"),
-        apply_event(1, term=1, entries=[[3, 1, "c"]], role="leader"),
+        apply_event(
+            1, term=1, entries=[[1, 1, 0, "a"], [2, 1, 0, "b"], [3, 1, 0, "c"]], role="leader"
+        ),
+        apply_event(1, term=1, entries=[[2, 1, 0, "b"]], role="leader"),
+        apply_event(1, term=1, entries=[[3, 1, 0, "c"]], role="leader"),
     ]
     assert check_election_trace(entries).problems == [
         "node 1 applied index 2 when it should have applied 4 next",

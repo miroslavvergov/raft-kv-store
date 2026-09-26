@@ -9,7 +9,7 @@ committed an entry of its own term before it may answer a read).
 import pytest
 
 from raftkv.consensus import Cluster, LogEntry, Role
-from raftkv.kvstore import KeyValueStore
+from raftkv.kvstore import KeyValueStore, OpenSession, Put
 from raftkv.node import DurableNodeState
 from raftkv.storage import SqliteStore
 from tests.support.append_entries_messages import accepted, append_entries, heartbeat
@@ -21,16 +21,23 @@ ONE_NODE = Cluster([NODE_ID])
 
 
 class RecordingStateMachine:
-    """A state machine double that remembers the commands it was given, in order."""
+    """A state machine double that remembers the commands it was given, in order.
+
+    Attributes:
+        applied: Every command applied, in order.
+        calls: Every call, as (index, cluster_time, command).
+    """
 
     def __init__(self, fail_on=None):
         self.applied = []
+        self.calls = []
         self.fail_on = fail_on
 
-    def __call__(self, command):
+    def __call__(self, index, cluster_time, command):
         if command == self.fail_on:
             raise RuntimeError("this state machine refuses that command")
         self.applied.append(command)
+        self.calls.append((index, cluster_time, command))
 
 
 async def follower_with(store, recorder):
@@ -58,6 +65,22 @@ async def test_committed_commands_are_applied_in_log_order(db_path):
 
         assert recorder.applied == ["a", "b", "c"]
         assert durable.last_applied == 3
+
+
+async def test_each_command_is_handed_over_with_its_index_and_cluster_time(db_path):
+    # The KV Store layer names a new session after its index, and judges expiry by the time
+    # on the entry, which every replica reads the same (DD-32).
+    recorder = RecordingStateMachine()
+    entries = [LogEntry(4, "a", 3), LogEntry(4, "b", 3), LogEntry(4, "c", 7)]
+    async with SqliteStore(db_path) as store:
+        durable = await follower_with(store, recorder)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=entries, leader_commit=3)
+        )
+
+        await durable.apply_committed()
+
+        assert recorder.calls == [(1, 3, "a"), (2, 3, "b"), (3, 7, "c")]
 
 
 async def test_nothing_past_the_commit_index_is_applied(db_path):
@@ -192,13 +215,15 @@ async def test_a_state_machine_that_raises_stops_before_the_entry_that_failed(db
 
 
 async def test_a_restarted_node_replays_its_whole_log_into_a_fresh_state_machine(db_path):
-    # Seeded with real commands, since a replay hands every entry to the state machine.
+    # Seeded with real commands, since a replay hands every entry to the state machine: a
+    # session opened at index 1, which is its client ID, and two of its puts.
     async with SqliteStore(db_path) as store:
         await store.replace_log_from(
             1,
             command_entries(
-                KeyValueStore.put_command("x", "1"),
-                KeyValueStore.put_command("y", "2"),
+                OpenSession().encode(),
+                Put(1, 1, "x", "1").encode(),
+                Put(1, 2, "y", "2").encode(),
                 term=1,
             ),
         )
@@ -206,8 +231,8 @@ async def test_a_restarted_node_replays_its_whole_log_into_a_fresh_state_machine
     kv = KeyValueStore()
     async with SqliteStore(db_path) as store:
         durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES, apply=kv.apply)
-        await win_election(durable)  # term 2; its empty entry is index 3
-        await durable.append_command(KeyValueStore.put_command("x", "5"))
+        await win_election(durable)  # term 2; its empty entry is index 4
+        await durable.append_command(Put(1, 3, "x", "5").encode())
         await durable.handle_append_entries(heartbeat(term=9, leader=8, commit=0))  # steps down
 
     restarted_kv = KeyValueStore()
@@ -218,12 +243,13 @@ async def test_a_restarted_node_replays_its_whole_log_into_a_fresh_state_machine
         assert restarted.last_applied == 0  # not persisted
         # A Leader tells it how far to commit, and the whole log is replayed from the start.
         await restarted.handle_append_entries(
-            heartbeat(term=9, leader=8, prev_log_index=4, prev_log_term=2, commit=4)
+            heartbeat(term=9, leader=8, prev_log_index=5, prev_log_term=2, commit=5)
         )
         await restarted.apply_committed()
 
-        assert restarted.last_applied == 4
+        assert restarted.last_applied == 5
         assert restarted_kv.as_dict() == {"x": "5", "y": "2"}  # replayed from index 1
+        assert set(restarted_kv.sessions) == {1}
 
 
 # --- CLIENT-10: has this Leader committed an entry of its own term? -------------------
@@ -271,7 +297,7 @@ async def test_an_async_state_machine_is_refused_when_the_node_is_built(db_path)
     # Calling one would build a coroutine and drop it: last_applied would run ahead of a state
     # machine that never saw the command. Awaiting it is no answer either, since the callback
     # runs under the node's lock. So it is refused at wiring time, not at the first commit.
-    async def apply(command):
+    async def apply(index, cluster_time, command):
         raise AssertionError("never reached")
 
     async with SqliteStore(db_path) as store:

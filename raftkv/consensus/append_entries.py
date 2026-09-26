@@ -27,11 +27,12 @@ class AppendEntriesRequest:
 
     Raises:
         ValueError: If `term` is below 1; any index or term is negative; exactly
-            one of `prev_log_index` and `prev_log_term` is 0; or the entries'
-            terms fall, start below `prev_log_term`, or exceed `term`. A negative
-            `prev_log_index` would otherwise be read as an offset from the log's
-            end, and falling terms would break every check that reads a log's
-            highest term from one index.
+            one of `prev_log_index` and `prev_log_term` is 0; the entries' terms
+            fall, start below `prev_log_term`, or exceed `term`; or the entries'
+            cluster times fall. A negative `prev_log_index` would otherwise be read
+            as an offset from the log's end; falling terms would break every check
+            that reads a log's highest term from one index; and falling times would
+            let a new Leader's clock resume below an earlier entry's (DD-32).
     """
 
     term: int
@@ -64,6 +65,9 @@ class AppendEntriesRequest:
             raise ValueError(
                 f"entry terms must not fall and must lie from prev_log_term to term, got {terms}"
             )
+        times = [entry.cluster_time for entry in self.entries]
+        if times != sorted(times):
+            raise ValueError(f"entry cluster times must not fall, got {times}")
 
     @property
     def last_new_index(self) -> int:

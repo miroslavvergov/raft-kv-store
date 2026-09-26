@@ -16,7 +16,7 @@ FOLLOWERS = [2, 3]
 
 def fresh_leadership(log):
     """Return a Leadership just won with `log`, before any Follower has answered."""
-    return Leadership(TERM, FOLLOWERS, log.last_index)
+    return Leadership(TERM, FOLLOWERS, log.last_index, cluster_time=0)
 
 
 def back_off(lead, follower):

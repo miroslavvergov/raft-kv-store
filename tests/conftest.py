@@ -28,14 +28,14 @@ async def start_cluster(tmp_path, request):
     """Return a function that starts an InProcessCluster; every cluster is stopped at teardown.
 
     The function takes the member IDs and, by keyword: `preload`, each node's starting file as
-    InProcessCluster.preload's arguments; `down`, the nodes left stopped; and
-    `check_votes_on_disk`. The test's election trace is re-checked at teardown, and the test
-    fails if it breaks a rule, unless it is marked `negative_control`.
+    InProcessCluster.preload's arguments; `down`, the nodes left stopped; and InProcessCluster's
+    `check_votes_on_disk` and `session_timeout`. The test's election trace is re-checked at
+    teardown, and the test fails if it breaks a rule, unless it is marked `negative_control`.
     """
     clusters = []
 
-    async def start(member_ids, *, preload=None, down=(), check_votes_on_disk=True):
-        cluster = InProcessCluster(tmp_path, member_ids, check_votes_on_disk=check_votes_on_disk)
+    async def start(member_ids, *, preload=None, down=(), **options):
+        cluster = InProcessCluster(tmp_path, member_ids, **options)
         clusters.append(cluster)
         for node_id, starting_file in (preload or {}).items():
             await cluster.preload(node_id, **starting_file)

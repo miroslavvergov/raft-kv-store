@@ -1,73 +1,114 @@
-"""The KV Store layer's state machine: the commands it builds, and what applying one does."""
+"""The KV Store layer's state machine: a key-value map guarded by client sessions."""
 
-import json
+from raftkv.kvstore.commands import OpenSession, Put, decode_command
+from raftkv.kvstore.results import (
+    CommandResult,
+    PutApplied,
+    SessionExpired,
+    SessionOpened,
+    StaleRequest,
+)
+from raftkv.kvstore.session_table import DEFAULT_SESSION_TIMEOUT, Session, SessionTable
 
 
 class KeyValueStore:
-    """A key-value map built only by applying committed commands (DD-12).
+    """A key-value map and its client sessions, built only by applying committed commands.
 
-    The Raft layer replicates a command as an opaque string and never decodes it
-    (DD-21); this class is the only place a command is written or read. `apply`
-    depends on nothing but the current map and the command, so every replica that
-    applies the same commands in the same order holds the same map (APPLY-6).
+    The Raft layer replicates each command as an opaque string and never decodes
+    it (DD-21); this layer builds and reads them. `apply` depends on nothing but
+    the current state and its arguments, so every replica that applies the same
+    commands, at the same indexes and cluster times, holds the same map and the
+    same sessions (APPLY-6, DD-12).
+
+    Every put carries its session and request number (FAIL-4, DD-15). A put that
+    repeats its session's latest request is answered with that request's first
+    result and changes no key, so a retried put takes effect once (FAIL-6); a
+    put whose session is not open is refused.
 
     Attributes:
         keys: The keys currently stored, in sorted order.
+        sessions: A copy of every open session, by client ID, most idle first.
     """
 
-    def __init__(self) -> None:
-        """Create an empty store, as a node holds before it applies anything."""
+    def __init__(self, session_timeout: int = DEFAULT_SESSION_TIMEOUT) -> None:
+        """Create an empty store, as a node holds before it applies anything.
+
+        Args:
+            session_timeout: How long a session may stay idle, in cluster time,
+                before it expires.
+
+        Raises:
+            ValueError: If `session_timeout` is below 1.
+        """
         self._values: dict[str, str] = {}
+        self._sessions = SessionTable(session_timeout)
 
     @property
     def keys(self) -> list[str]:
         return sorted(self._values)
 
-    @staticmethod
-    def put_command(key: str, value: str) -> str:
-        """Return the command string that stores `value` under `key`.
+    @property
+    def sessions(self) -> dict[int, Session]:
+        return self._sessions.as_dict()
 
-        Serialized once here and replicated verbatim (DD-21), so the same call
-        always produces the same string and two replicas cannot disagree on what a
-        log entry says.
+    def apply(self, index: int, cluster_time: int, command: str) -> CommandResult:
+        """Apply one committed command (APPLY-6, APPLY-7, FAIL-6).
 
-        Args:
-            key: The key to store under.
-            value: The value to store.
-
-        Raises:
-            TypeError: If either is not a str.
-        """
-        if not isinstance(key, str) or not isinstance(value, str):
-            raise TypeError("a key and a value must both be str")
-        return json.dumps({"op": "put", "key": key, "value": value}, sort_keys=True)
-
-    def apply(self, command: str) -> None:
-        """Apply one committed command to the map (APPLY-6, APPLY-7).
+        Sessions idle for more than the timeout at `cluster_time` are forgotten
+        first. An OpenSession opens session `index`. A Put takes effect unless its
+        session is not open (SessionExpired), it repeats the session's latest
+        request (that request's result again), or it is older than that
+        (StaleRequest).
 
         Args:
-            command: A command string built by `put_command`.
+            index: The command's log index; a session it opens takes it as its
+                client ID.
+            cluster_time: The cluster time on the command's entry (DD-32).
+            command: A command built by this layer.
+
+        Returns:
+            The command's result.
 
         Raises:
-            ValueError: If `command` is not one this store understands. Nothing is
-                applied; a replica that rejected a command every other replica
+            ValueError: If `command` is not one this layer builds. Nothing is
+                applied; a replica that refused a command every other replica
                 accepted would diverge, so this signals a bug, not a bad request.
         """
-        try:
-            decoded = json.loads(command)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"not a command: {command!r}") from error
-        if not isinstance(decoded, dict) or decoded.get("op") != "put":
-            raise ValueError(f"unknown command: {command!r}")
-        key, value = decoded.get("key"), decoded.get("value")
-        if not isinstance(key, str) or not isinstance(value, str):
-            raise ValueError(f"a put needs a str key and a str value: {command!r}")
-        self._values[key] = value
+        # NOTE: decoded before anything expires, so a command that fails to decode changes
+        # nothing at all.
+        request = decode_command(command)
+        self._sessions.expire_idle(cluster_time)
+        match request:
+            case OpenSession():
+                self._sessions.open(index, cluster_time)
+                return SessionOpened(client_id=index)
+            case Put():
+                return self._apply_put(request, cluster_time)
 
     def get(self, key: str) -> str | None:
         """Return the value stored under `key`, or None if there is none."""
         return self._values.get(key)
 
+    def session(self, client_id: int) -> Session | None:
+        """Return the open session `client_id`, or None if it is not open."""
+        return self._sessions.get(client_id)
+
     def as_dict(self) -> dict[str, str]:
         """Return a copy of the whole map, for comparing replicas."""
         return dict(self._values)
+
+    def _apply_put(self, put: Put, cluster_time: int) -> CommandResult:
+        session = self._sessions.get(put.client_id)
+        if session is None:
+            return SessionExpired()
+        if put.seq < session.last_seq:
+            return StaleRequest()
+        if put.seq == session.last_seq:
+            # NOTE: the stored result, not a new one: the key may have changed since, and a
+            # retry must learn what its request did, not what a second put would do.
+            self._sessions.touch(put.client_id, cluster_time)
+            return session.last_result
+        result = PutApplied(previous_value=self._values.get(put.key))
+        self._values[put.key] = put.value
+        self._sessions.record(put.client_id, put.seq, result, cluster_time)
+        return result

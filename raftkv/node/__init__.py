@@ -3,8 +3,9 @@
 Import from `raftkv.node`, never from its submodules.
 """
 
-from raftkv.node.durable_node_state import DurableNodeState
+from raftkv.node.durable_node_state import ApplyCallback, DurableNodeState
 
 __all__ = [
+    "ApplyCallback",
     "DurableNodeState",
 ]

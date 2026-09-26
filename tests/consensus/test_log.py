@@ -81,7 +81,9 @@ def test_log_entry_rejects_a_term_below_one(term):
 
 
 def test_repr_shows_the_entries():
-    assert repr(Log([LogEntry(term=1, command="a")])) == "Log([LogEntry(term=1, command='a')])"
+    assert repr(Log([LogEntry(term=1, command="a")])) == (
+        "Log([LogEntry(term=1, command='a', cluster_time=0)])"
+    )
 
 
 # --- The empty entry a new Leader appends ---------------------------------------------
@@ -94,3 +96,30 @@ def test_the_empty_entry_carries_its_term_and_no_command():
 
 def test_an_entry_with_a_command_is_not_marked_empty():
     assert LogEntry(term=5, command="x=5").is_empty is False
+
+
+# --- Cluster time (DD-32) -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cluster_time", [1.0, "3", True, None])
+def test_log_entry_rejects_a_cluster_time_that_is_not_an_int(cluster_time):
+    with pytest.raises(TypeError):
+        LogEntry(term=1, command="a", cluster_time=cluster_time)
+
+
+def test_log_entry_rejects_a_negative_cluster_time():
+    with pytest.raises(ValueError):
+        LogEntry(term=1, command="a", cluster_time=-1)
+
+
+def test_an_entry_built_without_a_cluster_time_carries_zero():
+    assert LogEntry(term=1, command="a").cluster_time == 0
+
+
+def test_the_empty_entry_carries_the_cluster_time_it_is_given():
+    assert LogEntry.empty(term=3, cluster_time=40).cluster_time == 40
+
+
+def test_last_cluster_time_is_the_last_entrys_and_zero_for_an_empty_log():
+    assert Log().last_cluster_time == 0
+    assert Log([LogEntry(1, "a", 5), LogEntry(1, "b", 9)]).last_cluster_time == 9

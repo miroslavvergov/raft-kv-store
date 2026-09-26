@@ -518,7 +518,7 @@ class NodeTracer:
             properties={
                 "next": after.next_index,
                 "match": after.match_index,
-                "log": [[entry.term, entry.command] for entry in after.log],
+                "log": [[entry.term, entry.cluster_time, entry.command] for entry in after.log],
             },
         )
 
@@ -547,10 +547,12 @@ class NodeTracer:
 def _entries(state: NodeSnapshot, first: int, last: int | None) -> list[list[Any]]:
     """Return `state`'s log entries from `first` through `last` (the end if None).
 
-    Each is `[index, term, command]`, so a trace shows exactly which entry each index holds.
+    Each is `[index, term, cluster time, command]`, so a trace shows exactly which entry each
+    index holds.
     """
     last = state.log.last_index if last is None else last
-    return [
-        [index, state.log.entry_at(index).term, state.log.entry_at(index).command]
-        for index in range(first, last + 1)
-    ]
+    entries = []
+    for index in range(first, last + 1):
+        entry = state.log.entry_at(index)
+        entries.append([index, entry.term, entry.cluster_time, entry.command])
+    return entries

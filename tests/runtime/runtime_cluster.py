@@ -13,6 +13,7 @@ import random
 from collections import defaultdict
 
 from raftkv.consensus import Role
+from raftkv.kvstore import DEFAULT_SESSION_TIMEOUT, OpenSession
 from raftkv.runtime import RaftNode, Timing
 from tests.cluster.in_process_cluster import InProcessCluster
 from tests.support.in_memory_network import InMemoryNetwork
@@ -35,8 +36,18 @@ class RuntimeCluster:
         member_ids: Every member's ID, in ascending order.
     """
 
-    def __init__(self, directory, member_ids, *, timing=TEST_TIMING, seed=0):
-        self.files = InProcessCluster(directory, member_ids, check_votes_on_disk=False)
+    def __init__(
+        self,
+        directory,
+        member_ids,
+        *,
+        timing=TEST_TIMING,
+        seed=0,
+        session_timeout=DEFAULT_SESSION_TIMEOUT,
+    ):
+        self.files = InProcessCluster(
+            directory, member_ids, check_votes_on_disk=False, session_timeout=session_timeout
+        )
         self.network = InMemoryNetwork()
         self.nodes = {}
         self.ticks = 0
@@ -121,6 +132,14 @@ class RuntimeCluster:
         await self.settle()
         self.check()
         return position
+
+    async def open_session(self, leader):
+        """Open a client session through `leader`; return its client ID once `leader` commits it."""
+        position = await self.append_command(leader, OpenSession().encode())
+        durable = self.nodes[leader].durable
+        assert durable.commit_index >= position.index, "the session did not commit"
+        assert durable.log.term_at(position.index) == position.term
+        return position.index
 
     def leader(self):
         """Return the running Leader of the highest term, or None if no node leads."""

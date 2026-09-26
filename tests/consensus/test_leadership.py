@@ -61,24 +61,24 @@ def repair_all(leadership, leader_log, follower_logs):
 
 
 def test_every_follower_starts_one_past_the_leaders_last_index_with_nothing_matched():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     assert leadership.term == TERM
     assert leadership.followers == frozenset(FOLLOWERS)
     assert snapshot(leadership) == {f: (12, 0) for f in FOLLOWERS}
 
 
 def test_an_empty_leader_log_starts_every_follower_at_index_1():
-    leadership = Leadership(term=1, followers=FOLLOWERS, last_log_index=0)
+    leadership = Leadership(term=1, followers=FOLLOWERS, last_log_index=0, cluster_time=0)
     assert snapshot(leadership) == {f: (1, 0) for f in FOLLOWERS}
 
 
 def test_a_single_node_cluster_has_no_followers():
-    leadership = Leadership(term=1, followers=[], last_log_index=5)
+    leadership = Leadership(term=1, followers=[], last_log_index=5, cluster_time=0)
     assert leadership.followers == frozenset()
 
 
 def test_term_and_followers_cannot_be_assigned_directly():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     with pytest.raises(AttributeError):
         leadership.term = 8
     with pytest.raises(AttributeError):
@@ -89,7 +89,7 @@ def test_follower_records_are_never_handed_out():
     # Nothing public exposes a FollowerProgress: the only way to change one is
     # record_success or record_rejection, which check the term first. The two
     # replication methods return a new request and an index, never a record.
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     public = {name for name in dir(leadership) if not name.startswith("_")}
     assert public == {
         "term",
@@ -100,15 +100,34 @@ def test_follower_records_are_never_handed_out():
         "record_rejection",
         "append_entries_request_for",
         "commit_index_after",
+        "cluster_time",
+        "advance_cluster_time",
     }
 
 
 def test_looking_up_an_unknown_follower_raises():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     with pytest.raises(KeyError):
         leadership.next_index(99)
     with pytest.raises(KeyError):
         leadership.match_index(99)
+
+
+# --- The cluster clock (DD-32) --------------------------------------------------------
+
+
+def test_the_clock_resumes_from_the_time_it_is_given_and_counts_one_per_tick():
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=40)
+    assert leadership.cluster_time == 40
+    for _ in range(3):
+        leadership.advance_cluster_time()
+    assert leadership.cluster_time == 43
+
+
+def test_cluster_time_cannot_be_assigned_directly():
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=0, cluster_time=0)
+    with pytest.raises(AttributeError):
+        leadership.cluster_time = 99
 
 
 # --- Each election starts fresh -------------------------------------------------------
@@ -118,11 +137,11 @@ def test_winning_again_starts_fresh_even_if_this_node_led_before():
     # In term 5 this node led with 12 entries and confirmed follower 2 through index 12.
     # Another Leader then cut its log back to 11 entries, and it won again in term 7. Nothing
     # from term 5 carries over: nextIndex comes from the log it holds now, 12, not 13.
-    old = Leadership(term=5, followers=[2], last_log_index=12)
+    old = Leadership(term=5, followers=[2], last_log_index=12, cluster_time=0)
     old.record_success(2, sent_in_term=5, prev_log_index=12, entry_count=0)
     assert (old.next_index(2), old.match_index(2)) == (13, 12)
 
-    new = Leadership(term=7, followers=[2], last_log_index=11)
+    new = Leadership(term=7, followers=[2], last_log_index=11, cluster_time=0)
     assert (new.next_index(2), new.match_index(2)) == (12, 0)
 
 
@@ -130,7 +149,7 @@ def test_winning_again_starts_fresh_even_if_this_node_led_before():
 
 
 def test_success_from_this_term_is_counted_for_that_follower_only():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     before = snapshot(leadership)
     assert leadership.record_success(3, sent_in_term=TERM, prev_log_index=9, entry_count=2) is True
     after = snapshot(leadership)
@@ -139,7 +158,7 @@ def test_success_from_this_term_is_counted_for_that_follower_only():
 
 
 def test_rejection_from_this_term_is_counted_for_that_follower_only():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     before = snapshot(leadership)
     assert leadership.record_rejection(4, sent_in_term=TERM, prev_log_index=11) is True
     after = snapshot(leadership)
@@ -148,21 +167,21 @@ def test_rejection_from_this_term_is_counted_for_that_follower_only():
 
 
 def test_success_sent_in_an_earlier_term_is_ignored():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     before = snapshot(leadership)
     assert leadership.record_success(2, sent_in_term=5, prev_log_index=9, entry_count=3) is False
     assert snapshot(leadership) == before
 
 
 def test_rejection_sent_in_an_earlier_term_is_ignored():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     before = snapshot(leadership)
     assert leadership.record_rejection(2, sent_in_term=5, prev_log_index=11) is False
     assert snapshot(leadership) == before
 
 
 def test_reply_from_any_other_term_is_ignored_not_only_an_earlier_one():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     before = snapshot(leadership)
     success = leadership.record_success(2, sent_in_term=TERM + 1, prev_log_index=11, entry_count=0)
     assert success is False
@@ -171,7 +190,7 @@ def test_reply_from_any_other_term_is_ignored_not_only_an_earlier_one():
 
 
 def test_a_stale_reply_is_ignored_before_the_follower_is_even_looked_up():
-    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11)
+    leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     assert leadership.record_success(99, sent_in_term=5, prev_log_index=9, entry_count=3) is False
     assert leadership.record_rejection(99, sent_in_term=5, prev_log_index=11) is False
     with pytest.raises(KeyError):
@@ -188,7 +207,9 @@ def test_late_reply_from_an_earlier_leadership_is_not_counted():
     #         neither of which the follower has seen.
     leader_log = make_log([1] * 9 + [6, 7])
     follower_log = make_log([1] * 9 + [5, 5, 5])
-    leadership = Leadership(term=7, followers=[2], last_log_index=leader_log.last_index)
+    leadership = Leadership(
+        term=7, followers=[2], last_log_index=leader_log.last_index, cluster_time=0
+    )
 
     # The stuck term-5 reply finally arrives, claiming the follower matches through index 12,
     # past the end of the Leader's own log.
@@ -215,7 +236,9 @@ def test_invariants_hold_across_any_sequence_of_replies(seed):
     # Successes and rejections from several followers, from this term and others, in any
     # order, with every invariant checked after each one.
     rng = random.Random(seed)
-    leadership = Leadership(term=TERM, followers=[2, 3, 4], last_log_index=rng.randint(0, 20))
+    leadership = Leadership(
+        term=TERM, followers=[2, 3, 4], last_log_index=rng.randint(0, 20), cluster_time=0
+    )
     for _ in range(300):
         before = snapshot(leadership)
         follower = rng.choice([2, 3, 4])
@@ -257,7 +280,9 @@ def test_one_leadership_repairs_six_diverged_followers_taking_turns():
     ]
     leader_log = make_log(LEADER_TERMS)
     follower_logs = {node: make_log(FOLLOWER_TERMS[name]) for node, name in enumerate(names, 2)}
-    leadership = Leadership(term=8, followers=follower_logs, last_log_index=leader_log.last_index)
+    leadership = Leadership(
+        term=8, followers=follower_logs, last_log_index=leader_log.last_index, cluster_time=0
+    )
 
     rejections = repair_all(leadership, leader_log, follower_logs)
 

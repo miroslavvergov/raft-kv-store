@@ -81,9 +81,9 @@ async def test_winning_an_election_is_reported_as_etcd_reports_it(db_path, traci
     assert became_leader["prop"] == {
         "next": {8: 1, 9: 1},
         "match": {8: 0, 9: 0},
-        "log": [[1, ""]],
+        "log": [[1, 0, ""]],
     }
-    assert replicate["prop"] == {"entries": [[1, 1, ""]]}
+    assert replicate["prop"] == {"entries": [[1, 1, 0, ""]]}
 
 
 async def test_a_single_node_election_is_reported_as_candidate_then_leader(db_path, tracing_on):
@@ -490,7 +490,19 @@ async def test_a_command_is_reported_as_a_replicated_entry_with_no_line(db_path,
 
     assert log_lines(tracing_on)[lines_before:] == []  # etcd logs no line for a proposal
     replicate = trace_events(tracing_on)[-1]
-    assert (replicate["name"], replicate["prop"]) == ("Replicate", {"entries": [[2, 1, "x=5"]]})
+    assert (replicate["name"], replicate["prop"]) == ("Replicate", {"entries": [[2, 1, 0, "x=5"]]})
+
+
+async def test_a_replicated_entry_is_reported_with_its_cluster_time(db_path, tracing_on):
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES)
+        await win_election(durable)
+        for _ in range(3):
+            durable.advance_cluster_time()
+        await durable.append_command("x=5")
+
+    replicate = trace_events(tracing_on)[-1]
+    assert (replicate["name"], replicate["prop"]) == ("Replicate", {"entries": [[2, 1, 3, "x=5"]]})
 
 
 async def test_a_single_nodes_command_is_reported_replicated_then_committed(db_path, tracing_on):
@@ -501,7 +513,10 @@ async def test_a_single_nodes_command_is_reported_replicated_then_committed(db_p
 
     replicate, commit = trace_events(tracing_on)[-2:]
     assert replicate["name"] == "Replicate"
-    assert (commit["name"], commit["prop"]) == ("Commit", {"commit": 2, "entries": [[2, 1, "x=5"]]})
+    assert (commit["name"], commit["prop"]) == (
+        "Commit",
+        {"commit": 2, "entries": [[2, 1, 0, "x=5"]]},
+    )
 
 
 async def test_building_a_request_is_reported_as_sending_it(db_path, tracing_on):
@@ -541,7 +556,7 @@ async def test_a_confirmation_that_commits_is_reported_with_every_entry_it_commi
     )
     assert (commit["name"], commit["prop"]) == (
         "Commit",
-        {"commit": 2, "entries": [[1, 1, ""], [2, 1, "x=5"]]},
+        {"commit": 2, "entries": [[1, 1, 0, ""], [2, 1, 0, "x=5"]]},
     )
 
 
@@ -595,7 +610,10 @@ async def test_a_follower_learning_the_commit_index_reports_what_it_commits(db_p
         )
 
     commit, answer = trace_events(tracing_on)[-2:]
-    assert (commit["name"], commit["prop"]) == ("Commit", {"commit": 1, "entries": [[1, 1, "x=5"]]})
+    assert (commit["name"], commit["prop"]) == (
+        "Commit",
+        {"commit": 1, "entries": [[1, 1, 0, "x=5"]]},
+    )
     assert answer["name"] == "SendAppendEntriesResponse"
 
 
@@ -624,7 +642,7 @@ async def test_each_apply_reports_one_event_naming_only_the_entries_it_advanced_
     async with SqliteStore(db_path) as store:
         await store.replace_log_from(1, [LogEntry(term=1, command=c) for c in ("", "a", "b")])
         durable = await DurableNodeState.load(
-            NODE_ID, store, THREE_NODES, apply=lambda command: None
+            NODE_ID, store, THREE_NODES, apply=lambda index, cluster_time, command: None
         )
         for commit in (2, 3):
             await durable.handle_append_entries(
@@ -633,6 +651,6 @@ async def test_each_apply_reports_one_event_naming_only_the_entries_it_advanced_
             await durable.apply_committed()
 
     assert [e["prop"] for e in trace_events(tracing_on) if e["name"] == "Apply"] == [
-        {"applied": 2, "entries": [[1, 1, ""], [2, 1, "a"]]},
-        {"applied": 3, "entries": [[3, 1, "b"]]},
+        {"applied": 2, "entries": [[1, 1, 0, ""], [2, 1, 0, "a"]]},
+        {"applied": 3, "entries": [[3, 1, 0, "b"]]},
     ]

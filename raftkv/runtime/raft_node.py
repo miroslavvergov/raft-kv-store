@@ -37,6 +37,8 @@ class RaftNode:
       that has not answered yet (FAIL-2, DD-30).
     - A Leader sends each Follower its AppendEntries every heartbeat interval
       (REPL-9), with whatever entries that Follower lacks.
+    - A Leader counts each tick as one unit of cluster time (DD-32), which it
+      stamps on the entries it appends.
 
     The election timeout restarts with a newly drawn length (ELECT-1) when an
     AppendEntries from the current term's Leader arrives, accepted or not
@@ -269,6 +271,7 @@ class RaftNode:
         if heartbeat_due:
             self._heartbeat_elapsed = 0
         if self._durable.role is Role.LEADER:
+            self._durable.advance_cluster_time()
             if heartbeat_due:
                 self._start_replicating_to_all()
             return

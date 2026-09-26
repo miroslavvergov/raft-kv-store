@@ -23,17 +23,22 @@ class LogEntry:
         command: The client command, serialized once by the KV Store layer
             (DD-21). Raft never decodes or re-encodes it (APPLY-7), so every
             replica applies the same value, as APPLY-6's determinism requires.
+        cluster_time: The cluster time, in Leader ticks, when the Leader appended
+            this entry (DD-32). Every replica reads the same value here, so it is
+            the one clock all of them can agree on. It never decreases along a log.
 
     Raises:
-        TypeError: If `term` is not an int or `command` not a str. Any other type
-            would be converted on its way to disk (SQLite stores 5 in a TEXT
-            column as '5') and reload unequal to the entry appended.
-        ValueError: If `term` is below 1: every entry is appended by the Leader
-            of some term, and terms start at 1.
+        TypeError: If `term` or `cluster_time` is not an int, or `command` not a
+            str. Any other type would be converted on its way to disk (SQLite
+            stores 5 in a TEXT column as '5') and reload unequal to the entry
+            appended.
+        ValueError: If `term` is below 1 or `cluster_time` is negative. Every entry
+            is appended by the Leader of some term, and terms start at 1.
     """
 
     term: int
     command: str
+    cluster_time: int = 0
 
     def __post_init__(self) -> None:
         # NOTE: bool is an int subclass, so True would pass as term 1 without this check.
@@ -43,16 +48,22 @@ class LogEntry:
             raise ValueError(f"LogEntry.term must be at least 1, got {self.term}")
         if not isinstance(self.command, str):
             raise TypeError(f"LogEntry.command must be a str, got {type(self.command).__name__}")
+        if isinstance(self.cluster_time, bool) or not isinstance(self.cluster_time, int):
+            raise TypeError(
+                f"LogEntry.cluster_time must be an int, got {type(self.cluster_time).__name__}"
+            )
+        if self.cluster_time < 0:
+            raise ValueError(f"LogEntry.cluster_time cannot be negative, got {self.cluster_time}")
 
     @classmethod
-    def empty(cls, term: int) -> "LogEntry":
+    def empty(cls, term: int, cluster_time: int = 0) -> "LogEntry":
         """Return the entry a new Leader appends in its term, carrying no command (DD-26).
 
         A Leader commits only entries of its own term (APPLY-2, APPLY-3); this
         gives it one at once, so the entries before it commit with it even while
         no client writes.
         """
-        return cls(term=term, command=EMPTY_COMMAND)
+        return cls(term=term, command=EMPTY_COMMAND, cluster_time=cluster_time)
 
     @property
     def is_empty(self) -> bool:
@@ -94,6 +105,11 @@ class Log:
     def last_term(self) -> int:
         """The term of the last entry; 0 if empty (ELECT-7)."""
         return self._entries[-1].term if self._entries else 0
+
+    @property
+    def last_cluster_time(self) -> int:
+        """The cluster time of the last entry; 0 if empty (DD-32)."""
+        return self._entries[-1].cluster_time if self._entries else 0
 
     @property
     def last_position(self) -> LogPosition:

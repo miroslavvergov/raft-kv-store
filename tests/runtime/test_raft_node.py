@@ -2,7 +2,7 @@
 
 The test ticks the clock itself, and every election timeout is drawn as the longest there is, so
 every deadline is exact. ELECT-1, ELECT-2, ELECT-6, ELECT-13, STATE-3, REPL-2, REPL-7, REPL-9,
-APPLY-4, APPLY-5, CLIENT-6, CLIENT-7, FAIL-2, FAIL-3, DD-9, DD-26, DD-28, DD-29, DD-30.
+APPLY-4, APPLY-5, CLIENT-6, CLIENT-7, FAIL-2, FAIL-3, DD-9, DD-26, DD-28, DD-29, DD-30, DD-32.
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from raftkv.consensus import (
     NotLeaderError,
     Role,
 )
-from raftkv.kvstore import KeyValueStore
+from raftkv.kvstore import KeyValueStore, OpenSession, Put
 from raftkv.node import DurableNodeState
 from raftkv.runtime import NodeStoppedError, PeerUnreachableError, RaftNode, Timing
 from raftkv.storage import SqliteStore
@@ -454,6 +454,37 @@ async def test_a_leader_deposed_while_its_sends_wait_for_the_lock_sends_nothing(
         assert transport.of_kind("append") == []
 
 
+# --- Cluster time (DD-32) ---------------------------------------------------------------
+
+
+async def test_only_a_leaders_ticks_count_as_cluster_time_and_each_entry_carries_it(db_path):
+    transport = ScriptedTransport(everyone_agrees)
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport)
+        await win(node)  # nineteen ticks begun as Follower, none counted
+        assert node.durable.log.entry_at(1).cluster_time == 0
+
+        await tick(node, 5)
+        await node.append_command("put x")
+        await within_bound(node.idle())
+
+        assert node.durable.log.entry_at(2).cluster_time == 5
+        sent = [request for _, request in transport.of_kind("append") if request.entries]
+        assert sent[-1].entries[-1].cluster_time == 5  # Followers are sent the same time
+
+
+async def test_cluster_time_counts_every_leader_tick_not_only_heartbeats(db_path):
+    transport = ScriptedTransport(everyone_agrees)
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport, timing=Timing(heartbeat_ticks=3))
+        await win(node)
+
+        await tick(node, 5)
+        await node.append_command("put x")
+
+        assert node.durable.log.entry_at(2).cluster_time == 5
+
+
 # --- Client commands (REPL-1, CLIENT-6) --------------------------------------------------
 
 
@@ -485,17 +516,17 @@ async def test_a_command_given_to_a_follower_is_refused(db_path):
 
 async def test_a_follower_applies_what_the_leader_commits_without_being_asked(db_path):
     kv = KeyValueStore()
-    command = KeyValueStore.put_command("x", "1")
+    entries = [LogEntry(1, OpenSession().encode()), LogEntry(1, Put(1, 1, "x", "1").encode())]
     async with SqliteStore(db_path) as store:
         node = await node_with(store, apply=kv.apply)
 
         await node.handle_append_entries(
-            append_entries(term=1, leader=2, entries=[LogEntry(1, command)], leader_commit=1)
+            append_entries(term=1, leader=2, entries=entries, leader_commit=2)
         )
         await within_bound(node.idle())
 
         assert kv.as_dict() == {"x": "1"}
-        assert node.durable.last_applied == 1
+        assert node.durable.last_applied == 2
 
 
 async def test_a_node_alone_in_its_cluster_elects_itself_and_applies_its_commands(db_path):
@@ -504,7 +535,8 @@ async def test_a_node_alone_in_its_cluster_elects_itself_and_applies_its_command
         node = await node_with(store, cluster=Cluster([NODE_ID]), apply=kv.apply)
         await tick(node, LONGEST)
 
-        await node.append_command(KeyValueStore.put_command("x", "1"))
+        session = await node.append_command(OpenSession().encode())
+        await node.append_command(Put(session.index, 1, "x", "1").encode())
         await within_bound(node.idle())
 
         assert node.durable.role is Role.LEADER
@@ -515,14 +547,16 @@ async def test_a_node_alone_in_its_cluster_replays_its_log_as_soon_as_it_is_elec
     # Its empty entry commits every entry before it, and applying starts with no new command.
     kv = KeyValueStore()
     async with SqliteStore(db_path) as store:
-        await store.replace_log_from(1, [LogEntry(1, KeyValueStore.put_command("x", "1"))])
+        await store.replace_log_from(
+            1, [LogEntry(1, OpenSession().encode()), LogEntry(1, Put(1, 1, "x", "1").encode())]
+        )
         await store.save_term_and_vote(1, None)
         node = await node_with(store, cluster=Cluster([NODE_ID]), apply=kv.apply)
 
         await tick(node, LONGEST)
 
         assert kv.as_dict() == {"x": "1"}
-        assert node.durable.last_applied == 2
+        assert node.durable.last_applied == 3
 
 
 async def test_a_long_backlog_is_applied_in_batches(db_path, monkeypatch):
@@ -531,7 +565,7 @@ async def test_a_long_backlog_is_applied_in_batches(db_path, monkeypatch):
     async with SqliteStore(db_path) as store:
         await store.replace_log_from(1, [LogEntry(1, "c")] * 2500)
         await store.save_term_and_vote(1, None)
-        node = await node_with(store, apply=applied.append)
+        node = await node_with(store, apply=lambda index, time, command: applied.append(command))
         batches = []
         apply_committed = node.durable.apply_committed
 
@@ -553,7 +587,7 @@ async def test_a_long_backlog_is_applied_in_batches(db_path, monkeypatch):
 
 
 async def test_a_state_machine_that_raises_stops_the_node(db_path):
-    def broken(command):
+    def broken(index, cluster_time, command):
         raise ValueError("cannot apply")
 
     async with SqliteStore(db_path) as store:
@@ -570,7 +604,7 @@ async def test_a_state_machine_that_raises_stops_the_node(db_path):
 
 async def test_a_failure_cancels_the_nodes_other_tasks(db_path):
     # Follower 2's AppendEntries is held in flight when applying the command fails.
-    def broken(command):
+    def broken(index, cluster_time, command):
         raise ValueError("cannot apply")
 
     hold = asyncio.Event()
@@ -595,7 +629,7 @@ async def test_a_failure_cancels_the_nodes_other_tasks(db_path):
 async def test_an_append_entries_that_would_change_a_committed_entry_stops_the_node(db_path):
     # DD-29: answering would only have the Leader send the same entries again, forever.
     async with SqliteStore(db_path) as store:
-        node = await node_with(store, apply=lambda command: None)
+        node = await node_with(store, apply=lambda index, cluster_time, command: None)
         await node.handle_append_entries(
             append_entries(
                 term=1, leader=2, entries=[LogEntry(1, "a"), LogEntry(1, "b")], leader_commit=2

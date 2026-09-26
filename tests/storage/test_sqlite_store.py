@@ -14,11 +14,12 @@ from tests.support.divergent_logs import make_log
 from tests.support.store_doubles import reload, term_and_vote_on_disk
 
 
-def unchecked_entry(term, command="x"):
+def unchecked_entry(term, command="x", cluster_time=0):
     """Return a LogEntry built around its own validation, so only the store's checks apply."""
     entry = object.__new__(LogEntry)
     object.__setattr__(entry, "term", term)
     object.__setattr__(entry, "command", command)
+    object.__setattr__(entry, "cluster_time", cluster_time)
     return entry
 
 
@@ -74,6 +75,14 @@ async def test_reopening_does_not_reset_persisted_state(db_path):
 
 async def test_log_survives_a_reopen(db_path):
     log = make_log([1, 1, 2, 3])
+    async with SqliteStore(db_path) as store:
+        await store.replace_log_from(1, list(log))
+    assert (await reload(db_path)).log == log
+
+
+async def test_each_entrys_cluster_time_survives_a_reopen(db_path):
+    # DD-32: a new Leader resumes its clock from the last entry's time, even after a restart.
+    log = Log([LogEntry(1, "a", 0), LogEntry(1, "b", 7), LogEntry(2, "c", 7), LogEntry(2, "d", 40)])
     async with SqliteStore(db_path) as store:
         await store.replace_log_from(1, list(log))
     assert (await reload(db_path)).log == log
@@ -151,6 +160,13 @@ async def test_a_log_term_below_one_is_rejected_and_nothing_is_written(db_path):
     async with SqliteStore(db_path) as store:
         with pytest.raises(sqlite3.IntegrityError):
             await store.replace_log_from(1, [unchecked_entry(term=0)])
+    assert (await reload(db_path)).log == Log()
+
+
+async def test_a_negative_cluster_time_is_rejected_and_nothing_is_written(db_path):
+    async with SqliteStore(db_path) as store:
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.replace_log_from(1, [unchecked_entry(term=1, cluster_time=-1)])
     assert (await reload(db_path)).log == Log()
 
 

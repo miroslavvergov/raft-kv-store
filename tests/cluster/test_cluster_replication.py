@@ -15,15 +15,6 @@ from raftkv.consensus import CommittedEntryConflictError, Log, LogEntry, LogPosi
 from tests.cluster.in_process_cluster import AppendEntriesInFlight
 
 
-@pytest.fixture
-async def three_nodes(start_cluster):
-    """Return a running cluster of fresh nodes 1, 2, and 3, with node 1 elected Leader."""
-    cluster = await start_cluster([1, 2, 3])
-    await cluster.run_election(1)
-    assert cluster.leaders() == {1}
-    return cluster
-
-
 def commands(cluster, node_id):
     """Return a node's log as its commands, the empty entry shown as ''."""
     return [entry.command for entry in cluster.nodes[node_id].log]

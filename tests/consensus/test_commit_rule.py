@@ -23,7 +23,7 @@ def leadership(term, cluster, log, *, confirmed=None):
         log: The Leader's log.
         confirmed: The index each Follower has acknowledged, by Follower; 0 if absent.
     """
-    lead = Leadership(term, cluster.peers_of(LEADER), log.last_index)
+    lead = Leadership(term, cluster.peers_of(LEADER), log.last_index, cluster_time=0)
     for follower, index in (confirmed or {}).items():
         assert lead.record_success(follower, term, prev_log_index=0, entry_count=index)
     return lead

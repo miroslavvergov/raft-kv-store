@@ -5,7 +5,7 @@ import copy
 import functools
 import inspect
 from collections.abc import Awaitable, Callable, Coroutine
-from typing import Any
+from typing import Any, Protocol
 
 from raftkv.consensus import (
     AppendEntriesRequest,
@@ -25,6 +25,12 @@ from raftkv.consensus import (
 )
 from raftkv.storage import SqliteStore
 from raftkv.tracing import NodeTracer, traced
+
+
+class ApplyCallback(Protocol):
+    """The KV Store layer's callback for one committed command, in log order (DD-12, DD-28)."""
+
+    def __call__(self, index: int, cluster_time: int, command: str) -> object: ...
 
 
 def _holding_the_lock[T](
@@ -78,6 +84,11 @@ class DurableNodeState:
     Every node hands its committed commands, in order, to the `apply` callback
     (`apply_committed`).
 
+    A Leader stamps every entry it appends with its leadership's cluster time,
+    which `advance_cluster_time` moves one tick at a time (DD-32); a Follower
+    stores the times it is sent. Every node hands each command's index and
+    cluster time to `apply`.
+
     Attributes:
         node_id: This node's permanent positive-integer identity.
         role: The current Role; in memory only, since every node restarts as a
@@ -97,8 +108,8 @@ class DurableNodeState:
             committed, which a Leader must have before answering a read (CLIENT-10).
         peers: The IDs of every other cluster member.
         candidacy: The current term's vote tally while Candidate; else None.
-        leadership: The current term's Follower progress while Leader; else
-            None.
+        leadership: The current term's Follower progress and cluster clock while
+            Leader; else None.
     """
 
     @traced(NodeTracer.report_started)
@@ -108,7 +119,7 @@ class DurableNodeState:
         log: Log,
         store: SqliteStore,
         cluster: Cluster,
-        apply: Callable[[str], Any] | None = None,
+        apply: ApplyCallback | None = None,
     ) -> None:
         """Wrap a state and log that already equal what `store` holds.
 
@@ -119,10 +130,11 @@ class DurableNodeState:
             log: The node's log.
             store: The open store holding the persisted copy of both.
             cluster: The cluster this node is a member of.
-            apply: The KV Store layer's callback for one committed command (DD-12);
-                without it `apply_committed` refuses to pass a command on. It runs
-                under the node's lock, so it must not call back into this node, and
-                must apply the command or raise, never partly apply it and raise.
+            apply: The KV Store layer's callback for one committed command, called
+                as `apply(index, cluster_time, command)` (DD-12, DD-28); without it
+                `apply_committed` refuses to pass a command on. It runs under the
+                node's lock, so it must not call back into this node, and must
+                apply the command or raise, never partly apply it and raise.
 
         Raises:
             ValueError: If this node is not a member of `cluster`.
@@ -155,7 +167,7 @@ class DurableNodeState:
         node_id: int,
         store: SqliteStore,
         cluster: Cluster,
-        apply: Callable[[str], Any] | None = None,
+        apply: ApplyCallback | None = None,
     ) -> "DurableNodeState":
         """Rebuild a node from `store`, as a Follower (STATE-2).
 
@@ -167,9 +179,10 @@ class DurableNodeState:
             node_id: This node's permanent positive-integer identity.
             store: The node's open store.
             cluster: The cluster this node is a member of.
-            apply: The KV Store layer's callback for one committed command (DD-12).
-                It must belong to a state machine holding nothing yet: nothing is
-                applied here, so the caller applies the whole log from index 1.
+            apply: The KV Store layer's callback for one committed command, called
+                as `apply(index, cluster_time, command)` (DD-12, DD-28). It must
+                belong to a state machine holding nothing yet: nothing is applied
+                here, so the caller applies the whole log from index 1.
 
         Returns:
             The node, ready to accept or issue RPCs.
@@ -505,7 +518,9 @@ class DurableNodeState:
         # which no entry can carry.
         if self._leadership is None:
             raise NotLeaderError(f"node {self.node_id} is {self.role.value}, not leader")
-        entry = LogEntry(term=self.current_term, command=command)
+        entry = LogEntry(
+            term=self.current_term, command=command, cluster_time=self._leadership.cluster_time
+        )
         if entry.is_empty:
             raise ValueError("an empty command is reserved for a new Leader's empty entry")
         return await self._append_to_own_log(entry)
@@ -585,6 +600,15 @@ class DurableNodeState:
             self._advance_commit_index()
         return False
 
+    def advance_cluster_time(self) -> None:
+        """Count one tick of cluster time; does nothing unless Leader (DD-32).
+
+        In memory only: the time reaches disk inside the entries this Leader
+        stamps. Synchronous, so it takes no lock.
+        """
+        if self._leadership is not None:
+            self._leadership.advance_cluster_time()
+
     @_holding_the_lock
     @traced(NodeTracer.report_apply_committed)
     async def apply_committed(self, max_entries: int | None = None) -> int:
@@ -611,7 +635,7 @@ class DurableNodeState:
             RuntimeError: If an entry carries a command and no callback was given.
                 No command is applied; `last_applied` stops at the entry before it.
             Exception: Whatever the callback raised. `last_applied` stops at the
-                entry before the one that failed, so the same entry is retried.
+                entry before the one that failed, so no entry is skipped.
         """
         applied = 0
         last = self._commit_index
@@ -625,7 +649,7 @@ class DurableNodeState:
                         f"node {self.node_id} has no state machine to apply "
                         f"index {self._last_applied + 1} to"
                     )
-                self._apply(entry.command)
+                self._apply(self._last_applied + 1, entry.cluster_time, entry.command)
                 applied += 1
             self._last_applied += 1
         return applied
@@ -763,7 +787,9 @@ class DurableNodeState:
         """Append this Leader's empty entry, so earlier entries can commit (APPLY-3, DD-26)."""
         # NOTE: appended after the Leadership is built, so each Follower's next_index is this
         # entry's index and the first AppendEntries carries it.
-        await self._append_to_own_log(LogEntry.empty(self._state.current_term))
+        await self._append_to_own_log(
+            LogEntry.empty(self._state.current_term, self._leadership.cluster_time)
+        )
 
     async def _append_to_own_log(self, entry: LogEntry) -> LogPosition:
         """Persist `entry` at the end of this Leader's log, install it, advance commitment.
@@ -809,4 +835,8 @@ class DurableNodeState:
         if role is not Role.LEADER:
             self._leadership = None
         elif self._leadership is None or self._leadership.term != term:
-            self._leadership = Leadership(term, self._peers, self._log.last_index)
+            # NOTE: the clock resumes from the log's last entry, so cluster time never goes back
+            # across a change of Leader and does not count the time without one (DD-32).
+            self._leadership = Leadership(
+                term, self._peers, self._log.last_index, self._log.last_cluster_time
+            )

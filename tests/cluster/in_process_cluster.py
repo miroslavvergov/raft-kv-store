@@ -7,6 +7,7 @@ against every node that commits it and every later Leader; and every step is rep
 trace (tests/conftest.py).
 """
 
+import functools
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from raftkv.consensus import (
     RequestVoteResponse,
     Role,
 )
-from raftkv.kvstore import KeyValueStore
+from raftkv.kvstore import DEFAULT_SESSION_TIMEOUT, KeyValueStore, OpenSession, Put, decode_command
 from raftkv.node import DurableNodeState
 from raftkv.storage import SqliteStore
 from tests.support.divergent_logs import make_log
@@ -121,7 +122,8 @@ class InProcessCluster:
     duplicated, or dropped later, in any order. Every Leader and every granted vote is recorded
     per term, for `assert_election_safety`. Every committed entry is recorded the first time any
     node commits it, and after each step every committing node and every Leader is checked to
-    still hold it (`assert_log_safety`).
+    still hold it (`assert_log_safety`). Every put that takes effect on a node is recorded as
+    (client ID, request number), and no node may apply the same one twice (FAIL-6).
 
     Attributes:
         paths: Each node's SQLite file.
@@ -132,9 +134,18 @@ class InProcessCluster:
             its own vote as a Candidate included.
         committed: Every committed entry, by index, with the term of the node first seen
             committing it, as (entry, term).
+        effects: Every put that took effect on each node since it last started, as
+            (client ID, request number), in order; a stopped node's list is kept until it
+            starts again.
     """
 
-    def __init__(self, directory, member_ids, check_votes_on_disk=True):
+    def __init__(
+        self,
+        directory,
+        member_ids,
+        check_votes_on_disk=True,
+        session_timeout=DEFAULT_SESSION_TIMEOUT,
+    ):
         self.cluster = Cluster(member_ids)
         self.paths = {n: str(directory / f"node-{n}.db") for n in member_ids}
         self.nodes = {}
@@ -144,8 +155,10 @@ class InProcessCluster:
         self.committed = {}
         self.applied = {}  # index -> the command the first node seen at that index applied
         self.kv = {}
+        self.effects = {}
         self._stores = {}
         self._check_votes_on_disk = check_votes_on_disk
+        self._session_timeout = session_timeout
 
     @property
     def member_ids(self):
@@ -167,9 +180,10 @@ class InProcessCluster:
         store = SqliteStore(self.paths[node_id])
         await store.__aenter__()
         self._stores[node_id] = store
-        self.kv[node_id] = KeyValueStore()
+        self.kv[node_id] = KeyValueStore(self._session_timeout)
+        self.effects[node_id] = []
         self.nodes[node_id] = await DurableNodeState.load(
-            node_id, store, self.cluster, apply=self.kv[node_id].apply
+            node_id, store, self.cluster, apply=functools.partial(self._apply, node_id)
         )
 
     async def stop(self, node_id):
@@ -427,9 +441,18 @@ class InProcessCluster:
         at each index (APPLY-4, APPLY-6); no node commits past the end of its log; every node that
         has committed an index holds the entry first committed there; and every running Leader
         whose term is at least the term that entry was first seen committed in holds it. A Leader
-        of an earlier term, and a lagging Follower, may lack an entry committed after them.
+        of an earlier term, and a lagging Follower, may lack an entry committed after them. Also
+        asserts that cluster times never fall along any node's log (DD-32), that no node has
+        applied the same client request twice (FAIL-6), and that nodes that have applied the
+        same entries hold the same map and the same sessions (APPLY-6).
         """
         for node_id, node in self.nodes.items():
+            times = [entry.cluster_time for entry in node.log]
+            assert times == sorted(times), f"node {node_id}'s cluster times fall: {times}"
+            effects = self.effects[node_id]
+            assert len(effects) == len(set(effects)), (
+                f"node {node_id} applied a client request twice: {effects}"
+            )
             assert node.last_applied <= node.commit_index, (
                 f"node {node_id} applied through {node.last_applied} but has only committed "
                 f"{node.commit_index}"
@@ -463,6 +486,46 @@ class InProcessCluster:
                     f"leader {node_id} of term {node.current_term} holds {held} at index "
                     f"{index}, where {entry} was committed in term {term}"
                 )
+        self._assert_same_state_at_the_same_point()
+
+    async def commit_everywhere(self, leader, command):
+        """Have `leader` append `command`, replicate it to every running peer, and apply it.
+
+        Returns:
+            The entry's position.
+        """
+        position = await self.append_command(leader, command)
+        await self.replicate_to_all(leader)
+        await self.replicate_to_all(leader)  # the second round carries the commit index
+        await self.apply_everywhere()
+        return position
+
+    async def open_session(self, leader):
+        """Commit an OpenSession through `leader` and return its client ID, the entry's index.
+
+        Returned only once `leader` has committed the entry in the term it was appended in: an
+        uncommitted entry can be lost with its Leader, and its index reused.
+        """
+        position = await self.append_command(leader, OpenSession().encode())
+        await self.replicate_to_all(leader)
+        node = self.nodes[leader]
+        assert node.commit_index >= position.index, "the session did not commit"
+        assert node.log.last_index >= position.index, "the session's entry was lost"
+        assert node.log.term_at(position.index) == position.term, "the session's entry was lost"
+        return position.index
+
+    def advance_cluster_time(self, leader, ticks):
+        """Count `ticks` ticks of cluster time on `leader`, as its clock would (DD-32)."""
+        assert self.nodes[leader].role is Role.LEADER, f"node {leader} is not Leader"
+        trace_step(
+            "clock",
+            "%d ticks pass on node %d",
+            ticks,
+            leader,
+            event={"name": "ClusterTicks", "nid": leader, "ticks": ticks},
+        )
+        for _ in range(ticks):
+            self.nodes[leader].advance_cluster_time()
 
     async def apply_everywhere(self):
         """Let every running node apply everything it has committed."""
@@ -488,6 +551,53 @@ class InProcessCluster:
         self._check_after_step()
         self._trace_cluster_state()
         return applied
+
+    def times_applied(self, client_id, seq):
+        """Return how many times each running node applied request `seq` of `client_id`."""
+        return {n: self.effects[n].count((client_id, seq)) for n in self.nodes}
+
+    def has_applied(self, client_id, seq):
+        """Whether any running node has applied request `seq` of `client_id` or a later one."""
+        return any(
+            (session := self.kv[n].session(client_id)) is not None and session.last_seq >= seq
+            for n in self.nodes
+        )
+
+    def _apply(self, node_id, index, cluster_time, command):
+        """Apply a command to `node_id`'s state machine, recording a put that takes effect.
+
+        A put took effect when its session stores a new result object. The request number
+        cannot tell: a retry applied a second time would store the same number again, while
+        a recognized retry leaves the stored result, the very same object, in place. A put
+        that took no effect must leave the map exactly as it was.
+        """
+        kv = self.kv[node_id]
+        request = decode_command(command)
+        if not isinstance(request, Put):
+            return kv.apply(index, cluster_time, command)
+        before = kv.session(request.client_id)
+        map_before = kv.as_dict()
+        result = kv.apply(index, cluster_time, command)
+        after = kv.session(request.client_id)
+        if after is not None and after.last_result is not (before and before.last_result):
+            self.effects[node_id].append((request.client_id, request.seq))
+        else:
+            assert kv.as_dict() == map_before, (
+                f"node {node_id} changed its map for request {request.seq} of client "
+                f"{request.client_id}, which took no effect"
+            )
+        return result
+
+    def _assert_same_state_at_the_same_point(self):
+        """Assert that running nodes that have applied the same entries hold the same state."""
+        by_point = {}
+        for node_id, node in self.nodes.items():
+            state = (self.kv[node_id].as_dict(), self.kv[node_id].sessions)
+            first_node, first_state = by_point.setdefault(node.last_applied, (node_id, state))
+            assert state == first_state, (
+                f"nodes {first_node} and {node_id} both applied through {node.last_applied} "
+                "but hold different maps or sessions"
+            )
 
     def maps(self):
         """Return each running node's key-value map, by node ID."""

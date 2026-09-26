@@ -14,7 +14,7 @@ from tests.support.store_doubles import term_and_vote_on_disk
 
 
 @pytest.fixture
-async def three_nodes(start_cluster):
+async def fresh_three_nodes(start_cluster):
     """Return a running cluster of fresh nodes 1, 2, and 3."""
     return await start_cluster([1, 2, 3])
 
@@ -22,49 +22,51 @@ async def three_nodes(start_cluster):
 # --- A cold start ---------------------------------------------------------------------
 
 
-async def test_cold_start_elects_exactly_one_leader(three_nodes):
+async def test_cold_start_elects_exactly_one_leader(fresh_three_nodes):
     # Every node starts as a Follower in term 0 (STATE-2); node 1's timeout fires first.
-    assert three_nodes.leaders() == set()
-    await three_nodes.run_election(1)
+    assert fresh_three_nodes.leaders() == set()
+    await fresh_three_nodes.run_election(1)
 
-    assert three_nodes.leaders() == {1}
-    leader = three_nodes.nodes[1]
+    assert fresh_three_nodes.leaders() == {1}
+    leader = fresh_three_nodes.nodes[1]
     assert (leader.current_term, leader.leadership.followers) == (1, frozenset({2, 3}))
     for voter in (2, 3):
-        node = three_nodes.nodes[voter]
+        node = fresh_three_nodes.nodes[voter]
         assert (node.role, node.current_term, node.voted_for) == (Role.FOLLOWER, 1, 1)
-    three_nodes.assert_election_safety()
+    fresh_three_nodes.assert_election_safety()
 
 
-async def test_every_vote_of_the_election_survives_a_restart_of_the_whole_cluster(three_nodes):
-    await three_nodes.run_election(1)
+async def test_every_vote_of_the_election_survives_a_restart_of_the_whole_cluster(
+    fresh_three_nodes,
+):
+    await fresh_three_nodes.run_election(1)
     for node_id in (1, 2, 3):
-        await three_nodes.restart(node_id)
+        await fresh_three_nodes.restart(node_id)
     for node_id in (1, 2, 3):
-        node = three_nodes.nodes[node_id]
+        node = fresh_three_nodes.nodes[node_id]
         assert (node.role, node.current_term, node.voted_for) == (Role.FOLLOWER, 1, 1)
 
 
 # --- Split votes ----------------------------------------------------------------------
 
 
-async def test_a_three_way_split_vote_is_resolved_in_the_next_term(three_nodes):
+async def test_a_three_way_split_vote_is_resolved_in_the_next_term(fresh_three_nodes):
     # All three time out at once and vote for themselves, so every request reaches a node
     # that has already voted in term 1.
-    requests = {n: await three_nodes.fire_election_timeout(n) for n in (1, 2, 3)}
+    requests = {n: await fresh_three_nodes.fire_election_timeout(n) for n in (1, 2, 3)}
     for candidate, request in requests.items():
-        for voter in three_nodes.nodes[candidate].peers:
-            response = await three_nodes.ask_for_vote(voter, request)
+        for voter in fresh_three_nodes.nodes[candidate].peers:
+            response = await fresh_three_nodes.ask_for_vote(voter, request)
             assert response.vote_granted is False
-            await three_nodes.deliver_vote_response(voter, request, response)
-    assert three_nodes.leaders() == set()
-    assert {node.role for node in three_nodes.nodes.values()} == {Role.CANDIDATE}
+            await fresh_three_nodes.deliver_vote_response(voter, request, response)
+    assert fresh_three_nodes.leaders() == set()
+    assert {node.role for node in fresh_three_nodes.nodes.values()} == {Role.CANDIDATE}
 
     # Randomized timeouts make another collision unlikely; node 2 times out first.
-    await three_nodes.run_election(2)
-    assert three_nodes.leaders() == {2}
-    assert three_nodes.nodes[2].current_term == 2
-    three_nodes.assert_election_safety()
+    await fresh_three_nodes.run_election(2)
+    assert fresh_three_nodes.leaders() == {2}
+    assert fresh_three_nodes.nodes[2].current_term == 2
+    fresh_three_nodes.assert_election_safety()
 
 
 async def test_a_two_two_split_in_four_nodes_elects_nobody_in_that_term(start_cluster):
@@ -88,15 +90,15 @@ async def test_a_two_two_split_in_four_nodes_elects_nobody_in_that_term(start_cl
 # --- A restarted voter (PERSIST-2, PERSIST-5, ELECT-8) --------------------------------
 
 
-async def test_a_restarted_voter_refuses_a_second_candidate_in_the_same_term(three_nodes):
-    first = await three_nodes.fire_election_timeout(1)
-    assert (await three_nodes.ask_for_vote(3, first)).vote_granted
-    await three_nodes.restart(3)  # crashes right after answering
-    assert three_nodes.nodes[3].voted_for == 1
+async def test_a_restarted_voter_refuses_a_second_candidate_in_the_same_term(fresh_three_nodes):
+    first = await fresh_three_nodes.fire_election_timeout(1)
+    assert (await fresh_three_nodes.ask_for_vote(3, first)).vote_granted
+    await fresh_three_nodes.restart(3)  # crashes right after answering
+    assert fresh_three_nodes.nodes[3].voted_for == 1
 
-    second = await three_nodes.fire_election_timeout(2)
+    second = await fresh_three_nodes.fire_election_timeout(2)
     assert second.term == first.term == 1
-    assert (await three_nodes.ask_for_vote(3, second)).vote_granted is False
+    assert (await fresh_three_nodes.ask_for_vote(3, second)).vote_granted is False
 
 
 @pytest.mark.negative_control
@@ -158,31 +160,31 @@ async def test_a_candidate_missing_a_committed_entry_cannot_win(start_cluster):
 
 
 async def test_a_delayed_grant_from_an_earlier_election_cannot_create_a_second_leader(
-    three_nodes,
+    fresh_three_nodes,
 ):
     # Term 1: node 1 asks node 2, which grants, but the answer is held up.
-    stale_request = await three_nodes.fire_election_timeout(1)
-    stale_grant = await three_nodes.ask_for_vote(2, stale_request)
+    stale_request = await fresh_three_nodes.fire_election_timeout(1)
+    stale_grant = await fresh_three_nodes.ask_for_vote(2, stale_request)
     assert stale_grant.vote_granted
 
     # Node 3, cut off from node 1, loses term 1 and then wins term 2 with node 2's vote.
-    await three_nodes.run_election(3, reachable={2})
-    await three_nodes.run_election(3, reachable={2})
-    assert three_nodes.leaders() == {3}
-    assert three_nodes.nodes[3].current_term == 2
+    await fresh_three_nodes.run_election(3, reachable={2})
+    await fresh_three_nodes.run_election(3, reachable={2})
+    assert fresh_three_nodes.leaders() == {3}
+    assert fresh_three_nodes.nodes[3].current_term == 2
 
     # Node 1 has not heard of term 2 and times out into it too. No term-2 answer has reached it,
     # so node 2 has not answered this election yet.
-    await three_nodes.fire_election_timeout(1)
-    assert three_nodes.nodes[1].role is Role.CANDIDATE
-    assert three_nodes.nodes[1].current_term == 2
+    await fresh_three_nodes.fire_election_timeout(1)
+    assert fresh_three_nodes.nodes[1].role is Role.CANDIDATE
+    assert fresh_three_nodes.nodes[1].current_term == 2
 
     # The term-1 grant finally arrives; only its term marks it as stale. Counting it would give
     # node 1 two votes of three in term 2, and term 2 two Leaders.
-    assert await three_nodes.deliver_vote_response(2, stale_request, stale_grant) is False
-    assert three_nodes.nodes[1].candidacy.votes_granted == frozenset({1})
-    assert three_nodes.leaders() == {3}
-    three_nodes.assert_election_safety()
+    assert await fresh_three_nodes.deliver_vote_response(2, stale_request, stale_grant) is False
+    assert fresh_three_nodes.nodes[1].candidacy.votes_granted == frozenset({1})
+    assert fresh_three_nodes.leaders() == {3}
+    fresh_three_nodes.assert_election_safety()
 
 
 async def test_a_candidate_answered_with_a_higher_term_steps_down(start_cluster):
@@ -194,20 +196,20 @@ async def test_a_candidate_answered_with_a_higher_term_steps_down(start_cluster)
     assert await term_and_vote_on_disk(cluster.paths[1]) == (5, None)
 
 
-async def test_a_newer_election_replaces_an_old_leader_one_leader_per_term(three_nodes):
-    await three_nodes.run_election(1)
+async def test_a_newer_election_replaces_an_old_leader_one_leader_per_term(fresh_three_nodes):
+    await fresh_three_nodes.run_election(1)
     # Node 3 stops hearing from node 1 and wins term 2 with node 2's vote. Node 1 still
     # believes it leads term 1: two Leaders, but of different terms, which is allowed.
-    await three_nodes.run_election(3, reachable={2})
-    assert three_nodes.leaders() == {1, 3}
-    assert three_nodes.leaders_by_term == {1: {1}, 2: {3}}
+    await fresh_three_nodes.run_election(3, reachable={2})
+    assert fresh_three_nodes.leaders() == {1, 3}
+    assert fresh_three_nodes.leaders_by_term == {1: {1}, 2: {3}}
 
     # Node 2 times out into term 3. Its RequestVote, the first message from a later term to reach
     # node 1, ends node 1's leadership.
-    await three_nodes.ask_for_vote(1, await three_nodes.fire_election_timeout(2))
-    assert three_nodes.nodes[1].role is Role.FOLLOWER
-    assert three_nodes.nodes[1].leadership is None
-    three_nodes.assert_election_safety()
+    await fresh_three_nodes.ask_for_vote(1, await fresh_three_nodes.fire_election_timeout(2))
+    assert fresh_three_nodes.nodes[1].role is Role.FOLLOWER
+    assert fresh_three_nodes.nodes[1].leadership is None
+    fresh_three_nodes.assert_election_safety()
 
 
 # --- Randomized schedules -------------------------------------------------------------

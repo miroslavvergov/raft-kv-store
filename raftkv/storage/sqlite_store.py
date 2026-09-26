@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS node_state (
 CREATE TABLE IF NOT EXISTS log (
     idx INTEGER PRIMARY KEY CHECK (idx > 0),
     term INTEGER NOT NULL CHECK (term > 0),
+    cluster_time INTEGER NOT NULL CHECK (cluster_time >= 0),
     command TEXT NOT NULL
 ) STRICT;
 
@@ -32,8 +33,9 @@ class SqliteStore:
     Two STRICT tables (DD-23). `node_state` is one row (`CHECK (id = 1)`) of
     `current_term` and `voted_for`, updated in place: only the latest values
     are reloaded (PERSIST-4, PERSIST-5), and an old term's vote is void
-    (STATE-6). `log` has one row per entry keyed by its 1-based index, so
-    REPL-8's truncation is one range delete. STRICT stores only integers in
+    (STATE-6). `log` has one row per entry, keyed by its 1-based index so
+    REPL-8's truncation is one range delete, and holding its term, cluster time
+    (DD-32), and command. STRICT stores only integers in
     INTEGER columns and rejects values it cannot convert losslessly; without
     it `'n1'` would pass `CHECK (voted_for > 0)`, since SQLite orders text
     above integers. So every node ID on disk is a positive integer (DD-20).
@@ -123,9 +125,9 @@ class SqliteStore:
         Raises:
             ValueError: If `index` would leave a gap after the last persisted entry,
                 which would reload as a renumbered log. Nothing is written.
-            sqlite3.IntegrityError: If an entry's term cannot be stored losslessly
-                as an integer, or `index` is below 1 with entries given. Nothing is
-                written.
+            sqlite3.IntegrityError: If an entry's term or cluster time cannot be
+                stored losslessly as an integer, or `index` is below 1 with entries
+                given. Nothing is written.
         """
         async with self._transaction() as connection:
             await self._write_log_from(connection, index, entries)
@@ -181,8 +183,11 @@ class SqliteStore:
         # entries past the new last one, as a conflict truncation requires (REPL-8).
         await connection.execute("DELETE FROM log WHERE idx >= ?", (index,))
         await connection.executemany(
-            "INSERT INTO log (idx, term, command) VALUES (?, ?, ?)",
-            [(index + offset, entry.term, entry.command) for offset, entry in enumerate(entries)],
+            "INSERT INTO log (idx, term, cluster_time, command) VALUES (?, ?, ?, ?)",
+            [
+                (index + offset, entry.term, entry.cluster_time, entry.command)
+                for offset, entry in enumerate(entries)
+            ],
         )
 
     async def load(self) -> PersistedState:
@@ -194,12 +199,19 @@ class SqliteStore:
             "SELECT current_term, voted_for FROM node_state WHERE id = 1"
         ) as cursor:
             current_term, voted_for = await cursor.fetchone()
-        async with self._connection.execute("SELECT term, command FROM log ORDER BY idx") as cursor:
+        async with self._connection.execute(
+            "SELECT term, cluster_time, command FROM log ORDER BY idx"
+        ) as cursor:
             rows = await cursor.fetchall()
         return PersistedState(
             current_term=current_term,
             voted_for=voted_for,
-            log=Log([LogEntry(term=term, command=command) for term, command in rows]),
+            log=Log(
+                [
+                    LogEntry(term=term, command=command, cluster_time=cluster_time)
+                    for term, cluster_time, command in rows
+                ]
+            ),
         )
 
     @contextlib.asynccontextmanager

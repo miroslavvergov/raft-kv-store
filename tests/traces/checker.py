@@ -14,14 +14,16 @@ It reads only the nodes' trace events and the harness's disk checks, and imports
 5. A node's term never goes down, and once it has voted in a term, that vote never changes while
    the term lasts, across restarts too (PERSIST-1, PERSIST-2, STATE-6).
 6. Every vote read back from a node's file matches the vote it held when it answered (PERSIST-2).
-7. Every node that commits an index commits the same entry there, term and command.
+7. Every node that commits an index commits the same entry there: term, cluster time, and
+   command (DD-32).
 8. A new Leader's log holds every entry already committed, in its own term or in an earlier
    one. A Leader of an earlier term need not: a vote cast in that term can arrive after a later
    term has committed, which legitimately elects a Leader that is behind.
 9. A node's commit index never goes down while it runs; a restart resets it, as it is not
    persisted.
-10. Every node applies the same command at each index, one index at a time with no gaps; a
-   restart resets the count, as the state machine is rebuilt from the log (APPLY-4, APPLY-6).
+10. Every node applies the same command, at the same cluster time, at each index, one index at
+   a time with no gaps; a restart resets the count, as the state machine is rebuilt from the log
+   (APPLY-4, APPLY-6, DD-32).
 
 Run on a directory of traces: `python -m tests.traces.checker test-traces/elections`.
 """
@@ -75,9 +77,10 @@ def check_election_trace(entries):
     requests_seen = {}
     first_answers = defaultdict(dict)  # (candidate, sent in term) -> {voter: granted}
     last_term_and_vote = {}
-    committed = {}  # index -> (entry term, command, the node and term that first committed it)
+    # index -> (entry term, cluster time, command, the node and term that first committed it)
+    committed = {}
     last_commit = {}  # node -> its commit index since it last started
-    applied = {}  # index -> (command, the first node seen applying it)
+    applied = {}  # index -> (cluster time, command, the first node seen applying it)
     last_applied = {}  # node -> how far it has applied since it last started
 
     for entry in entries:
@@ -133,16 +136,16 @@ def check_election_trace(entries):
                     f"node {node}'s commit index went down from {last_commit[node]} to {commit}"
                 )
             last_commit[node] = max(commit, last_commit.get(node, 0))
-            for index, entry_term, command in event["prop"]["entries"]:  # rule 7
-                first = committed.setdefault(index, (entry_term, command, node, term))
-                if (entry_term, command) != first[:2]:
+            for index, entry_term, time, command in event["prop"]["entries"]:  # rule 7
+                first = committed.setdefault(index, (entry_term, time, command, node, term))
+                if (entry_term, time, command) != first[:3]:
                     verdict.problems.append(
-                        f"node {node} committed (term {entry_term}, {command!r}) at index "
-                        f"{index}, but node {first[2]} committed (term {first[0]}, "
-                        f"{first[1]!r}) there"
+                        f"node {node} committed (term {entry_term}, time {time}, {command!r}) at "
+                        f"index {index}, but node {first[3]} committed (term {first[0]}, time "
+                        f"{first[1]}, {first[2]!r}) there"
                     )
         elif name == "Apply":
-            for index, _entry_term, command in event["prop"]["entries"]:  # rule 10
+            for index, _entry_term, time, command in event["prop"]["entries"]:  # rule 10
                 expected = last_applied.get(node, 0) + 1
                 if index != expected:
                     verdict.problems.append(
@@ -152,11 +155,11 @@ def check_election_trace(entries):
                 # NOTE: the high-water mark, not the index just seen, so one replayed event
                 # cannot resync the check and hide the ones after it.
                 last_applied[node] = max(index, last_applied.get(node, 0))
-                first = applied.setdefault(index, (command, node))
-                if command != first[0]:
+                first = applied.setdefault(index, (time, command, node))
+                if (time, command) != first[:2]:
                     verdict.problems.append(
-                        f"node {node} applied {command!r} at index {index}, but node {first[1]} "
-                        f"applied {first[0]!r} there"
+                        f"node {node} applied (time {time}, {command!r}) at index {index}, but "
+                        f"node {first[2]} applied (time {first[0]}, {first[1]!r}) there"
                     )
         elif name == "ReceiveRequestVoteRequest":
             requests_seen[(node, msg["from"], msg["term"])] = (msg["logTerm"], msg["index"])
@@ -197,15 +200,17 @@ def check_election_trace(entries):
             # NOTE: a commit from a later term is skipped, not flagged (rule 8); it is checked
             # against the next Leader of that term or later instead.
             if leader_log is not None:
-                for index, (entry_term, command, _, committed_in) in sorted(committed.items()):
+                for index, (entry_term, time, command, _, committed_in) in sorted(
+                    committed.items()
+                ):
                     if committed_in > term:
                         continue
                     held = leader_log[index - 1] if index <= len(leader_log) else None
-                    if held != [entry_term, command]:
+                    if held != [entry_term, time, command]:
                         verdict.problems.append(
                             f"node {node} became leader of term {term} holding {held} at index "
-                            f"{index}, where (term {entry_term}, {command!r}) was committed in "
-                            f"term {committed_in}"
+                            f"{index}, where (term {entry_term}, time {time}, {command!r}) was "
+                            f"committed in term {committed_in}"
                         )
             # NOTE: with no InitState the cluster size is unknown, so the majority check cannot
             # run and the win is flagged; rule 1 counts it above either way.
