@@ -2,7 +2,8 @@
 
 APPLY-4 (strictly in log order), APPLY-5 (never past what is committed), DD-12 (the KV Store
 layer is reached only through the callback), DD-26 (a Leader's empty entry is not a command),
-DD-28 (applying is volatile, synchronous, and rebuilt by replay), CLIENT-10 (a Leader must have
+DD-28 (applying is volatile, synchronous, and rebuilt by replay), DD-33 (each entry applied is
+reported to the caller with its index, term and result), CLIENT-10 (a Leader must have
 committed an entry of its own term before it may answer a read).
 """
 
@@ -38,6 +39,11 @@ class RecordingStateMachine:
             raise RuntimeError("this state machine refuses that command")
         self.applied.append(command)
         self.calls.append((index, cluster_time, command))
+
+
+def result_of(index, cluster_time, command):
+    """A state machine double whose result for a command names it."""
+    return f"result of {command}"
 
 
 async def follower_with(store, recorder):
@@ -180,6 +186,103 @@ async def test_commands_around_an_empty_entry_are_applied_in_order(db_path):
 
         assert recorder.applied == ["a", "b"]
         assert durable.last_applied == 3  # the empty entry plus both commands
+
+
+# --- What each entry's application returned goes back to the caller (DD-28, DD-33) -----
+
+
+async def test_each_applied_entry_is_reported_with_its_index_its_own_term_and_its_result(db_path):
+    # A proposal is told apart from an overwritten one by the term the entry at its index
+    # carries when applied, so each report carries that entry's own term.
+    reports = []
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES, apply=result_of)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=[LogEntry(2, "a"), LogEntry(4, "b")], leader_commit=2)
+        )
+
+        await durable.apply_committed(on_applied=lambda *report: reports.append(report))
+
+    assert reports == [(1, 2, "result of a"), (2, 4, "result of b")]
+
+
+async def test_an_empty_entry_is_reported_with_no_result(db_path):
+    reports = []
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, ONE_NODE, apply=result_of)
+        await durable.start_election()  # alone, so its empty entry commits at once
+        await durable.append_command("a")
+
+        await durable.apply_committed(on_applied=lambda *report: reports.append(report))
+
+    assert reports == [(1, 1, None), (2, 1, "result of a")]
+
+
+async def test_an_empty_entry_after_a_command_is_reported_with_no_result_not_the_commands(db_path):
+    # An empty entry reaches no command, so it has no result of its own to report.
+    reports = []
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES, apply=result_of)
+        await durable.handle_append_entries(
+            append_entries(term=2, entries=[LogEntry(1, "a"), LogEntry.empty(2)], leader_commit=2)
+        )
+
+        await durable.apply_committed(on_applied=lambda *report: reports.append(report))
+
+    assert reports == [(1, 1, "result of a"), (2, 2, None)]
+
+
+async def test_an_entry_is_reported_only_once_it_counts_as_applied(db_path):
+    recorder = RecordingStateMachine()
+    seen = []
+    async with SqliteStore(db_path) as store:
+        durable = await follower_with(store, recorder)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=command_entries("a", "b"), leader_commit=2)
+        )
+
+        def note(index, term, result):
+            seen.append((index, durable.last_applied, list(recorder.applied)))
+
+        await durable.apply_committed(on_applied=note)
+
+    assert seen == [(1, 1, ["a"]), (2, 2, ["a", "b"])]
+
+
+async def test_a_limited_call_reports_only_the_entries_it_applied(db_path):
+    reports = []
+    async with SqliteStore(db_path) as store:
+        durable = await DurableNodeState.load(NODE_ID, store, THREE_NODES, apply=result_of)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=command_entries("a", "b", "c"), leader_commit=3)
+        )
+
+        await durable.apply_committed(max_entries=2, on_applied=lambda *r: reports.append(r))
+        assert [index for index, _, _ in reports] == [1, 2]
+        await durable.apply_committed(max_entries=2, on_applied=lambda *r: reports.append(r))
+
+    assert [index for index, _, _ in reports] == [1, 2, 3]
+
+
+async def test_a_report_that_raises_leaves_its_entry_applied(db_path):
+    # The state machine has applied the entry by then, so applying must not go back to it.
+    recorder = RecordingStateMachine()
+
+    def raising(index, term, result):
+        raise RuntimeError("the caller's callback failed")
+
+    async with SqliteStore(db_path) as store:
+        durable = await follower_with(store, recorder)
+        await durable.handle_append_entries(
+            append_entries(term=4, entries=command_entries("a", "b"), leader_commit=2)
+        )
+
+        with pytest.raises(RuntimeError, match="the caller's callback failed"):
+            await durable.apply_committed(on_applied=raising)
+
+        assert (recorder.applied, durable.last_applied) == (["a"], 1)
+        await durable.apply_committed()
+        assert recorder.applied == ["a", "b"]  # "a" is not applied twice
 
 
 # --- The callback is the only way to the KV Store layer (DD-12) -----------------------

@@ -2,7 +2,7 @@
 
 import asyncio
 import contextlib
-from collections.abc import Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from typing import Any
 
 from raftkv.runtime.errors import NodeStoppedError
@@ -15,7 +15,7 @@ class TaskSupervisor:
     node never runs on after a part it depends on has failed. Once closed, no new
     task starts and no new call is admitted. `close` cancels every task and waits
     for them and for every call still in progress, so nothing uses the node's
-    store once it returns.
+    store once it returns. It calls `on_close` once, as it first closes.
 
     Attributes:
         closed: Whether the supervisor is closed: `close` was called, or something
@@ -25,8 +25,14 @@ class TaskSupervisor:
         busy: Whether a counted task is still running.
     """
 
-    def __init__(self) -> None:
-        """Create an open supervisor with no tasks and no calls in progress."""
+    def __init__(self, on_close: Callable[[], None] | None = None) -> None:
+        """Create an open supervisor with no tasks and no calls in progress.
+
+        Args:
+            on_close: Called once, synchronously, as the supervisor first closes,
+                whether `close` was called or something failed.
+        """
+        self._on_close = on_close
         self._counted: set[asyncio.Task] = set()
         self._uncounted: set[asyncio.Task] = set()
         self._calls_in_progress = 0
@@ -121,9 +127,12 @@ class TaskSupervisor:
         await self._no_calls.wait()
 
     def _begin_closing(self) -> None:
+        first_time = not self._closed
         self._closed = True
         for task in [*self._counted, *self._uncounted]:
             task.cancel()
+        if first_time and self._on_close is not None:
+            self._on_close()
 
     def _task_done(self, task: asyncio.Task) -> None:
         self._counted.discard(task)

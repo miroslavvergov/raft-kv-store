@@ -2,7 +2,8 @@
 
 The test ticks the clock itself, and every election timeout is drawn as the longest there is, so
 every deadline is exact. ELECT-1, ELECT-2, ELECT-6, ELECT-13, STATE-3, REPL-2, REPL-7, REPL-9,
-APPLY-4, APPLY-5, CLIENT-6, CLIENT-7, FAIL-2, FAIL-3, DD-9, DD-26, DD-28, DD-29, DD-30, DD-32.
+APPLY-4, APPLY-5, CLIENT-4, CLIENT-5, CLIENT-6, CLIENT-7, FAIL-2, FAIL-3, DD-9, DD-12, DD-26,
+DD-28, DD-29, DD-30, DD-32, DD-33.
 """
 
 import asyncio
@@ -20,9 +21,23 @@ from raftkv.consensus import (
     NotLeaderError,
     Role,
 )
-from raftkv.kvstore import KeyValueStore, OpenSession, Put
+from raftkv.kvstore import (
+    KeyValueStore,
+    OpenSession,
+    Put,
+    PutApplied,
+    SessionExpired,
+    SessionOpened,
+    StaleRequest,
+)
 from raftkv.node import DurableNodeState
-from raftkv.runtime import NodeStoppedError, PeerUnreachableError, RaftNode, Timing
+from raftkv.runtime import (
+    LeadershipLostError,
+    NodeStoppedError,
+    PeerUnreachableError,
+    RaftNode,
+    Timing,
+)
 from raftkv.storage import SqliteStore
 from tests.support.append_entries_messages import accepted, append_entries, heartbeat, rejected
 from tests.support.store_doubles import GatedStore, let_other_tasks_run
@@ -107,6 +122,32 @@ async def accepted_once_released(release, request):
     return accepted(term=request.term)
 
 
+def result_of(index, cluster_time, command):
+    """A state machine double whose result for a command names it."""
+    return f"result of {command}"
+
+
+class HoldableFollowers:
+    """Peers that grant every vote and accept every AppendEntries, held in flight on request."""
+
+    def __init__(self):
+        self._held = asyncio.Event()
+        self._released = asyncio.Event()
+
+    def hold(self):
+        """Hold every AppendEntries in flight from now on, until `release`."""
+        self._held.set()
+
+    def release(self):
+        """Answer every AppendEntries held, and every one after."""
+        self._released.set()
+
+    def __call__(self, kind, peer, request):
+        if kind == "append" and self._held.is_set() and not self._released.is_set():
+            return accepted_once_released(self._released, request)
+        return everyone_agrees(kind, peer, request)
+
+
 async def node_with(
     store, transport=None, *, timing=TIMING, cluster=THREE_NODES, apply=None, rng=None
 ):
@@ -126,6 +167,14 @@ async def win(node):
     """Run out node 1's election timeout; with `everyone_agrees`, it becomes Leader."""
     await tick(node, node.election_timeout)
     assert node.durable.role is Role.LEADER
+
+
+async def start_proposal(node, command="x"):
+    """Start a proposal of `command` and return its task once it is appended and waiting."""
+    waiting = node.pending_proposals
+    proposal = asyncio.create_task(node.propose(command))
+    await eventually(lambda: node.pending_proposals > waiting)
+    return proposal
 
 
 # --- The election timeout (ELECT-1, ELECT-2, ELECT-13, DD-9) ----------------------------
@@ -569,9 +618,9 @@ async def test_a_long_backlog_is_applied_in_batches(db_path, monkeypatch):
         batches = []
         apply_committed = node.durable.apply_committed
 
-        async def recording(max_entries=None):
+        async def recording(max_entries=None, **options):
             batches.append(max_entries)
-            return await apply_committed(max_entries)
+            return await apply_committed(max_entries, **options)
 
         monkeypatch.setattr(node.durable, "apply_committed", recording)
         await node.handle_append_entries(
@@ -581,6 +630,319 @@ async def test_a_long_backlog_is_applied_in_batches(db_path, monkeypatch):
 
         assert len(applied) == 2500
         assert batches == [1000, 1000, 1000]
+
+
+# --- Proposing a command (CLIENT-4, CLIENT-5, DD-12, DD-33) ------------------------------
+
+
+async def test_a_node_alone_in_its_cluster_answers_a_proposal_with_the_state_machines_result(
+    db_path,
+):
+    # Its entry commits inside the append itself, so the proposal must already be waiting by the
+    # time applying runs, or its answer is missed.
+    kv = KeyValueStore()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, cluster=Cluster([NODE_ID]), apply=kv.apply)
+        await tick(node, LONGEST)
+
+        opened = await within_bound(node.propose(OpenSession().encode()))
+        first = await within_bound(node.propose(Put(opened.client_id, 1, "x", "1").encode()))
+        second = await within_bound(node.propose(Put(opened.client_id, 2, "x", "2").encode()))
+
+        assert opened == SessionOpened(client_id=2)  # index 1 is the Leader's empty entry
+        assert (first, second) == (PutApplied(None), PutApplied("1"))
+        assert node.pending_proposals == 0
+
+
+async def test_a_proposal_returns_the_state_machines_refusal_of_a_command_that_took_no_effect(
+    db_path,
+):
+    # A refused put is committed and applied and does nothing, so its caller must be told what
+    # applying it returned, not that it was applied.
+    kv = KeyValueStore()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, cluster=Cluster([NODE_ID]), apply=kv.apply)
+        await tick(node, LONGEST)
+        opened = await within_bound(node.propose(OpenSession().encode()))
+        await within_bound(node.propose(Put(opened.client_id, 2, "x", "2").encode()))
+
+        stale = await within_bound(node.propose(Put(opened.client_id, 1, "x", "1").encode()))
+        no_session = await within_bound(node.propose(Put(99, 1, "y", "1").encode()))
+
+        assert (stale, no_session) == (StaleRequest(), SessionExpired())
+        assert kv.as_dict() == {"x": "2"}
+
+
+async def test_a_proposal_waits_until_its_entry_is_committed_and_applied(db_path):
+    applied = []
+    followers = HoldableFollowers()
+
+    def apply(index, cluster_time, command):
+        applied.append(command)
+        return f"result of {command}"
+
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=apply)
+        await win(node)
+        followers.hold()
+
+        proposal = await start_proposal(node)
+        await let_other_tasks_run()
+
+        assert not proposal.done()
+        assert node.durable.log.last_index == 2  # appended on the Leader, acknowledged by no one
+        assert (node.durable.commit_index, applied) == (1, [])
+
+        followers.release()
+        assert await within_bound(proposal) == "result of x"
+        assert (node.durable.commit_index, node.durable.last_applied, applied) == (2, 2, ["x"])
+        assert node.pending_proposals == 0
+
+
+async def test_proposals_wait_side_by_side_until_their_entries_are_applied(db_path):
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+
+        first = await start_proposal(node, "a")
+        second = await start_proposal(node, "b")
+        assert node.pending_proposals == 2
+
+        followers.release()
+        assert await within_bound(first) == "result of a"
+        assert await within_bound(second) == "result of b"
+        assert node.pending_proposals == 0
+
+
+async def test_a_proposal_has_no_time_limit_of_its_own(db_path):
+    # Ticks are this layer's only clock: a Leader whose Followers never answer waits through
+    # twenty election timeouts, and the proposal is still waiting for them.
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        proposal = await start_proposal(node)
+
+        for _ in range(20 * TIMING.election_ticks):
+            await node.tick()
+
+        assert not proposal.done() and node.pending_proposals == 1
+        followers.release()
+        assert await within_bound(proposal) == "result of x"
+
+
+async def test_concurrent_proposals_each_get_their_own_result(db_path):
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(everyone_agrees), apply=result_of)
+        await win(node)
+
+        results = await within_bound(asyncio.gather(*(node.propose(c) for c in ("a", "b", "c"))))
+
+        assert results == ["result of a", "result of b", "result of c"]
+        assert node.pending_proposals == 0
+
+
+async def test_a_proposal_to_a_follower_is_refused_with_nothing_left_waiting(db_path):
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store)
+
+        with pytest.raises(NotLeaderError):
+            await node.propose("x")
+
+        assert node.pending_proposals == 0
+        assert node.durable.log.last_index == 0
+
+
+async def test_a_proposal_of_the_empty_command_is_refused_with_nothing_left_waiting(db_path):
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(everyone_agrees))
+        await win(node)
+
+        with pytest.raises(ValueError, match="empty command"):
+            await node.propose("")
+
+        assert node.pending_proposals == 0
+
+
+DEPOSING_RPCS = {
+    "a RequestVote of a later term": lambda node: node.handle_request_vote(
+        vote_request(term=5, candidate=3)
+    ),
+    "an AppendEntries from a later term's Leader": lambda node: node.handle_append_entries(
+        heartbeat(term=5, leader=3)
+    ),
+}
+
+
+@pytest.mark.parametrize("depose", list(DEPOSING_RPCS.values()), ids=list(DEPOSING_RPCS))
+async def test_a_proposal_fails_at_once_when_the_node_stops_being_leader_before_it_is_applied(
+    db_path, depose
+):
+    # At once: no tick runs between the RPC and the failure.
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        proposal = await start_proposal(node)
+
+        await depose(node)
+
+        with pytest.raises(LeadershipLostError, match="no longer Leader of term 1"):
+            await within_bound(proposal)
+        followers.release()
+        await within_bound(node.idle())
+        assert node.pending_proposals == 0
+        assert node.failure is None  # only the proposal ended; the node carries on
+
+
+async def test_a_proposal_fails_when_a_followers_answer_shows_a_later_term(db_path):
+    later = asyncio.Event()
+
+    def answer(kind, peer, request):
+        if kind == "append" and later.is_set():
+            return rejected(term=5)
+        return everyone_agrees(kind, peer, request)
+
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(answer), apply=result_of)
+        await win(node)
+        later.set()
+
+        with pytest.raises(LeadershipLostError):
+            await within_bound(node.propose("x"))
+
+        assert (node.durable.role, node.durable.current_term) == (Role.FOLLOWER, 5)
+        assert node.pending_proposals == 0
+
+
+@pytest.mark.parametrize("depose", list(DEPOSING_RPCS.values()), ids=list(DEPOSING_RPCS))
+async def test_a_step_down_installed_before_its_caller_was_cancelled_still_fails_the_proposals(
+    db_path, depose
+):
+    # The RPC's write completes and is installed even though its caller is cancelled (DD-22),
+    # so the node has stepped down: its proposals must fail now, not at the next tick.
+    followers = HoldableFollowers()
+    async with GatedStore(db_path) as store:
+        store.release.set()
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        proposal = await start_proposal(node)
+
+        store.hold_next_write()
+        handler = asyncio.create_task(depose(node))
+        await store.wait_for_write()
+        handler.cancel()
+        store.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await within_bound(handler)
+
+        assert (node.durable.role, node.durable.current_term) == (Role.FOLLOWER, 5)
+        with pytest.raises(LeadershipLostError):
+            await within_bound(proposal)
+        assert node.pending_proposals == 0
+
+
+async def test_a_caller_that_gives_up_leaves_nothing_waiting_and_its_entry_still_commits(db_path):
+    applied = []
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(
+            store,
+            ScriptedTransport(followers),
+            apply=lambda index, cluster_time, command: applied.append(command),
+        )
+        await win(node)
+        followers.hold()
+        proposal = await start_proposal(node)
+
+        proposal.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await proposal
+        assert node.pending_proposals == 0
+
+        followers.release()
+        await within_bound(node.idle())
+        assert (node.durable.commit_index, applied) == (2, ["x"])  # it went on without its caller
+
+
+async def test_a_proposal_waiting_when_the_node_stops_fails_with_node_stopped(db_path):
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers))
+        await win(node)
+        followers.hold()
+        proposal = await start_proposal(node)
+
+        await within_bound(node.stop())
+
+        with pytest.raises(NodeStoppedError):
+            await within_bound(proposal)
+        assert node.pending_proposals == 0
+
+
+async def test_a_command_appended_while_the_node_stops_fails_instead_of_waiting(db_path):
+    # Stopping waits for the write in progress, which then returns a position nothing will ever
+    # apply; the proposal must notice the node is closed instead of waiting on it forever.
+    async with GatedStore(db_path) as store:
+        store.release.set()
+        node = await node_with(store, ScriptedTransport(everyone_agrees))
+        await win(node)
+
+        store.hold_next_write()
+        proposal = asyncio.create_task(node.propose("x"))
+        await store.wait_for_write()
+        stopping = asyncio.create_task(node.stop())
+        await let_other_tasks_run()
+        store.release.set()
+        await within_bound(stopping)
+
+        with pytest.raises(NodeStoppedError):
+            await within_bound(proposal)
+        assert node.pending_proposals == 0
+
+
+async def test_a_state_machine_that_raises_fails_the_proposal_waiting_on_it(db_path):
+    def broken(index, cluster_time, command):
+        raise ValueError("cannot apply")
+
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(everyone_agrees), apply=broken)
+        await win(node)
+
+        with pytest.raises(NodeStoppedError):
+            await within_bound(node.propose("boom"))
+
+        assert isinstance(node.failure, ValueError)
+        assert node.pending_proposals == 0
+
+
+async def test_a_proposal_is_answered_when_tasks_start_eagerly(db_path):
+    # Eagerly started tasks run at once, so applying happens inside the append itself; the wait
+    # must be registered before that, whichever way tasks start.
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        kv = KeyValueStore()
+        async with SqliteStore(db_path) as store:
+            node = await node_with(store, cluster=Cluster([NODE_ID]), apply=kv.apply)
+            await tick(node, LONGEST)
+
+            opened = await within_bound(node.propose(OpenSession().encode()))
+
+            assert opened == SessionOpened(client_id=2)
+    finally:
+        loop.set_task_factory(None)
+
+
+def test_the_two_ways_a_proposal_fails_are_unrelated_errors():
+    # A caller that handles one must not catch the other by accident.
+    assert not issubclass(LeadershipLostError, NodeStoppedError)
+    assert not issubclass(NodeStoppedError, LeadershipLostError)
 
 
 # --- Failing and stopping ------------------------------------------------------------------
@@ -658,6 +1020,8 @@ async def test_a_stopped_node_refuses_every_call(db_path):
             await node.tick()
         with pytest.raises(NodeStoppedError):
             await node.append_command("x")
+        with pytest.raises(NodeStoppedError):
+            await node.propose("x")
         with pytest.raises(NodeStoppedError):
             await node.handle_request_vote(vote_request(term=1, candidate=2))
         with pytest.raises(NodeStoppedError):

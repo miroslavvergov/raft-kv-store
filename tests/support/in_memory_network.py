@@ -54,6 +54,15 @@ class InMemoryNetwork:
         trace_step("net", "the link between node %d and node %d is cut", a, b)
         self._cut |= {(a, b), (b, a)}
 
+    def cut_one_way(self, sender, receiver):
+        """Cut every message from `sender` to `receiver`; the other direction stays open.
+
+        A request `sender` sends to `receiver` is lost. A request `receiver` sends to `sender`
+        arrives, but `sender`'s answer to it is lost.
+        """
+        trace_step("net", "messages from node %d to node %d are cut", sender, receiver)
+        self._cut.add((sender, receiver))
+
     def heal(self):
         """Restore every cut link."""
         trace_step("net", "every link is restored")

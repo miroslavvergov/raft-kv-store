@@ -1,4 +1,4 @@
-"""The driver that runs a node by itself: its clock, the RPCs it sends, and applying."""
+"""The driver that runs a node by itself: its clock, its RPCs, applying, and proposals."""
 
 import asyncio
 import random
@@ -14,7 +14,8 @@ from raftkv.consensus import (
     Role,
 )
 from raftkv.node import DurableNodeState
-from raftkv.runtime.errors import PeerUnreachableError
+from raftkv.runtime.errors import LeadershipLostError, NodeStoppedError, PeerUnreachableError
+from raftkv.runtime.pending_proposals import PendingProposals
 from raftkv.runtime.task_supervisor import TaskSupervisor
 from raftkv.runtime.timing import Timing
 from raftkv.runtime.transport import Transport
@@ -59,6 +60,12 @@ class RaftNode:
     machine that raises, or an AppendEntries that would change a committed entry
     (DD-29) stops the node and is kept in `failure`.
 
+    A Leader's caller proposes a command with `propose`, which returns what the state
+    machine returned once the command's entry is committed and applied (CLIENT-3,
+    CLIENT-4, CLIENT-5, DD-12). It fails if the node stops leading, or stops, before
+    that; the failure says the outcome is open, since the command may still take
+    effect (DD-33). It sets no time limit of its own: the caller sets one.
+
     Attributes:
         node_id: This node's ID.
         durable: The node state this driver runs. Read it freely; change it only
@@ -69,6 +76,7 @@ class RaftNode:
         election_timeout: The current election timeout, in ticks.
         failure: The error that stopped the node, or None.
         busy: Whether any send or apply task is still running.
+        pending_proposals: How many proposals are waiting to be applied.
     """
 
     def __init__(
@@ -90,7 +98,9 @@ class RaftNode:
         self._transport = transport
         self._timing = timing or Timing()
         self._rng = rng or random.Random()
-        self._supervisor = TaskSupervisor()
+        self._proposals = PendingProposals()
+        # NOTE: told through the supervisor, not `stop`: a failing task closes it too.
+        self._supervisor = TaskSupervisor(on_close=self._fail_waiting_proposals)
         self._ticker: asyncio.Task | None = None
         self._election_elapsed = 0
         self._heartbeat_elapsed = 0
@@ -127,6 +137,10 @@ class RaftNode:
     def busy(self) -> bool:
         return self._supervisor.busy
 
+    @property
+    def pending_proposals(self) -> int:
+        return len(self._proposals)
+
     # --- Running and stopping ---------------------------------------------------------
 
     def start(self) -> None:
@@ -148,8 +162,8 @@ class RaftNode:
 
         A task cancelled during a write still finishes that write first (DD-22).
         Once this returns, nothing uses the node's store, and every later call
-        raises `NodeStoppedError`. Must not be awaited from within this node's own
-        RPC handling.
+        raises `NodeStoppedError`. Every proposal still waiting fails with it too
+        (DD-33). Must not be awaited from within this node's own RPC handling.
         """
         await self._supervisor.close()
 
@@ -186,6 +200,7 @@ class RaftNode:
             NotLeaderError: If this node is not Leader (CLIENT-6).
             TypeError: If `command` is not a str.
             ValueError: If `command` is empty, which marks a new Leader's empty entry.
+            sqlite3.Error: If writing the entry fails. Nothing was appended.
             NodeStoppedError: If the node was stopped.
         """
         with self._supervisor.call():
@@ -194,9 +209,66 @@ class RaftNode:
             finally:
                 # NOTE: in a finally, so an entry a cancelled caller installed is still sent and,
                 # in a one-node cluster, applied.
-                if self._durable.role is Role.LEADER:
-                    self._start_replicating_to_all()
-                    self._schedule_apply()
+                self._send_and_apply()
+
+    async def propose(self, command: str) -> object:
+        """Append a client command and wait until it is committed and applied; return its result.
+
+        The result is what the state machine returned for the command on this node (CLIENT-3,
+        CLIENT-4, CLIENT-5, DD-12). The wait has no time limit of its own: a caller that cannot
+        wait as long as it takes wraps the call in `asyncio.timeout`. A caller that gives up, by
+        timeout or cancellation, leaves the entry in the log, where it is committed and applied,
+        or overwritten, like any other; its result is dropped (DD-33).
+
+        Args:
+            command: The command, serialized once by the KV Store layer (DD-21).
+
+        Returns:
+            What the state machine returned for `command`.
+
+        Raises:
+            NotLeaderError: If this node is not Leader (CLIENT-6). Nothing was appended.
+            TypeError: If `command` is not a str.
+            ValueError: If `command` is empty, which marks a new Leader's empty entry.
+            sqlite3.Error: If writing the entry fails. Nothing was appended.
+            LeadershipLostError: If this node stopped being Leader before the entry was
+                applied. A later Leader may still commit the entry, so whether the command
+                takes effect is unknown.
+            NodeStoppedError: If the node was stopped before the call; nothing was appended.
+                Also if it stopped while the command was being written or waited: the entry
+                may be in the log, and whether the command takes effect is unknown.
+        """
+        with self._supervisor.call():
+            try:
+                position = await self._durable.append_command(command)
+                # NOTE: a stop during the write closed the node, and no apply will come.
+                self._supervisor.check_open()
+                # NOTE: registered before the `finally` sends or applies anything, so the entry
+                # cannot be applied, and its result dropped, before its caller is waiting.
+                future = self._proposals.register(position)
+            finally:
+                self._send_and_apply()
+        try:
+            return await future
+        finally:
+            self._proposals.discard(position)
+
+    def _send_and_apply(self) -> None:
+        """Send the entries just appended to every Follower at once and start applying.
+
+        Does nothing unless this node leads.
+        """
+        if self._durable.role is Role.LEADER:
+            self._start_replicating_to_all()
+            self._schedule_apply()
+
+    def _fail_waiting_proposals(self) -> None:
+        """Fail every proposal still waiting with `NodeStoppedError`: none is applied here now."""
+        self._proposals.fail_all(
+            NodeStoppedError,
+            f"node {self.node_id} stopped while its command waited to be applied; "
+            "whether the command takes effect is unknown",
+        )
 
     # --- RPCs from peers --------------------------------------------------------------
 
@@ -213,8 +285,12 @@ class RaftNode:
             NodeStoppedError: If the node was stopped.
         """
         with self._supervisor.call():
-            response = await self._durable.handle_vote_request(request)
-            self._notice_role_or_term_change()
+            try:
+                response = await self._durable.handle_vote_request(request)
+            finally:
+                # NOTE: in a finally, so a change installed before its caller was cancelled is
+                # noticed now, not at the next tick.
+                self._notice_role_or_term_change()
             if response.vote_granted:
                 self._restart_election_timeout()
             return response
@@ -243,7 +319,10 @@ class RaftNode:
             except CommittedEntryConflictError as error:
                 self._supervisor.fail(error)
                 raise
-            self._notice_role_or_term_change()
+            finally:
+                # NOTE: in a finally, so a change installed before its caller was cancelled is
+                # noticed now, not at the next tick.
+                self._notice_role_or_term_change()
             if request.term == self._durable.current_term and self._durable.role is Role.FOLLOWER:
                 self._leader_id = request.leader_id
                 self._restart_election_timeout()
@@ -296,7 +375,8 @@ class RaftNode:
     def _notice_role_or_term_change(self) -> None:
         """React to a new role or term, once, however many calls observe it.
 
-        A new term forgets its predecessor's Leader and RequestVote. Any change
+        A Leader that stops leading fails every proposal still waiting (DD-33). A new
+        term forgets its predecessor's Leader and RequestVote. Any change
         restarts both timers (DD-9). A new Leader records itself as `leader_id`,
         sends its empty entry at once rather than a heartbeat later, and starts
         applying.
@@ -304,6 +384,12 @@ class RaftNode:
         role, term = self._durable.role, self._durable.current_term
         if (role, term) == (self._seen_role, self._seen_term):
             return
+        if self._seen_role is Role.LEADER:
+            self._proposals.fail_all(
+                LeadershipLostError,
+                f"node {self.node_id} is no longer Leader of term {self._seen_term}; "
+                "whether the command takes effect is unknown",
+            )
         if term != self._seen_term:
             self._leader_id = None
             self._vote_request = None
@@ -414,10 +500,15 @@ class RaftNode:
         self._supervisor.spawn(self._apply())
 
     async def _apply(self) -> None:
-        """Apply committed entries in batches until the state machine has caught up."""
+        """Apply committed entries in batches until the state machine has caught up.
+
+        Each applied entry answers the proposal waiting on it, if any (DD-33).
+        """
         try:
             while self._durable.last_applied < self._durable.commit_index:
-                await self._durable.apply_committed(max_entries=_APPLY_BATCH_SIZE)
+                await self._durable.apply_committed(
+                    max_entries=_APPLY_BATCH_SIZE, on_applied=self._proposals.answer
+                )
                 await asyncio.sleep(0)
         finally:
             self._applying = False

@@ -33,6 +33,16 @@ class ApplyCallback(Protocol):
     def __call__(self, index: int, cluster_time: int, command: str) -> object: ...
 
 
+class AppliedCallback(Protocol):
+    """The caller's callback for one applied entry: its index, term, and the state machine's result.
+
+    The result is what `ApplyCallback` returned for the entry's command, and None for an empty
+    entry, which reaches no command (DD-26, DD-28, DD-33).
+    """
+
+    def __call__(self, index: int, term: int, result: object) -> None: ...
+
+
 def _holding_the_lock[T](
     method: Callable[..., Awaitable[T]],
 ) -> Callable[..., Coroutine[Any, Any, T]]:
@@ -82,7 +92,7 @@ class DurableNodeState:
     (`handle_append_entries_response`), committing what a majority holds from
     its own term. A Follower answers AppendEntries (`handle_append_entries`).
     Every node hands its committed commands, in order, to the `apply` callback
-    (`apply_committed`).
+    (`apply_committed`), which tells its caller each entry's result through `on_applied`.
 
     A Leader stamps every entry it appends with its leadership's cluster time,
     which `advance_cluster_time` moves one tick at a time (DD-32); a Follower
@@ -611,7 +621,9 @@ class DurableNodeState:
 
     @_holding_the_lock
     @traced(NodeTracer.report_apply_committed)
-    async def apply_committed(self, max_entries: int | None = None) -> int:
+    async def apply_committed(
+        self, max_entries: int | None = None, *, on_applied: AppliedCallback | None = None
+    ) -> int:
         """Apply committed entries not yet applied, in order; return how many carried a command.
 
         Walks from `last_applied + 1` to `commit_index`, or `max_entries` entries if
@@ -623,35 +635,43 @@ class DurableNodeState:
 
         Args:
             max_entries: The most entries to apply in this call, empty ones included;
-                all that are committed if None. The callback runs without yielding
-                to the event loop, so a caller with a long backlog applies it in
-                batches.
+                all that are committed if None. Applying runs without yielding to
+                the event loop, so a caller with a long backlog applies it in batches.
+            on_applied: Told of each entry right after it is applied, empty ones
+                included, with its index, its term, and what the state machine
+                returned for it (DD-28, DD-33). Called under the node's lock, so it
+                must not wait or call back into this node. It is how a Leader gets a
+                proposed command's result.
 
         Returns:
             How many commands were handed to the state machine; empty entries are
             not counted.
 
         Raises:
-            RuntimeError: If an entry carries a command and no callback was given.
+            RuntimeError: If an entry carries a command and there is no `apply` callback.
                 No command is applied; `last_applied` stops at the entry before it.
-            Exception: Whatever the callback raised. `last_applied` stops at the
-                entry before the one that failed, so no entry is skipped.
+            Exception: Whatever the `apply` callback raised. `last_applied` stops at the
+                entry before the one that failed, so no entry is skipped. If
+                `on_applied` raised instead, `last_applied` is already past that entry.
         """
         applied = 0
         last = self._commit_index
         if max_entries is not None:
             last = min(last, self._last_applied + max_entries)
         while self._last_applied < last:
-            entry = self._log.entry_at(self._last_applied + 1)
+            index = self._last_applied + 1
+            entry = self._log.entry_at(index)
+            result = None
             if not entry.is_empty:
                 if self._apply is None:
                     raise RuntimeError(
-                        f"node {self.node_id} has no state machine to apply "
-                        f"index {self._last_applied + 1} to"
+                        f"node {self.node_id} has no state machine to apply index {index} to"
                     )
-                self._apply(self._last_applied + 1, entry.cluster_time, entry.command)
+                result = self._apply(index, entry.cluster_time, entry.command)
                 applied += 1
-            self._last_applied += 1
+            self._last_applied = index
+            if on_applied is not None:
+                on_applied(index, entry.term, result)
         return applied
 
     async def _persist_then_install_append_entries(

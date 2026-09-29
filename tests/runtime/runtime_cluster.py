@@ -17,7 +17,7 @@ from raftkv.kvstore import DEFAULT_SESSION_TIMEOUT, OpenSession
 from raftkv.runtime import RaftNode, Timing
 from tests.cluster.in_process_cluster import InProcessCluster
 from tests.support.in_memory_network import InMemoryNetwork
-from tests.support.waiting import within_bound
+from tests.support.waiting import eventually, within_bound
 from tests.traces.recorder import trace_step
 
 # NOTE: the shortest election timeout that still leaves several heartbeats before it.
@@ -132,6 +132,27 @@ class RuntimeCluster:
         await self.settle()
         self.check()
         return position
+
+    async def propose(self, node_id, command):
+        """Have `node_id` propose a client command; return what it answered, once messages settle.
+
+        For a cluster that can commit it without ticks; a proposal that cannot finish fails the
+        test here, so a test of one that waits creates its own task.
+        """
+        result = await within_bound(self.nodes[node_id].propose(command))
+        await self.settle()
+        self.check()
+        return result
+
+    async def wait_until_proposal_waits(self, node_id):
+        """Wait until a proposal to `node_id` is appended and waiting, and its messages settle.
+
+        A proposal's own coroutine is not a task the cluster tracks, so `settle` alone can return
+        before its entry is written.
+        """
+        await eventually(lambda: self.nodes[node_id].pending_proposals > 0)
+        await self.settle()
+        self.check()
 
     async def open_session(self, leader):
         """Open a client session through `leader`; return its client ID once `leader` commits it."""

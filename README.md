@@ -22,7 +22,7 @@ strategy this project implements against.
       consensus/   pure Raft rules: log, roles, voting, replication, commit (no I/O)
       node/        DurableNodeState: runs those rules and persists before acting
       storage/     SQLite storage of term, vote, and log
-      runtime/     RaftNode: the clock, the RPCs a node sends, and applying
+      runtime/     RaftNode: the clock, the RPCs a node sends, applying, and proposals
       kvstore/     the key-value state machine, its commands, and its client sessions
       tracing/     log lines and trace events for every node decision
     tests/
@@ -116,7 +116,11 @@ cluster time, counted in Leader ticks, at which its Leader appended it. Clients
 open sessions through the log and number their requests, so a retried put takes
 effect once on every node; a session idle for more than 36,000 ticks (an hour
 at the default tick) is forgotten when the next command is applied, at the same
-entry on every node. Not yet built: a `propose()` that
-waits for commit and apply, a `read_barrier()` for linearizable reads, the HTTP
-transport, the client API and its retry loop, a node entry point configured from
-environment variables, and the Docker packaging.
+entry on every node. `RaftNode.propose` appends a command and returns what the
+state machine returned once the command is committed and applied. It fails,
+saying the outcome is open, if the node stops leading or stops first, and it
+sets no time limit of its own. Not yet built: a `read_barrier()` for
+linearizable reads, the HTTP transport, the client API and its retry loop, a
+node entry point configured from environment variables, and the Docker
+packaging. Planned after those: check-quorum, so that a Leader that cannot reach
+a majority steps down and the proposals waiting on it fail instead of waiting.

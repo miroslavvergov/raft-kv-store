@@ -113,3 +113,36 @@ async def test_closing_waits_for_every_call_in_progress():
 
     release.set()
     await within_bound(asyncio.gather(calling, closing))
+
+
+async def test_closing_calls_on_close_once_however_often_it_is_closed():
+    told = []
+    supervisor = TaskSupervisor(on_close=lambda: told.append(supervisor.closed))
+
+    await supervisor.close()
+    await supervisor.close()
+    supervisor.fail(ValueError("after closing"))
+
+    assert told == [True]  # once, and already closed when told
+
+
+async def test_a_failure_calls_on_close_before_anything_else_can_run():
+    told = []
+    supervisor = TaskSupervisor(on_close=lambda: told.append(True))
+
+    supervisor.fail(ValueError("broken"))
+
+    assert told == [True]  # no await in between: whoever waits is told at once
+
+
+async def test_a_task_that_raises_calls_on_close():
+    told = []
+    supervisor = TaskSupervisor(on_close=lambda: told.append(True))
+
+    async def broken():
+        raise ValueError("broken")
+
+    supervisor.spawn(broken())
+    await within_bound(supervisor.idle())
+
+    assert told == [True]
