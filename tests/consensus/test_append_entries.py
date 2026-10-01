@@ -1,12 +1,15 @@
 """Tier 1 tests for the AppendEntries messages: their fields, and REPL-13's commit rule.
 
 Pure: no disk, no node. REPL-3 (the previous entry travels with the RPC), REPL-4 (so does the
-Leader's commit index), REPL-13 (what a Follower does with it).
+Leader's commit index), REPL-13 (what a Follower does with it), DD-34 (it carries nothing more
+for a read).
 """
+
+import dataclasses
 
 import pytest
 
-from raftkv.consensus import LogEntry
+from raftkv.consensus import AppendEntriesRequest, LogEntry
 from tests.support.append_entries_messages import append_entries, heartbeat
 
 
@@ -16,6 +19,21 @@ def entries(*terms):
 
 
 # --- The request's fields (REPL-3, REPL-4) --------------------------------------------
+
+
+def test_a_request_carries_only_what_replication_needs_and_nothing_for_a_read():
+    # A Leader confirms a read by pairing each answer with the request it answers, so the RPC
+    # needs no field of its own for that (DD-34).
+    names = [field.name for field in dataclasses.fields(AppendEntriesRequest)]
+
+    assert names == [
+        "term",
+        "leader_id",
+        "prev_log_index",
+        "prev_log_term",
+        "entries",
+        "leader_commit",
+    ]
 
 
 def test_a_request_is_immutable_and_keeps_its_own_copy_of_the_entries():

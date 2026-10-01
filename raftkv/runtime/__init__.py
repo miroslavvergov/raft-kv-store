@@ -1,4 +1,4 @@
-"""Public API of the runtime: the driver that ticks a node, sends its RPCs, applies, and proposes.
+"""Public API of the runtime: the driver that ticks a node, sends RPCs, applies, proposes and reads.
 
 Import from `raftkv.runtime`, never from its submodules.
 """

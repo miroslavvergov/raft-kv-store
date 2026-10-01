@@ -22,7 +22,7 @@ strategy this project implements against.
       consensus/   pure Raft rules: log, roles, voting, replication, commit (no I/O)
       node/        DurableNodeState: runs those rules and persists before acting
       storage/     SQLite storage of term, vote, and log
-      runtime/     RaftNode: the clock, the RPCs a node sends, applying, and proposals
+      runtime/     RaftNode: the clock, the RPCs a node sends, applying, proposals, reads
       kvstore/     the key-value state machine, its commands, and its client sessions
       tracing/     log lines and trace events for every node decision
     tests/
@@ -107,8 +107,7 @@ lacks, backs off on rejection, and commits what a majority holds from its own
 term; a Follower accepts entries and learns the commit index. Committed
 entries are applied in order to a key-value state machine, which every node
 rebuilds by replaying its log after a restart, and a Leader knows whether it
-has committed in its own term, one of the three conditions a linearizable read
-waits on (CLIENT-8, CLIENT-9, CLIENT-10). A `RaftNode` runs each node by itself
+has committed in its own term (CLIENT-10). A `RaftNode` runs each node by itself
 on a clock counted in ticks: election timeouts, heartbeats, sending and
 resending RPCs, and applying what commits, over any `Transport`; the tests run
 whole clusters of them over an in-memory network. Every entry carries the
@@ -119,8 +118,16 @@ at the default tick) is forgotten when the next command is applied, at the same
 entry on every node. `RaftNode.propose` appends a command and returns what the
 state machine returned once the command is committed and applied. It fails,
 saying the outcome is open, if the node stops leading or stops first, and it
-sets no time limit of its own. Not yet built: a `read_barrier()` for
-linearizable reads, the HTTP transport, the client API and its retry loop, a
-node entry point configured from environment variables, and the Docker
-packaging. Planned after those: check-quorum, so that a Leader that cannot reach
-a majority steps down and the proposals waiting on it fail instead of waiting.
+sets no time limit of its own. `RaftNode.read_barrier` returns the read index,
+the commit index when the read began, once the state machine has applied through
+it, so that the state machine may then be read. A read waits until the Leader has
+committed an entry of its own term and until a majority has answered a request
+built after the read began, so a Leader that a newer one has replaced serves no
+read (CLIENT-8, CLIENT-9, CLIENT-10). It fails with `NotLeaderError` if the node
+is not Leader or stops leading, and with `NodeStoppedError` if the node stops; it
+sets no time limit of its own. Not yet built: the KV service that turns a
+client's put and get into `propose` and `read_barrier`, the HTTP transport, the
+client API and its retry loop, a node entry point configured from environment
+variables, and the Docker packaging. Planned after those: check-quorum, so that
+a Leader that cannot reach a majority steps down and the proposals and reads
+waiting on it fail instead of waiting.

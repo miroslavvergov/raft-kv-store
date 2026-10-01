@@ -1,4 +1,6 @@
-"""A Leader's per-Follower replication progress: nextIndex and matchIndex."""
+"""A Leader's per-Follower replication progress: nextIndex, matchIndex, and what it has answered."""
+
+from raftkv.consensus.append_entries import AppendEntriesRequest
 
 
 class FollowerProgress:
@@ -12,11 +14,18 @@ class FollowerProgress:
     `match_index < next_index`. It holds no term: its `Leadership` passes on only
     replies to RPCs sent in its own term.
 
+    It also remembers the request built last, with its number, until the
+    Follower answers it, and the number of the newest request the Follower has
+    answered, so that `Leadership` can tell which requests a read's confirmation
+    may count (CLIENT-8, DD-34).
+
     Attributes:
         next_index: The index of the next entry to send; always above
             `match_index`.
         match_index: The highest index known to match on the Follower; 0 until
             one is confirmed. Never decreases (REPL-17).
+        answered_request: The number of the newest request the Follower has
+            answered in this term; 0 until one is.
     """
 
     def __init__(self, next_index: int) -> None:
@@ -29,6 +38,9 @@ class FollowerProgress:
         """
         self._next_index = next_index
         self._match_index = 0
+        self._awaiting_answer: AppendEntriesRequest | None = None
+        self._awaiting_number = 0
+        self._answered_request = 0
 
     @property
     def next_index(self) -> int:
@@ -37,6 +49,37 @@ class FollowerProgress:
     @property
     def match_index(self) -> int:
         return self._match_index
+
+    @property
+    def answered_request(self) -> int:
+        return self._answered_request
+
+    def record_built(self, request: AppendEntriesRequest, request_number: int) -> None:
+        """Remember `request`, the one now awaiting an answer, and its number.
+
+        Args:
+            request: The AppendEntries just built for this Follower.
+            request_number: Its number among every request the leadership has built.
+        """
+        self._awaiting_answer = request
+        self._awaiting_number = request_number
+
+    def record_reply(self, request: AppendEntriesRequest) -> None:
+        """Record that the Follower answered `request`, if it is the one now awaiting an answer.
+
+        Only the request built last counts: an answer to an older one, or a second
+        answer to the same one, changes nothing. The request is matched by identity,
+        not equality: two heartbeats to a caught-up Follower are equal in every
+        field, so equality could not tell an answer to the older from one to the newer.
+
+        Args:
+            request: The AppendEntries the Follower answered: the very object given to
+                `record_built`. An equal copy is not recognized.
+        """
+        if request is not self._awaiting_answer:
+            return
+        self._answered_request = self._awaiting_number
+        self._awaiting_answer = None
 
     def record_success(self, prev_log_index: int, entry_count: int) -> None:
         """Record that the Follower accepted an AppendEntries.

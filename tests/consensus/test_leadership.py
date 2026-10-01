@@ -86,9 +86,9 @@ def test_term_and_followers_cannot_be_assigned_directly():
 
 
 def test_follower_records_are_never_handed_out():
-    # Nothing public exposes a FollowerProgress: the only way to change one is
-    # record_success or record_rejection, which check the term first. The two
-    # replication methods return a new request and an index, never a record.
+    # Nothing public exposes a FollowerProgress. After the term check, only record_success and
+    # record_rejection change a Follower's next_index and match_index, and record_reply records
+    # an answer; the other methods return a request, an index, a number or a flag, never a record.
     leadership = Leadership(term=TERM, followers=FOLLOWERS, last_log_index=11, cluster_time=0)
     public = {name for name in dir(leadership) if not name.startswith("_")}
     assert public == {
@@ -96,10 +96,14 @@ def test_follower_records_are_never_handed_out():
         "followers",
         "next_index",
         "match_index",
+        "answered_request",
         "record_success",
         "record_rejection",
+        "record_reply",
         "append_entries_request_for",
         "commit_index_after",
+        "confirmation_mark",
+        "confirmed_since",
         "cluster_time",
         "advance_cluster_time",
     }

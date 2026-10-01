@@ -90,9 +90,12 @@ class DurableNodeState:
     A Leader appends client commands (`append_command`), builds each Follower's
     AppendEntries (`append_entries_request_for`), and records the answers
     (`handle_append_entries_response`), committing what a majority holds from
-    its own term. A Follower answers AppendEntries (`handle_append_entries`).
-    Every node hands its committed commands, in order, to the `apply` callback
-    (`apply_committed`), which tells its caller each entry's result through `on_applied`.
+    its own term. For a read it gives the mark and read index
+    (`mark_and_read_index`) and tells whether a majority has confirmed the read
+    (`read_confirmed`) (CLIENT-8, CLIENT-10, DD-34). A Follower answers
+    AppendEntries (`handle_append_entries`). Every node hands its committed
+    commands, in order, to the `apply` callback (`apply_committed`), which tells its
+    caller each entry's result through `on_applied`.
 
     A Leader stamps every entry it appends with its leadership's cluster time,
     which `advance_cluster_time` moves one tick at a time (DD-32); a Follower
@@ -542,8 +545,9 @@ class DurableNodeState:
 
         Built by `Leadership.append_entries_request_for` from the Follower's
         `next_index`, this node's log, and its commit index (REPL-4). Changes
-        nothing; taken under the lock, so it never reflects a change still being
-        written.
+        nothing in the log or on disk, but numbers the request and remembers it as
+        the one now awaiting this Follower's answer (DD-34); taken under the lock,
+        so it never reflects a change still being written.
 
         Args:
             follower: A peer of this node.
@@ -572,7 +576,10 @@ class DurableNodeState:
         2. Otherwise only a Leader records it, and only an answer to an RPC sent in
            this term counts (REPL-16, DD-25); `request` is the RPC answered, so its
            term is the term it was sent in.
-        3. A success raises the Follower's `match_index` to the last entry `request`
+        3. An answer carrying that term, a rejection included, shows the Follower
+           recognizes this Leader; it counts toward confirming a read if `request`
+           is the one built last for that Follower (CLIENT-8, DD-34).
+        4. A success raises the Follower's `match_index` to the last entry `request`
            carried (REPL-16, REPL-17), then advances `commit_index` (APPLY-1,
            APPLY-2, APPLY-3). A rejection of the probe now outstanding lowers its
            `next_index` (REPL-6, DD-27); a duplicate or a late rejection of an
@@ -601,6 +608,9 @@ class DurableNodeState:
             return False
         if self._leadership is None:
             return False
+        # NOTE: a rejection of the log check carries this term too: the Follower took it as its own.
+        if response.term == request.term:
+            self._leadership.record_reply(follower, request)
         if not response.success:
             return self._leadership.record_rejection(follower, request.term, request.prev_log_index)
         counted = self._leadership.record_success(
@@ -618,6 +628,49 @@ class DurableNodeState:
         """
         if self._leadership is not None:
             self._leadership.advance_cluster_time()
+
+    def mark_and_read_index(self) -> tuple[int, int]:
+        """Return the mark and the read index for a read that begins now.
+
+        The read index is the commit index now. As this Leader has committed an entry
+        of its own term (CLIENT-10), no write committed before the read began lies
+        beyond it, so the read may be served once the state machine has applied
+        through it. The mark is what `read_confirmed` tests: only requests built after
+        it confirm this Leader for the read (CLIENT-8, DD-34). In memory only, and
+        changes nothing. Synchronous, so it takes no lock.
+
+        Returns:
+            The mark and the read index.
+
+        Raises:
+            NotLeaderError: If the node is not Leader.
+            RuntimeError: If no entry of the current term is committed yet, so the
+                commit index may still be behind what earlier Leaders committed.
+        """
+        if self._leadership is None:
+            raise NotLeaderError(f"node {self.node_id} is {self.role.value}, not leader")
+        if not self.has_committed_in_current_term:
+            raise RuntimeError(
+                f"node {self.node_id} has committed nothing of term {self.current_term} yet, "
+                "so its commit index may be behind (CLIENT-10)"
+            )
+        return self._leadership.confirmation_mark(), self._commit_index
+
+    def read_confirmed(self, mark: int) -> bool:
+        """Whether a majority, counting this node, has answered a request built after `mark`.
+
+        A majority of the cluster, so that no other Leader can have been elected before
+        the read began (CLIENT-8, DD-34). Synchronous, so it takes no lock.
+
+        Args:
+            mark: What `mark_and_read_index` returned when the read began.
+
+        Raises:
+            NotLeaderError: If the node is not Leader.
+        """
+        if self._leadership is None:
+            raise NotLeaderError(f"node {self.node_id} is {self.role.value}, not leader")
+        return self._leadership.confirmed_since(mark, self._cluster.majority)
 
     @_holding_the_lock
     @traced(NodeTracer.report_apply_committed)

@@ -144,6 +144,23 @@ class RuntimeCluster:
         self.check()
         return result
 
+    async def read_barrier(self, node_id):
+        """Have `node_id` serve a read; return its read index, once messages settle.
+
+        For a cluster that can confirm it without ticks; a read that cannot be served fails the
+        test here, so a test of one that waits creates its own task.
+        """
+        index = await within_bound(self.nodes[node_id].read_barrier())
+        await self.settle()
+        self.check()
+        return index
+
+    async def wait_until_read_waits(self, node_id):
+        """Wait until a read on `node_id` is registered and waiting, and its messages settle."""
+        await eventually(lambda: self.nodes[node_id].pending_reads > 0)
+        await self.settle()
+        self.check()
+
     async def wait_until_proposal_waits(self, node_id):
         """Wait until a proposal to `node_id` is appended and waiting, and its messages settle.
 

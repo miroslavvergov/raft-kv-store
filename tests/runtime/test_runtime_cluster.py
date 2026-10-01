@@ -2,20 +2,21 @@
 
 After every tick no node has failed, no term has two Leaders, no committed entry has changed, no
 cluster time has fallen, and no client request has taken effect twice (RuntimeCluster.check).
-ELECT-2, ELECT-11, ELECT-12, REPL-9, REPL-10, APPLY-4, CLIENT-4, CLIENT-5, CLIENT-6, FAIL-2,
-FAIL-3, FAIL-6, DD-9, DD-12, DD-15, DD-30, DD-32, DD-33.
+ELECT-2, ELECT-11, ELECT-12, REPL-9, REPL-10, APPLY-4, CLIENT-4, CLIENT-5, CLIENT-6, CLIENT-8,
+CLIENT-9, CLIENT-10, FAIL-2, FAIL-3, FAIL-6, DD-9, DD-12, DD-15, DD-30, DD-32, DD-33, DD-34.
 """
 
 import asyncio
 import random
+from dataclasses import dataclass
 
 import pytest
 
 from raftkv.consensus import NotLeaderError, Role
 from raftkv.kvstore import OpenSession, PutApplied, decode_command
-from raftkv.runtime import LeadershipLostError, NodeStoppedError, Timing
+from raftkv.runtime import LeadershipLostError, NodeStoppedError, RaftNode, Timing
 from tests.support.kv_client import KvClient
-from tests.support.waiting import eventually
+from tests.support.waiting import eventually, within_bound
 
 # NOTE: an election timeout is 10 to 19 ticks; a split vote costs another, so 100 ticks leaves
 # room for several rounds.
@@ -46,6 +47,33 @@ async def disturb(cluster, rng, members):
         cluster.network.heal()
     elif roll < 0.08 and len(cluster.nodes) == len(members):
         waiting = [n for n in members if cluster.nodes[n].pending_proposals]
+        await cluster.restart(rng.choice(waiting or members))
+
+
+async def disturb_for_reads(cluster, rng, members):
+    """Now and then cut a node off, split two nodes from the rest, restore links, or restart.
+
+    Half the time the node cut off, or in the pair, is the Leader, so reads wait on a Leader that
+    the others have left. Links come back within a few ticks more often than not, so a Leader cut
+    off for less than an election timeout can rejoin with its reads still waiting. A restart takes
+    a node with a read waiting, if any: restarting is what fails it with `NodeStoppedError`.
+    """
+    roll = rng.random()
+    leader = cluster.leader()
+    if roll < 0.04:
+        victim = leader if leader is not None and rng.random() < 0.5 else rng.choice(members)
+        cluster.network.isolate(victim, members)
+    elif roll < 0.06 and len(members) > 3:
+        pair = rng.sample(members, 2)  # in five nodes, a minority that may hold the Leader
+        if leader is not None and leader not in pair and rng.random() < 0.5:
+            pair[0] = leader
+        for inside in pair:
+            for outside in set(members) - set(pair):
+                cluster.network.cut(inside, outside)
+    elif roll < 0.16:
+        cluster.network.heal()
+    elif roll < 0.18 and len(cluster.nodes) == len(members):
+        waiting = [n for n in members if cluster.nodes[n].pending_reads]
         await cluster.restart(rng.choice(waiting or members))
 
 
@@ -372,6 +400,204 @@ async def test_proposals_are_answered_with_their_own_results_through_crashes_and
     for request_id, result in results.items():
         assert request_id in previous, f"{request_id} was answered but never took effect"
         assert result == PutApplied(previous[request_id]), f"the wrong answer to {request_id}"
+
+
+# --- Reading (CLIENT-8, CLIENT-9, CLIENT-10, DD-12, DD-34) ---------------------------------
+
+
+async def test_a_read_through_the_leader_reflects_a_write_the_leader_acknowledged(
+    start_runtime_cluster,
+):
+    cluster = await start_runtime_cluster([1, 2, 3])
+    leader, client = await elect_with_client(cluster)
+    await cluster.propose(leader, client.put("x", "1"))
+
+    index = await cluster.read_barrier(leader)
+
+    assert index >= cluster.nodes[leader].durable.log.last_index
+    assert cluster.maps()[leader]["x"] == "1"
+    assert cluster.nodes[leader].pending_reads == 0
+
+
+async def test_a_new_leader_serves_reads_that_reflect_what_the_old_leader_committed(
+    start_runtime_cluster,
+):
+    cluster = await start_runtime_cluster([1, 2, 3])
+    old_leader, client = await elect_with_client(cluster)
+    await cluster.propose(old_leader, client.put("x", "1"))
+    committed = cluster.nodes[old_leader].durable.log.last_index
+    await cluster.run_until(cluster.all_caught_up, within=2)
+    await cluster.stop(old_leader)
+    new_leader = await elect(cluster)
+
+    index = await cluster.read_barrier(new_leader)  # waits for the new Leader's empty entry
+
+    assert index == committed + 1  # the old Leader's last entry, then this Leader's empty one
+
+
+async def test_a_leader_cut_off_from_the_cluster_serves_no_read_once_a_newer_leader_committed(
+    start_runtime_cluster,
+):
+    # The cut-off Leader still believes it leads. Serving a read from its own state would miss
+    # what the new Leader commits, so its read waits for a majority that never answers, and
+    # fails once the Leader hears of the new term (CLIENT-8).
+    cluster = await start_runtime_cluster([1, 2, 3])
+    old_leader, client = await elect_with_client(cluster)
+    cluster.network.isolate(old_leader, cluster.member_ids)
+    stale_read = asyncio.create_task(cluster.nodes[old_leader].read_barrier())
+    await cluster.wait_until_read_waits(old_leader)
+
+    await cluster.run_until(
+        lambda: cluster.leader() not in (None, old_leader), within=ELECTION_BOUND
+    )
+    new_leader = cluster.leader()
+    await cluster.propose(new_leader, client.put("x", "1"))  # commits under the new Leader
+    committed = cluster.nodes[new_leader].durable.commit_index
+    await cluster.tick(5)
+    assert not stale_read.done()  # still cut off, still believing it leads, and serving nothing
+
+    assert await cluster.read_barrier(new_leader) >= committed
+    cluster.network.heal()
+    await cluster.run_until(stale_read.done, within=ELECTION_BOUND)
+    with pytest.raises(NotLeaderError):
+        await stale_read
+
+
+async def test_a_leader_cut_off_briefly_serves_its_waiting_read_once_reconnected(
+    start_runtime_cluster,
+):
+    # Cut off for far less than an election timeout, the Leader still leads when its links
+    # return, so a majority answers a request built after the read began, and it is served.
+    cluster = await start_runtime_cluster([1, 2, 3])
+    leader, _ = await elect_with_client(cluster)
+    cluster.network.isolate(leader, cluster.member_ids)
+    read = asyncio.create_task(cluster.nodes[leader].read_barrier())
+    await cluster.wait_until_read_waits(leader)
+    await cluster.tick(3)
+    assert not read.done()
+    assert cluster.leader() == leader
+
+    cluster.network.heal()
+    await cluster.tick(2)
+
+    assert await within_bound(read) == cluster.nodes[leader].durable.commit_index
+
+
+async def test_a_leader_with_only_one_follower_of_four_serves_no_read(start_runtime_cluster):
+    # The Leader and one Follower are two of five: never a majority, however long the others
+    # stay away. Once they return, the read is served or the Leader is deposed, never stale.
+    cluster = await start_runtime_cluster([1, 2, 3, 4, 5])
+    leader = await elect(cluster)
+    commit_index = cluster.nodes[leader].durable.commit_index
+    followers = [n for n in cluster.member_ids if n != leader]
+    for node_id in followers[1:]:  # three of the four Followers are cut off from everyone
+        cluster.network.isolate(node_id, cluster.member_ids)
+    read = asyncio.create_task(cluster.nodes[leader].read_barrier())
+    await cluster.wait_until_read_waits(leader)
+    await cluster.tick(5)
+    assert not read.done()
+
+    cluster.network.heal()
+    await cluster.run_until(read.done, within=ELECTION_BOUND)
+    error = read.exception()
+    if error is None:
+        assert read.result() == commit_index  # a majority answered after the links returned
+    else:
+        assert isinstance(error, NotLeaderError)  # a node whose term had moved on deposed it
+
+
+@dataclass
+class ReadRecord:
+    """A read a randomized test started.
+
+    Attributes:
+        floor: The highest commit index any node had when the read began.
+        node: The RaftNode it ran on.
+        ticks_waited: How many ticks it has been waiting.
+    """
+
+    floor: int
+    node: RaftNode
+    ticks_waited: int = 0
+
+
+@pytest.mark.parametrize(
+    ("members", "seed"),
+    [
+        *(pytest.param([1, 2, 3], seed, id=f"3-nodes-seed-{seed}") for seed in range(8)),
+        *(pytest.param([1, 2, 3, 4, 5], seed, id=f"5-nodes-seed-{seed}") for seed in range(4)),
+    ],
+)
+async def test_reads_never_fall_behind_earlier_commits_through_crashes_and_partitions(
+    start_runtime_cluster, members, seed
+):
+    # Reads start on a Leader of any term or, one time in five, on any node, while a client keeps
+    # writing and nodes are cut off, split, healed, and restarted. A read may fail only because
+    # its node does not lead, or because the node was restarted. Every read served must reach at
+    # least the highest commit index any node had when the read began: a Leader cut off from a
+    # newer one would serve less, so this is what confirming through a majority prevents
+    # (CLIENT-8). Once healed and caught up, every read has ended.
+    rng = random.Random(seed)
+    cluster = await start_runtime_cluster(members, seed=seed)
+    leader = await elect(cluster)
+    client = KvClient(await cluster.open_session(leader))
+    reads = {}  # read -> its ReadRecord
+    served = 0
+
+    def collect(read, record):
+        """Take what an ended read gave: an index at or above its floor, or an allowed failure."""
+        nonlocal served
+        error = read.exception()
+        if error is not None:
+            assert isinstance(error, NotLeaderError | NodeStoppedError)
+            if isinstance(error, NodeStoppedError):
+                assert cluster.nodes[record.node.node_id] is not record.node, "never restarted"
+            return
+        served += 1
+        assert read.result() >= record.floor, f"served {read.result()}, behind {record.floor}"
+
+    for _ in range(150):
+        await disturb_for_reads(cluster, rng, members)
+        leader = cluster.leader()
+        if leader is not None and rng.random() < 0.4:
+            try:
+                await cluster.append_command(leader, client.put(rng.choice("abc"), "v"))
+            except NotLeaderError:
+                pass
+        if rng.random() < 0.5:
+            leaders = [
+                n for n in sorted(cluster.nodes) if cluster.nodes[n].durable.role is Role.LEADER
+            ]
+            node_id = (
+                rng.choice(leaders) if leaders and rng.random() >= 0.2 else rng.choice(members)
+            )
+            floor = max(node.durable.commit_index for node in cluster.nodes.values())
+            reads[asyncio.create_task(cluster.nodes[node_id].read_barrier())] = ReadRecord(
+                floor, cluster.nodes[node_id]
+            )
+        await cluster.tick()
+        for read, record in list(reads.items()):
+            if read.done():
+                del reads[read]
+                collect(read, record)
+                continue
+            record.ticks_waited += 1
+            if record.ticks_waited >= 3 and rng.random() < 0.05:
+                read.cancel()  # the client gives up waiting
+                del reads[read]
+
+    cluster.network.heal()
+    await cluster.run_until(
+        lambda: cluster.has_one_leader_known_to_all() and cluster.all_caught_up(),
+        within=2 * ELECTION_BOUND,
+    )
+    await cluster.tick(5)
+    stuck = sum(1 for read in reads if not read.done())
+    assert not stuck, f"{stuck} reads still waiting in a healed, caught-up cluster"
+    for read, record in reads.items():
+        collect(read, record)
+    assert all(node.pending_reads == 0 for node in cluster.nodes.values())
+    assert served > 0
 
 
 @pytest.mark.parametrize(

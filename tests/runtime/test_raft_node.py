@@ -2,8 +2,8 @@
 
 The test ticks the clock itself, and every election timeout is drawn as the longest there is, so
 every deadline is exact. ELECT-1, ELECT-2, ELECT-6, ELECT-13, STATE-3, REPL-2, REPL-7, REPL-9,
-APPLY-4, APPLY-5, CLIENT-4, CLIENT-5, CLIENT-6, CLIENT-7, FAIL-2, FAIL-3, DD-9, DD-12, DD-26,
-DD-28, DD-29, DD-30, DD-32, DD-33.
+APPLY-4, APPLY-5, CLIENT-4, CLIENT-5, CLIENT-6, CLIENT-7, CLIENT-8, CLIENT-9, CLIENT-10, FAIL-2,
+FAIL-3, DD-9, DD-12, DD-14, DD-26, DD-28, DD-29, DD-30, DD-32, DD-33, DD-34.
 """
 
 import asyncio
@@ -46,6 +46,7 @@ from tests.support.waiting import eventually, within_bound
 
 NODE_ID = 1
 THREE_NODES = Cluster([NODE_ID, 2, 3])
+FIVE_NODES = Cluster([NODE_ID, 2, 3, 4, 5])
 TIMING = Timing(heartbeat_ticks=1, election_ticks=10)
 LONGEST = 2 * TIMING.election_ticks - 1  # every timeout these tests draw
 
@@ -82,6 +83,10 @@ class ScriptedTransport:
 
     async def _reply(self, kind, peer, request):
         self.sent.append((kind, peer, request))
+        # NOTE: no test sends this many. A driver that resends without end never yields to the
+        # event loop while answers come at once, so no timeout could stop it; it fails here.
+        if len(self.sent) > 2000:
+            raise AssertionError(f"{len(self.sent)} RPCs sent: a send loop that never ends")
         result = None if self.answer is None else self.answer(kind, peer, request)
         if inspect.isawaitable(result):
             result = await result
@@ -169,12 +174,30 @@ async def win(node):
     assert node.durable.role is Role.LEADER
 
 
+async def win_without_idling(node):
+    """Run out node 1's election timeout, without waiting for the sends and applies it starts.
+
+    `tick` waits for the node to be idle, which a held answer or a long apply backlog prevents.
+    """
+    for _ in range(node.election_timeout):
+        await node.tick()
+    await eventually(lambda: node.durable.role is Role.LEADER)
+
+
 async def start_proposal(node, command="x"):
     """Start a proposal of `command` and return its task once it is appended and waiting."""
     waiting = node.pending_proposals
     proposal = asyncio.create_task(node.propose(command))
     await eventually(lambda: node.pending_proposals > waiting)
     return proposal
+
+
+async def start_read(node):
+    """Start a read and return its task once it is waiting; for a read that cannot end at once."""
+    waiting = node.pending_reads
+    read = asyncio.create_task(node.read_barrier())
+    await eventually(lambda: node.pending_reads > waiting)
+    return read
 
 
 # --- The election timeout (ELECT-1, ELECT-2, ELECT-13, DD-9) ----------------------------
@@ -945,6 +968,384 @@ def test_the_two_ways_a_proposal_fails_are_unrelated_errors():
     assert not issubclass(NodeStoppedError, LeadershipLostError)
 
 
+# --- Reading (CLIENT-8, CLIENT-9, CLIENT-10, DD-12, DD-14, DD-34) -------------------------
+
+
+async def test_a_node_alone_in_its_cluster_serves_a_read_at_its_commit_index(db_path):
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, cluster=Cluster([NODE_ID]), apply=KeyValueStore().apply)
+        await tick(node, LONGEST)
+        await within_bound(node.propose(OpenSession().encode()))
+
+        index = await within_bound(node.read_barrier())
+
+        assert index == node.durable.commit_index == 2  # its empty entry and the session
+        assert node.pending_reads == 0
+
+
+async def test_a_read_on_a_follower_is_refused_with_nothing_left_waiting(db_path):
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store)
+
+        with pytest.raises(NotLeaderError):
+            await within_bound(node.read_barrier())
+
+        assert node.pending_reads == 0
+
+
+async def test_a_read_waits_for_a_majority_to_answer_a_request_built_after_it(db_path):
+    followers = HoldableFollowers()
+    transport = ScriptedTransport(followers)
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport, apply=result_of)
+        await win(node)
+        sent_before = len(transport.of_kind("append"))
+        followers.hold()
+
+        read = await start_read(node)
+        await eventually(lambda: len(transport.of_kind("append")) == sent_before + 2)
+        await let_other_tasks_run()
+
+        assert not read.done()  # a round went out at once, and no Follower has answered it
+        followers.release()
+        assert await within_bound(read) == node.durable.commit_index == 1
+        assert node.pending_reads == 0
+
+
+async def test_an_answer_to_a_request_sent_before_the_read_does_not_confirm_it(db_path):
+    # Heartbeats are in flight when the read arrives. Their answers show only that each Follower
+    # recognized this Leader before the read began, so the read waits for a round of its own.
+    earlier, later = HoldableFollowers(), HoldableFollowers()
+    serving = [earlier]
+    transport = ScriptedTransport(lambda kind, peer, request: serving[0](kind, peer, request))
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport, apply=result_of)
+        await win(node)
+        earlier.hold()
+        sent = len(transport.of_kind("append"))
+        await node.tick()
+        await eventually(lambda: len(transport.of_kind("append")) == sent + 2)  # in flight
+
+        read = await start_read(node)
+        serving[0] = later
+        later.hold()
+        earlier.release()  # the heartbeats are answered; the read needs requests built after it
+        await eventually(lambda: len(transport.of_kind("append")) == sent + 4)
+        await let_other_tasks_run()
+
+        assert not read.done()
+        later.release()
+        assert await within_bound(read) == 1
+
+
+async def test_a_followers_rejection_of_the_log_check_confirms_a_read_too(db_path):
+    rejecting = asyncio.Event()
+
+    def answer(kind, peer, request):
+        if kind == "append" and rejecting.is_set():
+            return rejected(term=request.term)
+        return everyone_agrees(kind, peer, request)
+
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(answer), apply=result_of)
+        await win(node)
+        rejecting.set()
+
+        index = await within_bound(node.read_barrier())
+
+        assert index == node.durable.commit_index
+
+
+async def test_a_read_fails_when_a_followers_answer_shows_a_later_term(db_path):
+    later = asyncio.Event()
+
+    def answer(kind, peer, request):
+        if kind == "append" and later.is_set():
+            return rejected(term=5)
+        return everyone_agrees(kind, peer, request)
+
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(answer), apply=result_of)
+        await win(node)
+        later.set()
+
+        with pytest.raises(NotLeaderError):
+            await within_bound(node.read_barrier())
+
+        assert (node.durable.role, node.durable.current_term) == (Role.FOLLOWER, 5)
+        assert node.pending_reads == 0
+
+
+async def test_an_answer_with_a_lower_term_neither_confirms_a_read_nor_is_asked_for_again(db_path):
+    # Only an answer carrying the request's term shows the Follower recognizes this Leader; one
+    # that does not must not make the Leader send the same Follower another request, and another.
+    lower = asyncio.Event()
+    transport = ScriptedTransport()
+
+    def answer(kind, peer, request):
+        if kind == "append" and lower.is_set():
+            # NOTE: loses the request once 30 are sent, so a Leader that repeats it without end
+            # fails the count below, long before the transport's own bound.
+            lost = len(transport.of_kind("append")) > 30
+            return None if lost else accepted(term=request.term - 1)
+        return everyone_agrees(kind, peer, request)
+
+    transport.answer = answer
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport, apply=result_of)
+        await win(node)
+        lower.set()
+        sent_before = len(transport.of_kind("append"))
+
+        read = await start_read(node)
+        await within_bound(node.idle())
+
+        assert not read.done()
+        assert len(transport.of_kind("append")) - sent_before == 2  # one to each, none repeated
+
+
+async def test_a_leader_reaching_one_of_four_followers_keeps_its_read_waiting(db_path):
+    # The Leader and one Follower are two of five: not a majority, and the Follower that does
+    # answer is asked nothing more once its answer is in.
+    reachable = {2, 3}
+    transport = ScriptedTransport()
+
+    def answer(kind, peer, request):
+        # NOTE: loses every request once 60 are sent, so a Leader that repeats one without end
+        # fails the count below, long before the transport's own bound.
+        if kind == "append" and (peer not in reachable or len(transport.of_kind("append")) > 60):
+            return None
+        return everyone_agrees(kind, peer, request)
+
+    transport.answer = answer
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport, cluster=FIVE_NODES, apply=result_of)
+        await win(node)  # its empty entry commits through Followers 2 and 3
+        reachable.discard(3)
+        sent_before = len(transport.of_kind("append"))
+
+        read = await start_read(node)
+        await within_bound(node.idle())
+
+        assert not read.done()
+        assert len(transport.of_kind("append")) - sent_before == 4  # one to each, none repeated
+
+
+@pytest.mark.parametrize("depose", list(DEPOSING_RPCS.values()), ids=list(DEPOSING_RPCS))
+async def test_a_read_fails_at_once_when_the_node_stops_being_leader(db_path, depose):
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        read = await start_read(node)
+
+        await depose(node)
+
+        with pytest.raises(NotLeaderError, match="no longer Leader of term 1"):
+            await within_bound(read)
+        followers.release()
+        await within_bound(node.idle())
+        assert node.pending_reads == 0
+        assert node.failure is None  # only the read ended; the node carries on
+
+
+async def test_a_read_waits_until_the_leader_has_committed_an_entry_of_its_own_term(db_path):
+    # Its commit index may still be behind what earlier Leaders committed, so it serves nothing
+    # until its empty entry commits (CLIENT-10).
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        followers.hold()  # the empty entry is answered only once released
+        await win_without_idling(node)
+        assert not node.durable.has_committed_in_current_term
+
+        read = await start_read(node)
+        await let_other_tasks_run()
+        assert not read.done()
+
+        followers.release()
+        assert await within_bound(read) == 1  # the index of its empty entry
+        assert node.durable.has_committed_in_current_term
+
+
+async def test_a_leader_that_knows_an_older_commit_index_still_holds_a_read_for_its_own_entry(
+    db_path,
+):
+    # An earlier Leader told this node that entries 1 to 3 are committed, and may have committed
+    # more since. This node's commit index is behind until its own entry, index 4, commits, so
+    # a read served at 3 could miss writes (CLIENT-10).
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await node.handle_append_entries(
+            append_entries(term=1, leader=2, entries=(LogEntry(1, "a"),) * 3, leader_commit=3)
+        )
+        assert node.durable.commit_index == 3
+        followers.hold()
+        await win_without_idling(node)
+        assert node.durable.commit_index == 3
+        assert not node.durable.has_committed_in_current_term
+
+        read = await start_read(node)
+        await let_other_tasks_run()
+        assert not read.done()
+
+        followers.release()
+        assert await within_bound(read) == 4  # its own empty entry, not the older Leader's 3
+
+
+async def test_a_read_waits_for_the_state_machine_to_apply_through_its_read_index(
+    db_path, monkeypatch
+):
+    # Applying the 500 entries already in the log takes a turn of the event loop each, far
+    # longer than confirming the read takes.
+    monkeypatch.setattr("raftkv.runtime.raft_node._APPLY_BATCH_SIZE", 1)
+    applied = []
+    async with SqliteStore(db_path) as store:
+        await store.replace_log_from(1, [LogEntry(1, "c")] * 500)
+        await store.save_term_and_vote(1, None)
+        node = await node_with(
+            store,
+            ScriptedTransport(everyone_agrees),
+            apply=lambda index, cluster_time, command: applied.append(index),
+        )
+        await win_without_idling(node)
+
+        index = await within_bound(node.read_barrier())
+
+        assert index == 501  # its empty entry, after the 500 already in the log
+        assert node.durable.last_applied >= index
+        assert len(applied) == 500
+
+
+async def test_a_read_ends_as_soon_as_its_index_is_applied_not_when_the_apply_loop_ends(
+    db_path, monkeypatch
+):
+    # The state machine is 8,000 entries behind when two more commands commit, so the apply loop
+    # runs on long after the read's index, 8,001, is applied. Each batch is a chance to end it.
+    monkeypatch.setattr("raftkv.runtime.raft_node._APPLY_BATCH_SIZE", 1)
+    async with SqliteStore(db_path) as store:
+        await store.replace_log_from(1, [LogEntry(1, "c")] * 8000)
+        await store.save_term_and_vote(1, None)
+        node = await node_with(
+            store, ScriptedTransport(everyone_agrees), apply=lambda index, time, command: None
+        )
+        await win_without_idling(node)
+        await eventually(lambda: node.durable.has_committed_in_current_term)
+        read = await start_read(node)
+        applied_when_it_ended = []
+        read.add_done_callback(
+            lambda _: applied_when_it_ended.append(
+                (node.durable.last_applied, node.durable.commit_index)
+            )
+        )
+        await node.append_command("y")
+        await node.append_command("y")
+
+        assert await within_bound(read) == 8001
+        last_applied, commit_index = applied_when_it_ended[0]
+        assert last_applied < commit_index  # it ended with entries still to apply
+
+
+async def test_a_read_reflects_every_write_acknowledged_before_it(db_path):
+    kv = KeyValueStore()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(everyone_agrees), apply=kv.apply)
+        await win(node)
+        opened = await within_bound(node.propose(OpenSession().encode()))
+        await within_bound(node.propose(Put(opened.client_id, 1, "x", "1").encode()))
+
+        index = await within_bound(node.read_barrier())
+
+        assert index >= node.durable.log.last_index
+        assert kv.get("x") == "1"
+
+
+async def test_reads_that_arrive_together_share_one_round_of_requests(db_path):
+    transport = ScriptedTransport(everyone_agrees)
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, transport, apply=result_of)
+        await win(node)
+        sent_before = len(transport.of_kind("append"))
+
+        indexes = await within_bound(asyncio.gather(*(node.read_barrier() for _ in range(5))))
+
+        assert set(indexes) == {1}
+        sent = transport.of_kind("append")[sent_before:]
+        assert sorted(peer for peer, _ in sent) == [2, 3]  # one request to each Follower, for all
+
+
+async def test_a_read_has_no_time_limit_of_its_own(db_path):
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        read = await start_read(node)
+
+        for _ in range(20 * TIMING.election_ticks):
+            await node.tick()
+
+        assert not read.done() and node.pending_reads == 1
+        followers.release()
+        assert await within_bound(read) == 1
+
+
+async def test_a_caller_that_gives_up_leaves_no_read_waiting(db_path):
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        read = await start_read(node)
+
+        read.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await within_bound(read)
+        assert node.pending_reads == 0
+
+        followers.release()
+        await within_bound(node.idle())
+        assert node.failure is None
+
+
+async def test_a_read_waiting_when_the_node_stops_fails_with_node_stopped(db_path):
+    followers = HoldableFollowers()
+    async with SqliteStore(db_path) as store:
+        node = await node_with(store, ScriptedTransport(followers), apply=result_of)
+        await win(node)
+        followers.hold()
+        read = await start_read(node)
+
+        await within_bound(node.stop())
+
+        with pytest.raises(NodeStoppedError):
+            await within_bound(read)
+        assert node.pending_reads == 0
+
+
+@pytest.mark.parametrize("cluster", [Cluster([NODE_ID]), THREE_NODES], ids=["alone", "three nodes"])
+async def test_a_read_costs_one_request_per_follower_when_tasks_start_eagerly(db_path, cluster):
+    # Eagerly started tasks run at once, inside the call that starts them: the round can be
+    # answered before the read has begun to wait, and must still be the only one.
+    loop = asyncio.get_running_loop()
+    loop.set_task_factory(asyncio.eager_task_factory)
+    try:
+        async with SqliteStore(db_path) as store:
+            transport = ScriptedTransport(everyone_agrees)
+            node = await node_with(store, transport, cluster=cluster)
+            await tick(node, LONGEST)
+            sent_before = len(transport.of_kind("append"))
+
+            index = await within_bound(node.read_barrier())
+
+            assert index == node.durable.commit_index
+            assert len(transport.of_kind("append")) - sent_before == len(node.durable.peers)
+    finally:
+        loop.set_task_factory(None)
+
+
 # --- Failing and stopping ------------------------------------------------------------------
 
 
@@ -1022,6 +1423,8 @@ async def test_a_stopped_node_refuses_every_call(db_path):
             await node.append_command("x")
         with pytest.raises(NodeStoppedError):
             await node.propose("x")
+        with pytest.raises(NodeStoppedError):
+            await within_bound(node.read_barrier())
         with pytest.raises(NodeStoppedError):
             await node.handle_request_vote(vote_request(term=1, candidate=2))
         with pytest.raises(NodeStoppedError):

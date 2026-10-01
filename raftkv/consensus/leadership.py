@@ -19,14 +19,22 @@ class Leadership:
     DD-25): an older reply describes logs that may since have been overwritten
     and could fake a commit majority. The send term is compared, not the reply's
     term, because a delayed request can come back rejected with the current term
-    on it. The Follower records are private, and only `record_success` and
-    `record_rejection` change them, after that check, so no caller can count a
-    stale reply or back off twice for one probe. The caller handles a higher term
-    in a reply with `NodeState.handle_observed_term`.
+    on it. The Follower records are private. After that check, only
+    `record_success` and `record_rejection` change a Follower's `next_index` and
+    `match_index`, so no caller can count a stale reply or back off twice for one
+    probe. The caller handles a higher term in a reply with
+    `NodeState.handle_observed_term`.
 
     The leadership also keeps the cluster clock (DD-32): it resumes from the
     cluster time of the Leader's last log entry and counts one per Leader tick,
     so cluster time never goes back and does not run while there is no Leader.
+
+    It numbers every AppendEntries it builds, 1, 2, 3, ... across all Followers,
+    and records the number of the newest request each Follower has answered. A
+    read takes a mark, the number of requests built so far, and is confirmed once
+    a majority, this Leader counted, has answered requests numbered above its mark,
+    which were built after the read began (CLIENT-8, DD-34): `confirmation_mark`
+    gives the mark and `confirmed_since` tests it.
 
     Attributes:
         term: The term in which this node won the election.
@@ -52,6 +60,7 @@ class Leadership:
             follower: FollowerProgress(next_index=last_log_index + 1) for follower in followers
         }
         self._cluster_time = cluster_time
+        self._requests_built = 0
 
     @property
     def term(self) -> int:
@@ -90,6 +99,17 @@ class Leadership:
             KeyError: If `follower` is not one of this leadership's Followers.
         """
         return self._progress[follower].match_index
+
+    def answered_request(self, follower: int) -> int:
+        """Return the number of the newest request a Follower has answered; 0 if none.
+
+        Args:
+            follower: The Follower's node ID.
+
+        Raises:
+            KeyError: If `follower` is not one of this leadership's Followers.
+        """
+        return self._progress[follower].answered_request
 
     def record_success(
         self, follower: int, sent_in_term: int, prev_log_index: int, entry_count: int
@@ -145,6 +165,27 @@ class Leadership:
             return False
         return self._progress[follower].record_rejection(prev_log_index)
 
+    def record_reply(self, follower: int, request: AppendEntriesRequest) -> None:
+        """Record that a Follower answered `request` within this term: it recognizes this Leader.
+
+        Any answer carrying this term counts, a rejection of the log check included,
+        since the Follower has taken this term as its own either way. The caller
+        passes only such answers; a higher term steps the Leader down instead. Only
+        the request built last for that Follower counts, and a request from any other
+        term is ignored before the Follower is looked up (DD-34).
+
+        Args:
+            follower: The ID of the Follower that answered.
+            request: The AppendEntries it answered.
+
+        Raises:
+            KeyError: If `request` was sent in this term but `follower` is not one of
+                this leadership's Followers.
+        """
+        if request.term != self._term:
+            return
+        self._progress[follower].record_reply(request)
+
     def append_entries_request_for(
         self, follower: int, log: Log, leader_id: int, commit_index: int
     ) -> AppendEntriesRequest:
@@ -155,7 +196,8 @@ class Leadership:
         `next_index`, so an accepted RPC leaves the Follower's log matching this one
         from `next_index` on, and a caught-up Follower gets a heartbeat. Built in this
         leadership's term, which is what an answer is later checked against (REPL-16,
-        DD-25).
+        DD-25). The request is numbered and remembered as the one now awaiting an
+        answer from that Follower (DD-34).
 
         Args:
             follower: The Follower to send to.
@@ -166,8 +208,9 @@ class Leadership:
         Raises:
             KeyError: If `follower` is not one of this leadership's Followers.
         """
-        next_index = self._progress[follower].next_index
-        return AppendEntriesRequest(
+        progress = self._progress[follower]
+        next_index = progress.next_index
+        request = AppendEntriesRequest(
             term=self._term,
             leader_id=leader_id,
             prev_log_index=next_index - 1,
@@ -175,6 +218,9 @@ class Leadership:
             entries=log.entries_from(next_index),
             leader_commit=commit_index,
         )
+        self._requests_built += 1
+        progress.record_built(request, self._requests_built)
+        return request
 
     def commit_index_after(self, commit_index: int, log: Log, majority: int) -> int:
         """Return the Leader's commit index given what its Followers have confirmed.
@@ -201,3 +247,31 @@ class Leadership:
         if on_a_majority <= commit_index or log.term_at(on_a_majority) != self._term:
             return commit_index
         return on_a_majority
+
+    def confirmation_mark(self) -> int:
+        """Return a mark: the number of requests built so far, which a read is confirmed against.
+
+        Only requests numbered above the mark were built after this call, and only
+        they count toward confirming the read (CLIENT-8, DD-34). An answer to an
+        earlier request shows only that its Follower recognized this Leader before
+        the read began: it may have voted for a newer Leader since. Reads with no
+        request built between them share a mark.
+        """
+        return self._requests_built
+
+    def confirmed_since(self, mark: int, majority: int) -> bool:
+        """Whether a majority, counting this Leader, has answered a request built after `mark`.
+
+        A Leader elected before the read began needed votes from a majority, and any
+        two majorities share a server. That server, answering after the read began,
+        would carry the newer term, and such an answer does not count: so no other
+        Leader had been elected when the read began (CLIENT-8, DD-34).
+
+        Args:
+            mark: What `confirmation_mark` returned when the read began.
+            majority: How many members make a strict majority (`Cluster.majority`).
+        """
+        answered = sum(
+            1 for progress in self._progress.values() if progress.answered_request > mark
+        )
+        return 1 + answered >= majority

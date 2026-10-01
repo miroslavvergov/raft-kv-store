@@ -1,4 +1,4 @@
-"""The driver that runs a node by itself: its clock, its RPCs, applying, and proposals."""
+"""The driver that runs a node by itself: its clock, its RPCs, applying, proposals, and reads."""
 
 import asyncio
 import random
@@ -16,6 +16,7 @@ from raftkv.consensus import (
 from raftkv.node import DurableNodeState
 from raftkv.runtime.errors import LeadershipLostError, NodeStoppedError, PeerUnreachableError
 from raftkv.runtime.pending_proposals import PendingProposals
+from raftkv.runtime.pending_reads import PendingReads
 from raftkv.runtime.task_supervisor import TaskSupervisor
 from raftkv.runtime.timing import Timing
 from raftkv.runtime.transport import Transport
@@ -48,8 +49,10 @@ class RaftNode:
     starts no election if that call restarted it.
 
     A Leader also sends at once when it appends an entry, and sends a Follower
-    again at once after a rejection that lowered its `next_index` (REPL-7) or a
-    success that leaves it short of the Leader's log. At most one AppendEntries
+    again at once after a rejection that lowered its `next_index` (REPL-7), after
+    a success that leaves it short of the Leader's log, and after an answer
+    carrying the request's term while a read still awaits that Follower's answer
+    to a request built after the read began (DD-34). At most one AppendEntries
     and one RequestVote per term are in flight to each peer; a send wanted
     meanwhile is skipped, since the answer to the one in flight brings the next
     send and the next heartbeat interval sends in any case. An RPC that gets no
@@ -66,6 +69,16 @@ class RaftNode:
     that; the failure says the outcome is open, since the command may still take
     effect (DD-33). It sets no time limit of its own: the caller sets one.
 
+    A Leader's caller reads with `read_barrier`, which returns the read index, the
+    commit index when the read began, once the state machine has applied through
+    it; the state machine may then be read. The read waits until the Leader has
+    committed an entry of its own term, then until a majority has answered a request
+    built after the read began. Such requests go out at once to each Follower with
+    none in flight, and to any other as soon as its request is answered (CLIENT-8,
+    CLIENT-9, CLIENT-10, DD-12, DD-14, DD-34). It fails with `NotLeaderError` if the
+    node is not Leader or stops leading first, and with `NodeStoppedError` if the
+    node stops. It sets no time limit of its own: the caller sets one.
+
     Attributes:
         node_id: This node's ID.
         durable: The node state this driver runs. Read it freely; change it only
@@ -77,6 +90,7 @@ class RaftNode:
         failure: The error that stopped the node, or None.
         busy: Whether any send or apply task is still running.
         pending_proposals: How many proposals are waiting to be applied.
+        pending_reads: How many reads are waiting to be served.
     """
 
     def __init__(
@@ -99,8 +113,9 @@ class RaftNode:
         self._timing = timing or Timing()
         self._rng = rng or random.Random()
         self._proposals = PendingProposals()
+        self._reads = PendingReads()
         # NOTE: told through the supervisor, not `stop`: a failing task closes it too.
-        self._supervisor = TaskSupervisor(on_close=self._fail_waiting_proposals)
+        self._supervisor = TaskSupervisor(on_close=self._fail_waiting_callers)
         self._ticker: asyncio.Task | None = None
         self._election_elapsed = 0
         self._heartbeat_elapsed = 0
@@ -141,6 +156,10 @@ class RaftNode:
     def pending_proposals(self) -> int:
         return len(self._proposals)
 
+    @property
+    def pending_reads(self) -> int:
+        return len(self._reads)
+
     # --- Running and stopping ---------------------------------------------------------
 
     def start(self) -> None:
@@ -162,8 +181,8 @@ class RaftNode:
 
         A task cancelled during a write still finishes that write first (DD-22).
         Once this returns, nothing uses the node's store, and every later call
-        raises `NodeStoppedError`. Every proposal still waiting fails with it too
-        (DD-33). Must not be awaited from within this node's own RPC handling.
+        raises `NodeStoppedError`. Every proposal and read still waiting fails with it
+        too (DD-33, DD-34). Must not be awaited from within this node's own RPC handling.
         """
         await self._supervisor.close()
 
@@ -262,13 +281,73 @@ class RaftNode:
             self._start_replicating_to_all()
             self._schedule_apply()
 
-    def _fail_waiting_proposals(self) -> None:
-        """Fail every proposal still waiting with `NodeStoppedError`: none is applied here now."""
+    async def read_barrier(self) -> int:
+        """Wait until a linearizable read may be served from this node; return its read index.
+
+        The read waits, in this order:
+
+        1. Until this Leader has committed an entry of its own term; it then takes its
+           commit index as the read index (CLIENT-10).
+        2. Until a majority has answered an AppendEntries built after the read began,
+           which shows no other Leader had been elected by then (CLIENT-8, DD-14).
+        3. Until the state machine has applied through the read index (CLIENT-9).
+
+        The state machine may then be read at once, and reflects every write committed
+        before the read began (DD-12, DD-34). Reads that begin together share the round
+        of requests. The wait has no time limit of its own: a caller that cannot wait as
+        long as it takes wraps the call in `asyncio.timeout`.
+
+        Returns:
+            The read index.
+
+        Raises:
+            NotLeaderError: If this node is not Leader, or stopped being Leader while the
+                read waited (CLIENT-6). No read was served.
+            NodeStoppedError: If the node was stopped, before the call or while the read
+                waited.
+        """
+        # NOTE: not inside `call()`: a read touches no store, and a stop fails it through
+        # `on_close`.
+        self._supervisor.check_open()
+        if self._durable.leadership is None:
+            raise NotLeaderError(f"node {self.node_id} is {self._durable.role.value}, not leader")
+        future = self._reads.register()
+        try:
+            self._settle_reads()
+            return await future
+        finally:
+            self._reads.discard(future)
+
+    def _settle_reads(self) -> None:
+        """Start, confirm and end the waiting reads as far as the node's state now allows.
+
+        Runs whenever something a read waits for may have changed: a read arrives, an
+        answer is handled, a batch is applied. Once this Leader has committed an entry
+        of its own term, every read that has not started starts, together, at the
+        commit index of that moment. Only requests built after a read began confirm it,
+        so a round goes out at once to each Follower with no request in flight; the
+        others are asked when they answer, or at the next heartbeat.
+        """
+        durable = self._durable
+        if not self._reads or durable.leadership is None:
+            return
+        if self._reads.has_unstarted() and durable.has_committed_in_current_term:
+            mark, read_index = durable.mark_and_read_index()
+            self._reads.start(mark, read_index)
+            self._start_replicating_to_all()
+        self._reads.settle(durable.read_confirmed, durable.last_applied)
+
+    def _fail_waiting_callers(self) -> None:
+        """Fail every proposal and read still waiting with `NodeStoppedError`.
+
+        The node applies and serves nothing more.
+        """
         self._proposals.fail_all(
             NodeStoppedError,
             f"node {self.node_id} stopped while its command waited to be applied; "
             "whether the command takes effect is unknown",
         )
+        self._reads.fail_all(NodeStoppedError, f"node {self.node_id} stopped while its read waited")
 
     # --- RPCs from peers --------------------------------------------------------------
 
@@ -375,8 +454,8 @@ class RaftNode:
     def _notice_role_or_term_change(self) -> None:
         """React to a new role or term, once, however many calls observe it.
 
-        A Leader that stops leading fails every proposal still waiting (DD-33). A new
-        term forgets its predecessor's Leader and RequestVote. Any change
+        A Leader that stops leading fails every proposal and read still waiting (DD-33,
+        DD-34). A new term forgets its predecessor's Leader and RequestVote. Any change
         restarts both timers (DD-9). A new Leader records itself as `leader_id`,
         sends its empty entry at once rather than a heartbeat later, and starts
         applying.
@@ -389,6 +468,9 @@ class RaftNode:
                 LeadershipLostError,
                 f"node {self.node_id} is no longer Leader of term {self._seen_term}; "
                 "whether the command takes effect is unknown",
+            )
+            self._reads.fail_all(
+                NotLeaderError, f"node {self.node_id} is no longer Leader of term {self._seen_term}"
             )
         if term != self._seen_term:
             self._leader_id = None
@@ -461,10 +543,11 @@ class RaftNode:
         """Send AppendEntries to `peer` while this term's Leader has more to send it at once.
 
         Each round sends the request `next_index` calls for (REPL-2), records the
-        answer, and goes again only after a rejection that lowered `next_index`
-        (REPL-7) or a success that leaves `peer` short of the log. A rejection that
-        lowered nothing is not resent: the same request would be rejected the same
-        way.
+        answer, and goes again after a rejection that lowered `next_index` (REPL-7),
+        after a success that leaves `peer` short of the log, or after an answer
+        carrying the request's term while a read still awaits `peer`'s answer to a
+        request built after the read began (DD-34). Any other rejection is not
+        resent: the same request would be rejected the same way.
         """
         try:
             while self._durable.role is Role.LEADER and self._durable.current_term == term:
@@ -478,7 +561,16 @@ class RaftNode:
                 )
                 self._notice_role_or_term_change()
                 self._schedule_apply()
-                if not (backed_off or (response.success and self._has_entries_for(peer))):
+                self._settle_reads()
+                # NOTE: asked for again only after an answer `handle_append_entries_response`
+                # credits, one carrying the request's term; nothing credits any other, so it
+                # would be asked for again without end.
+                answered_in_term = response.term == request.term
+                if not (
+                    backed_off
+                    or (response.success and self._has_entries_for(peer))
+                    or (answered_in_term and self._read_wants_round_from(peer))
+                ):
                     return
         finally:
             self._append_entries_in_flight.discard((peer, term))
@@ -488,6 +580,15 @@ class RaftNode:
         leadership = self._durable.leadership
         return (
             leadership is not None and leadership.next_index(peer) <= self._durable.log.last_index
+        )
+
+    def _read_wants_round_from(self, peer: int) -> bool:
+        """Whether a read still needs `peer` to answer a request built after the read began."""
+        leadership = self._durable.leadership
+        if not self._reads or leadership is None:
+            return False
+        return self._reads.wants_round(
+            leadership.answered_request(peer), self._durable.read_confirmed
         )
 
     # --- Applying ---------------------------------------------------------------------
@@ -502,13 +603,15 @@ class RaftNode:
     async def _apply(self) -> None:
         """Apply committed entries in batches until the state machine has caught up.
 
-        Each applied entry answers the proposal waiting on it, if any (DD-33).
+        Each applied entry answers the proposal waiting on it, if any (DD-33), and each
+        batch may end a read waiting for the state machine to catch up (DD-34).
         """
         try:
             while self._durable.last_applied < self._durable.commit_index:
                 await self._durable.apply_committed(
                     max_entries=_APPLY_BATCH_SIZE, on_applied=self._proposals.answer
                 )
+                self._settle_reads()
                 await asyncio.sleep(0)
         finally:
             self._applying = False
